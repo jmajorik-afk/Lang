@@ -2,7 +2,74 @@ package storage
 
 import (
 	"database/sql"
+	"time"
 )
+
+type Reminder struct {
+	ID       int
+	UserID   int
+	Word     string
+	Language string
+	HelpType string
+	SendAt   time.Time
+}
+
+// ScheduleReminders creates spaced-repetition reminders for a word if not already scheduled.
+func ScheduleReminders(db *sql.DB, userID int, word, language, helpType string) error {
+	// Only schedule if this is the first time this word is queried by this user
+	var count int
+	err := db.QueryRow(`SELECT COUNT(*) FROM reminders WHERE user_id=? AND word=? AND language=?`,
+		userID, word, language).Scan(&count)
+	if err != nil || count > 0 {
+		return err
+	}
+
+	now := time.Now()
+	intervals := []time.Duration{
+		3 * time.Hour,
+		24 * time.Hour,
+		7 * 24 * time.Hour,
+		30 * 24 * time.Hour,
+	}
+	for _, d := range intervals {
+		_, err := db.Exec(
+			`INSERT INTO reminders (user_id, word, language, help_type, send_at) VALUES (?,?,?,?,?)`,
+			userID, word, language, helpType, now.Add(d),
+		)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// GetDueReminders returns all unsent reminders whose send_at <= now.
+func GetDueReminders(db *sql.DB) ([]Reminder, error) {
+	rows, err := db.Query(
+		`SELECT id, user_id, word, language, help_type, send_at FROM reminders WHERE sent=0 AND send_at <= ?`,
+		time.Now(),
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var reminders []Reminder
+	for rows.Next() {
+		var r Reminder
+		if err := rows.Scan(&r.ID, &r.UserID, &r.Word, &r.Language, &r.HelpType, &r.SendAt); err != nil {
+			return nil, err
+		}
+		reminders = append(reminders, r)
+	}
+	return reminders, nil
+}
+
+// MarkReminderSent marks a reminder as sent.
+func MarkReminderSent(db *sql.DB, id int) error {
+	_, err := db.Exec(`UPDATE reminders SET sent=1 WHERE id=?`, id)
+	return err
+}
 
 type LastUserQuery struct {
 	Word     string
