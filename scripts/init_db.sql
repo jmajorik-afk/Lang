@@ -52,6 +52,7 @@ CREATE TABLE IF NOT EXISTS reminders (
     help_type TEXT NOT NULL,
     send_at DATETIME NOT NULL,
     sent INTEGER NOT NULL DEFAULT 0,
+    step INTEGER NOT NULL DEFAULT 1,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (user_id) REFERENCES users(id)
 );

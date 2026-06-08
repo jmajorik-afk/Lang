@@ -12,6 +12,7 @@ type Reminder struct {
 	Language string
 	HelpType string
 	SendAt   time.Time
+	Step     int // 1=3h, 2=1d, 3=7d, 4=30d
 }
 
 // ScheduleReminders creates spaced-repetition reminders for a word if not already scheduled.
@@ -31,10 +32,10 @@ func ScheduleReminders(db *sql.DB, userID int, word, language, helpType string) 
 		7 * 24 * time.Hour,
 		30 * 24 * time.Hour,
 	}
-	for _, d := range intervals {
+	for step, d := range intervals {
 		_, err := db.Exec(
-			`INSERT INTO reminders (user_id, word, language, help_type, send_at) VALUES (?,?,?,?,?)`,
-			userID, word, language, helpType, now.Add(d),
+			`INSERT INTO reminders (user_id, word, language, help_type, send_at, step) VALUES (?,?,?,?,?,?)`,
+			userID, word, language, helpType, now.Add(d), step+1,
 		)
 		if err != nil {
 			return err
@@ -46,7 +47,7 @@ func ScheduleReminders(db *sql.DB, userID int, word, language, helpType string) 
 // GetDueReminders returns all unsent reminders whose send_at <= now.
 func GetDueReminders(db *sql.DB) ([]Reminder, error) {
 	rows, err := db.Query(
-		`SELECT id, user_id, word, language, help_type, send_at FROM reminders WHERE sent=0 AND send_at <= ?`,
+		`SELECT id, user_id, word, language, help_type, send_at, step FROM reminders WHERE sent=0 AND send_at <= ?`,
 		time.Now(),
 	)
 	if err != nil {
@@ -57,7 +58,7 @@ func GetDueReminders(db *sql.DB) ([]Reminder, error) {
 	var reminders []Reminder
 	for rows.Next() {
 		var r Reminder
-		if err := rows.Scan(&r.ID, &r.UserID, &r.Word, &r.Language, &r.HelpType, &r.SendAt); err != nil {
+		if err := rows.Scan(&r.ID, &r.UserID, &r.Word, &r.Language, &r.HelpType, &r.SendAt, &r.Step); err != nil {
 			return nil, err
 		}
 		reminders = append(reminders, r)

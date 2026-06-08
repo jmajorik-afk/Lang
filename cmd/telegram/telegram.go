@@ -151,7 +151,7 @@ func scheduleReminders(db *sql.DB, tgbot *tgbotapi.BotAPI) {
 				continue
 			}
 			for _, r := range reminders {
-				bot.SendReminderMessage(tgbot, r.UserID, r.Word, r.Language, r.HelpType)
+				bot.SendReminderMessage(tgbot, r.UserID, r.Word, r.Language, r.HelpType, r.Step)
 				if err := storage.MarkReminderSent(db, r.ID); err != nil {
 					log.Printf("Error marking reminder %d sent: %v\n", r.ID, err)
 				}

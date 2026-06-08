@@ -565,11 +565,29 @@ func IsAllowedUser(update tgbotapi.Update, allowedUsers []int64) bool {
 	return false
 }
 
-// SendReminderMessage sends a spaced-repetition reminder to the user.
-func SendReminderMessage(bot *tgbotapi.BotAPI, userID int, word, language, helpType string) {
-	text := fmt.Sprintf("🔔 Reminder: time to review \"%s\" (%s — %s)", word, language, helpType)
+// SendReminderMessage sends a spaced-repetition reminder with different prompts per step.
+func SendReminderMessage(bot *tgbotapi.BotAPI, userID int, word, language, helpType string, step int) {
+	var text string
+	switch step {
+	case 1: // 3 hours — ask in Russian
+		text = fmt.Sprintf("как будет «%s» по-японски?", word)
+	case 2: // 1 day — give a hint
+		text = fmt.Sprintf("помнишь это слово? подсказка: первый символ — %s", firstChar(word))
+	case 3: // 1 week — ask in Japanese
+		text = fmt.Sprintf("「%s」を使って文(ぶん)を作(つく)って", word)
+	default: // 1 month — no hints
+		text = word
+	}
 	msg := tgbotapi.NewMessage(int64(userID), text)
 	if _, err := bot.Send(msg); err != nil {
 		log.Printf("Error sending reminder to user %d: %v\n", userID, err)
 	}
+}
+
+func firstChar(s string) string {
+	runes := []rune(s)
+	if len(runes) == 0 {
+		return s
+	}
+	return string(runes[0]) + "..."
 }
