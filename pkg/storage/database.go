@@ -126,6 +126,9 @@ func GetUserSpeechSpeed(db *sql.DB, userID int) (float64, error) {
 	if err != nil {
 		return 1.0, err
 	}
+	if speechSpeed <= 0 {
+		return 1.0, nil
+	}
 	return speechSpeed, nil
 }
 

@@ -36,7 +36,7 @@ func GetClaudeResponse(ctx context.Context, client *anthropic.Client, req Claude
 	msgParams = append(msgParams, anthropic.NewUserMessage(anthropic.NewTextBlock(req.UserMessage)))
 
 	params := anthropic.MessageNewParams{
-		Model:     anthropic.ModelClaude3_5HaikuLatest,
+		Model:     anthropic.ModelClaudeSonnet4_6,
 		MaxTokens: 1024,
 		Messages:  msgParams,
 	}

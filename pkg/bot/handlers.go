@@ -133,6 +133,86 @@ func sendAudioMessage(clients *Clients, db *sql.DB, firstLine string, userid int
 
 func HandleCallbackQuery(bot *tgbotapi.BotAPI, clients *Clients, callbackQuery *tgbotapi.CallbackQuery, db *sql.DB) {
 	data := callbackQuery.Data
+
+	if strings.HasPrefix(data, "action:") {
+		action := strings.TrimPrefix(data, "action:")
+		userID := int(callbackQuery.From.ID)
+		chatID := callbackQuery.Message.Chat.ID
+
+		lastQuery, err := storage.GetLastUserQuery(db, userID)
+		if err != nil || lastQuery == nil {
+			bot.Send(tgbotapi.NewMessage(chatID, "Не могу найти последнее слово. Напиши что-нибудь сначала."))
+			return
+		}
+
+		var prompt string
+		switch action {
+		case "examples":
+			prompt = lastQuery.Word
+			storage.UpdateUserHelpType(db, userID, "examples")
+		case "practice":
+			prompt = fmt.Sprintf("Дай мне практическое задание для слова «%s». Одно простое предложение на русском, которое нужно перевести на японский. Укажи новые слова с читалкой. Не давай ответ.", lastQuery.Word)
+		case "explain":
+			prompt = fmt.Sprintf("Объясни слово «%s» ещё раз, по-другому — другие примеры, другой угол.", lastQuery.Word)
+		}
+
+		if action == "examples" {
+			response, err := ProcessQuery("examples", lastQuery.Language, lastQuery.Word, db, userID, clients)
+			if err != nil {
+				log.Printf("Error processing examples: %v\n", err)
+				return
+			}
+			msg := tgbotapi.NewMessage(chatID, response)
+			msg.ReplyMarkup = postResponseKeyboard()
+			bot.Send(msg)
+		} else {
+			ctx := context.Background()
+			req := claude_api.ClaudeRequest{
+				SystemPrompt: fmt.Sprintf("You are a friendly Japanese tutor. No emojis. The user is learning Japanese. Respond in Russian. No formal language."),
+				UserMessage:  prompt,
+			}
+			response, err := claude_api.GetClaudeResponse(ctx, &clients.Claude, req)
+			if err != nil {
+				log.Printf("Error getting response: %v\n", err)
+				return
+			}
+			msg := tgbotapi.NewMessage(chatID, response)
+			if action == "practice" {
+				msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(
+					tgbotapi.NewInlineKeyboardRow(
+						tgbotapi.NewInlineKeyboardButtonData("Сдаюсь, покажи ответ", "action:show_answer"),
+					),
+				)
+			} else {
+				msg.ReplyMarkup = postResponseKeyboard()
+			}
+			bot.Send(msg)
+		}
+		return
+	}
+
+	if strings.HasPrefix(data, "action:show_answer") {
+		userID := int(callbackQuery.From.ID)
+		chatID := callbackQuery.Message.Chat.ID
+		lastQuery, err := storage.GetLastUserQuery(db, userID)
+		if err != nil || lastQuery == nil {
+			return
+		}
+		ctx := context.Background()
+		req := claude_api.ClaudeRequest{
+			SystemPrompt: "You are a friendly Japanese tutor. No emojis. Respond in Russian.",
+			UserMessage:  fmt.Sprintf("Покажи правильный перевод последнего задания со словом «%s» с полным разбором.", lastQuery.Word),
+		}
+		response, err := claude_api.GetClaudeResponse(ctx, &clients.Claude, req)
+		if err != nil {
+			return
+		}
+		msg := tgbotapi.NewMessage(chatID, response)
+		msg.ReplyMarkup = postResponseKeyboard()
+		bot.Send(msg)
+		return
+	}
+
 	if strings.HasPrefix(data, "language:") {
 		language := strings.Split(data, ":")[1]
 		updateLanguagePreference(bot, callbackQuery, db, language)
@@ -262,17 +342,27 @@ func speechSpeedInlineKeyboard() tgbotapi.InlineKeyboardMarkup {
 	return keyboard
 }
 
+func postResponseKeyboard() tgbotapi.InlineKeyboardMarkup {
+	return tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("Примеры", "action:examples"),
+			tgbotapi.NewInlineKeyboardButtonData("Попробую сам", "action:practice"),
+			tgbotapi.NewInlineKeyboardButtonData("Объясни ещё раз", "action:explain"),
+		),
+	)
+}
+
 func languageInlineKeyboard() tgbotapi.InlineKeyboardMarkup {
 	return tgbotapi.NewInlineKeyboardMarkup(
 		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("Dutch", "language:Dutch"),
+			tgbotapi.NewInlineKeyboardButtonData("Japanese", "language:Japanese"),
+			tgbotapi.NewInlineKeyboardButtonData("Spanish", "language:Spanish"),
 			tgbotapi.NewInlineKeyboardButtonData("French", "language:French"),
-			tgbotapi.NewInlineKeyboardButtonData("German", "language:German"),
 		),
 		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("German", "language:German"),
+			tgbotapi.NewInlineKeyboardButtonData("Dutch", "language:Dutch"),
 			tgbotapi.NewInlineKeyboardButtonData("Estonian", "language:Estonian"),
-			tgbotapi.NewInlineKeyboardButtonData("Spanish", "language:Spanish"),
-			tgbotapi.NewInlineKeyboardButtonData("Russian", "language:Russian"),
 		),
 	)
 }
@@ -340,6 +430,7 @@ func HandleMessage(ctx context.Context, bot *tgbotapi.BotAPI, message *tgbotapi.
 	}
 
 	msg := tgbotapi.NewMessage(message.Chat.ID, gptresponse)
+	msg.ReplyMarkup = postResponseKeyboard()
 	if _, err = bot.Send(msg); err != nil {
 		log.Printf("Error sending response: %v\n", err)
 	}
