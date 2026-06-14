@@ -2,6 +2,7 @@ package storage
 
 import (
 	"database/sql"
+	"strings"
 	"time"
 )
 
@@ -16,11 +17,11 @@ type Reminder struct {
 }
 
 // ScheduleReminders creates spaced-repetition reminders for a word if not already scheduled.
-func ScheduleReminders(db *sql.DB, userID int, word, language, helpType string) error {
+func ScheduleReminders(db *sql.DB, userID int, word string) error {
 	// Only schedule if this is the first time this word is queried by this user
 	var count int
-	err := db.QueryRow(`SELECT COUNT(*) FROM reminders WHERE user_id=? AND word=? AND language=?`,
-		userID, word, language).Scan(&count)
+	err := db.QueryRow(`SELECT COUNT(*) FROM reminders WHERE user_id=? AND word=?`,
+		userID, word).Scan(&count)
 	if err != nil || count > 0 {
 		return err
 	}
@@ -35,7 +36,7 @@ func ScheduleReminders(db *sql.DB, userID int, word, language, helpType string) 
 	for step, d := range intervals {
 		_, err := db.Exec(
 			`INSERT INTO reminders (user_id, word, language, help_type, send_at, step) VALUES (?,?,?,?,?,?)`,
-			userID, word, language, helpType, now.Add(d), step+1,
+			userID, word, "Japanese", "", now.Add(d), step+1,
 		)
 		if err != nil {
 			return err
@@ -66,9 +67,113 @@ func GetDueReminders(db *sql.DB) ([]Reminder, error) {
 	return reminders, nil
 }
 
+// GetUserVocab returns unique real words the user has studied (filters out meta-questions).
+func GetUserVocab(db *sql.DB, userID int) ([]LastUserQuery, error) {
+	rows, err := db.Query(`
+		SELECT DISTINCT word, help_type, language
+		FROM queries
+		WHERE user_id = ?
+		ORDER BY timestamp DESC
+	`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var vocab []LastUserQuery
+	seen := map[string]bool{}
+	for rows.Next() {
+		var q LastUserQuery
+		if err := rows.Scan(&q.Word, &q.Type, &q.Language); err != nil {
+			return nil, err
+		}
+		if !seen[q.Word] && IsRealWord(q.Word) {
+			seen[q.Word] = true
+			vocab = append(vocab, q)
+		}
+	}
+	return vocab, nil
+}
+
+// IsRealWord returns true if the entry looks like a word/phrase being studied,
+// not a meta-question or chat message.
+func IsRealWord(w string) bool {
+	// Too long — likely a full sentence question
+	runes := []rune(w)
+	if len(runes) > 30 {
+		return false
+	}
+	// Contains question mark
+	if strings.Contains(w, "?") {
+		return false
+	}
+	// Starts with common Russian question words
+	lower := strings.ToLower(strings.TrimSpace(w))
+	metaPrefixes := []string{
+		"что ", "как ", "почему ", "где ", "когда ", "а как", "а что",
+		"какие", "нет ", "стоп", "погоди", "подожди", "ты написал",
+		"что значит", "а кровать", "а жена",
+	}
+	for _, p := range metaPrefixes {
+		if strings.HasPrefix(lower, p) {
+			return false
+		}
+	}
+	return true
+}
+
+type ConversationTurn struct {
+	UserMessage string
+	BotResponse string
+}
+
+// SaveConversationTurn stores one user↔bot exchange.
+func SaveConversationTurn(db *sql.DB, userID int, userMessage, botResponse string) error {
+	_, err := db.Exec(
+		`INSERT INTO conversations (user_id, user_message, bot_response) VALUES (?,?,?)`,
+		userID, userMessage, botResponse,
+	)
+	return err
+}
+
+// GetConversationHistory returns the last n turns for a user, oldest first.
+func GetConversationHistory(db *sql.DB, userID int, n int) ([]ConversationTurn, error) {
+	rows, err := db.Query(`
+		SELECT user_message, bot_response FROM (
+			SELECT user_message, bot_response, created_at
+			FROM conversations
+			WHERE user_id = ?
+			ORDER BY created_at DESC
+			LIMIT ?
+		) ORDER BY created_at ASC
+	`, userID, n)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var turns []ConversationTurn
+	for rows.Next() {
+		var t ConversationTurn
+		if err := rows.Scan(&t.UserMessage, &t.BotResponse); err != nil {
+			return nil, err
+		}
+		turns = append(turns, t)
+	}
+	return turns, nil
+}
+
 // MarkReminderSent marks a reminder as sent.
 func MarkReminderSent(db *sql.DB, id int) error {
 	_, err := db.Exec(`UPDATE reminders SET sent=1 WHERE id=?`, id)
+	return err
+}
+
+// MarkWordLearned cancels all future reminders for a word for this user.
+func MarkWordLearned(db *sql.DB, userID int, word string) error {
+	_, err := db.Exec(
+		`UPDATE reminders SET sent=1 WHERE user_id=? AND word=? AND sent=0`,
+		userID, word,
+	)
 	return err
 }
 
@@ -78,20 +183,13 @@ type LastUserQuery struct {
 	Language string
 }
 
-func UpdateUserLanguage(db *sql.DB, userID int, language string) error {
-	// SQL query for upsert operation
-	query := `
-	INSERT INTO users (id, language, help_type, speech_speed)
-	VALUES (?, ?, ?, ?)
-	ON CONFLICT(id) DO UPDATE SET
-		language = EXCLUDED.language,
-		speech_speed = CASE WHEN EXCLUDED.speech_speed > 0 THEN EXCLUDED.speech_speed ELSE users.speech_speed END
-	`
-	_, err := db.Exec(query, userID, language, "", 0.0)
-	if err != nil {
-		return err
-	}
-	return nil
+// EnsureUser creates the user row (Japanese, default speed) if it doesn't exist yet.
+func EnsureUser(db *sql.DB, userID int) error {
+	_, err := db.Exec(
+		`INSERT OR IGNORE INTO users (id, language, help_type, speech_speed) VALUES (?, 'Japanese', '', 0.0)`,
+		userID,
+	)
+	return err
 }
 
 func UpdateUserSpeechSpeed(db *sql.DB, userID int, speech_speed float64) error {
@@ -104,18 +202,6 @@ func UpdateUserSpeechSpeed(db *sql.DB, userID int, speech_speed float64) error {
 		return err
 	}
 	return nil
-}
-
-func GetUserLanguage(db *sql.DB, userID int) (string, error) {
-	query := `
-	SELECT language FROM users WHERE id = ?;
-	`
-	var language string
-	err := db.QueryRow(query, userID).Scan(&language)
-	if err != nil {
-		return "", err
-	}
-	return language, nil
 }
 
 func GetUserSpeechSpeed(db *sql.DB, userID int) (float64, error) {
@@ -131,30 +217,6 @@ func GetUserSpeechSpeed(db *sql.DB, userID int) (float64, error) {
 		return 1.0, nil
 	}
 	return speechSpeed, nil
-}
-
-func UpdateUserHelpType(db *sql.DB, userID int, helpType string) error {
-	query := `
-    UPDATE users SET help_type = ?
-    WHERE id = ?;
-    `
-	_, err := db.Exec(query, helpType, userID)
-	if err != nil {
-		return err
-	}
-	return nil
-}
-
-func GetUserHelpType(db *sql.DB, userID int) (string, error) {
-	query := `
-	SELECT help_type FROM users WHERE id = ?;
-	`
-	var helpType string
-	err := db.QueryRow(query, userID).Scan(&helpType)
-	if err != nil {
-		return "", err
-	}
-	return helpType, nil
 }
 
 func StoreQuery(db *sql.DB, userID int, helpType, language, word string) (int, error) {
@@ -173,7 +235,6 @@ func StoreQuery(db *sql.DB, userID int, helpType, language, word string) (int, e
 }
 
 func GetLastUserQuery(db *sql.DB, userID int) (*LastUserQuery, error) {
-	// select last query from user, join with cached_responses to get type
 	query := `
   SELECT q.word, q.help_type, q.language
   FROM queries q
@@ -190,43 +251,3 @@ func GetLastUserQuery(db *sql.DB, userID int) (*LastUserQuery, error) {
 	return &lastQuery, nil
 }
 
-func CacheResponse(db *sql.DB, query_id int, response string) error {
-	query := `
-  INSERT INTO cached_responses (query_id, response)
-  VALUES (?, ?);
-  `
-	_, err := db.Exec(query, query_id, response)
-	if err != nil {
-		return err
-	}
-	return nil
-}
-
-func GetCachedResponseByWordLangAndType(db *sql.DB, language, helpType, word string) (string, error) {
-	query := `
-  SELECT cr.response
-  FROM cached_responses cr
-  JOIN queries q ON q.id = cr.query_id
-  WHERE q.language = ? AND q.help_type = ? AND q.word = ? ;
-  `
-	var response string
-	qr := db.QueryRow(query, language, helpType, word)
-	err := qr.Err()
-	if err != nil {
-		return "", err
-	}
-	qr.Scan(&response)
-	return response, nil
-}
-
-func CleanOldCachedResponses(db *sql.DB) error {
-	query := `
-        DELETE FROM cached_responses
-        WHERE datetime(created_at) < datetime('now', '-24 hours');
-    `
-	_, err := db.Exec(query)
-	if err != nil {
-		return err
-	}
-	return nil
-}

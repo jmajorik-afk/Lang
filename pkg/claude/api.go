@@ -36,9 +36,10 @@ func GetClaudeResponse(ctx context.Context, client *anthropic.Client, req Claude
 	msgParams = append(msgParams, anthropic.NewUserMessage(anthropic.NewTextBlock(req.UserMessage)))
 
 	params := anthropic.MessageNewParams{
-		Model:     anthropic.ModelClaudeSonnet4_6,
-		MaxTokens: 1024,
-		Messages:  msgParams,
+		Model:       anthropic.ModelClaudeSonnet4_6,
+		MaxTokens:   2048,
+		Temperature: anthropic.Float(0.3),
+		Messages:    msgParams,
 	}
 	if req.SystemPrompt != "" {
 		params.System = []anthropic.TextBlockParam{{Text: req.SystemPrompt}}

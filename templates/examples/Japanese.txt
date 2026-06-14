@@ -1,6 +1,4 @@
-user: кошка
-assistant: 猫 (ねこ, neko) — кошка\n\n1. 私の猫はかわいいです。\n   (わたしのねこはかわいいです / Watashi no neko wa kawaii desu.)\n   — Моя кошка милая.\n   📝 私 — кандзи, の・は・です — хирагана\n\n2. 猫が魚を食べています。\n   (ねこがさかなをたべています / Neko ga sakana wo tabete imasu.)\n   — Кошка ест рыбу.\n\n3. 彼女は猫が好きです。\n   (かのじょはねこがすきです / Kanojo wa neko ga suki desu.)\n   — Она любит кошек.
-user: есть (принимать пищу)
-assistant: 食べる (たべる, taberu) — есть, кушать\n\n1. 私は毎朝ご飯を食べます。\n   (わたしはまいあさごはんをたべます / Watashi wa maiasa gohan wo tabemasu.)\n   — Я ем рис каждое утро.\n   📝 食べ — кандзи, ます — хирагана (вежливый суффикс)\n\n2. 昨日、寿司を食べました。\n   (きのう、すしをたべました / Kinou, sushi wo tabemashita.)\n   — Вчера я ел суши.\n\n3. 一緒に食べませんか？\n   (いっしょにたべませんか / Issho ni tabemasen ka?)\n   — Не поедим вместе?
-user: красивый
-assistant: 美しい (うつくしい, utsukushii) — красивый\n\n1. この花は美しいです。\n   (このはなはうつくしいです / Kono hana wa utsukushii desu.)\n   — Этот цветок красивый.\n   📝 美し — кандзи, い・は・です — хирагана\n\n2. 美しい夕日を見た。\n   (うつくしいゆうひをみた / Utsukushii yuuhi wo mita.)\n   — Я увидел красивый закат.\n\n3. 彼女の声は美しい。\n   (かのじょのこえはうつくしい / Kanojo no koe wa utsukushii.)\n   — Её голос красивый.
+user: дерево
+assistant: 木(き)が ある。(ki ga aru.) — Есть дерево.\n大(おお)きい 木(き)だ。(ookii ki da.) — Большое дерево.\n木(き)の 下(した)で 待(ま)つ。(ki no shita de matsu.) — Жду под деревом.\n\nЧастица の показывает принадлежность — 木の下 это "низ дерева".
+user: есть (кушать)
+assistant: ご飯(はん)を 食(た)べる。(gohan wo taberu.) — Ем рис.\n猫(ねこ)が 魚(さかな)を 食(た)べる。(neko ga sakana wo taberu.) — Кошка ест рыбу.\n一緒(いっしょ)に 食(た)べよう。(issho ni tabeyou.) — Давай поедим вместе.\n\nЧастица を всегда отмечает то, что едят — прямой объект.

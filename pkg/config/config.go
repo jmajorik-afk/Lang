@@ -33,7 +33,6 @@ type TTSConfig struct {
 type Config struct {
 	GptTemplateWordUsageExamples *GptRequestType
 	GptTemplateWordTranslation   *GptRequestType
-	GptTemplateInflection        *GptRequestType
 	GptPromptTunings             GptPromptTuningByLanguageAndHelpType
 	TTSConfig                    *TTSConfig
 }
@@ -110,10 +109,6 @@ func NewConfig() *Config {
 		GptTemplateWordTranslation: &GptRequestType{
 			HelpType:       "translation",
 			PromptTemplate: template.Must(template.ParseFiles("templates/translation.txt")),
-		},
-		GptTemplateInflection: &GptRequestType{
-			HelpType:       "inflection",
-			PromptTemplate: template.Must(template.ParseFiles("templates/inflection.txt")),
 		},
 		TTSConfig: &TTSConfig{
 			Voice: "nova",

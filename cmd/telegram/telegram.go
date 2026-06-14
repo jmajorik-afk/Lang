@@ -30,12 +30,9 @@ func StartTelegramBot() {
 	}
 
 	_, err = tgbot.Request(tgbotapi.NewSetMyCommands(
-		tgbotapi.BotCommand{Command: "start", Description: "Configure the preferred language"},
-		tgbotapi.BotCommand{Command: "inflection", Description: "Give inflection of a given word"},
-		tgbotapi.BotCommand{Command: "translation", Description: "Provide translation of a phrase or a word"},
-		tgbotapi.BotCommand{Command: "examples", Description: "Provide 3-4 examples of a word or a phrase"},
-		tgbotapi.BotCommand{Command: "pronunciation", Description: "Pronounce a word or a phrase"},
-		tgbotapi.BotCommand{Command: "speech_speed", Description: "Set speech speed"},
+		tgbotapi.BotCommand{Command: "start", Description: "Начать"},
+		tgbotapi.BotCommand{Command: "speech_speed", Description: "Скорость произношения"},
+		tgbotapi.BotCommand{Command: "vocab", Description: "Показать все слова которые ты изучал"},
 		tgbotapi.BotCommand{Command: "healthz", Description: "Check service health status"},
 	))
 	if err != nil {
@@ -64,7 +61,6 @@ func StartTelegramBot() {
 
 	allowedUsers := parseAllowedUsers(os.Getenv("ALLOWED_TELEGRAM_USER_IDS"))
 
-	scheduleQueriesRemoval(db)
 	scheduleReminders(db, tgbot)
 
 	u := tgbotapi.NewUpdate(0)
@@ -121,25 +117,6 @@ func parseAllowedUsers(s string) []int64 {
 	return users
 }
 
-func scheduleQueriesRemoval(db *sql.DB) {
-	intervalStr := os.Getenv("CACHE_CLEAN_INTERVAL_HOURS")
-	if intervalStr == "" {
-		intervalStr = "24"
-	}
-	hours, err := strconv.Atoi(intervalStr)
-	if err != nil {
-		log.Fatal(err)
-	}
-	ticker := time.NewTicker(time.Duration(hours) * time.Hour)
-	go func() {
-		for range ticker.C {
-			if err := storage.CleanOldCachedResponses(db); err != nil {
-				log.Println("Error cleaning cached responses:", err)
-			}
-		}
-	}()
-}
-
 // scheduleReminders polls every 5 minutes and sends due spaced-repetition reminders.
 func scheduleReminders(db *sql.DB, tgbot *tgbotapi.BotAPI) {
 	ticker := time.NewTicker(5 * time.Minute)
@@ -151,7 +128,7 @@ func scheduleReminders(db *sql.DB, tgbot *tgbotapi.BotAPI) {
 				continue
 			}
 			for _, r := range reminders {
-				bot.SendReminderMessage(tgbot, r.UserID, r.Word, r.Language, r.HelpType, r.Step)
+				bot.SendReminderMessage(tgbot, r.UserID, r.Word, r.Step)
 				if err := storage.MarkReminderSent(db, r.ID); err != nil {
 					log.Printf("Error marking reminder %d sent: %v\n", r.ID, err)
 				}

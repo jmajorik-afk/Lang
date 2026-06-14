@@ -19,29 +19,8 @@ CREATE TABLE IF NOT EXISTS queries (
     FOREIGN KEY (user_id) REFERENCES users(id)
 );
 
--- Add column speech_speed to users table if it doesn't exist
-CREATE TABLE IF NOT EXISTS temp_users AS SELECT * FROM users; -- Create a temporary table
-DROP TABLE IF EXISTS users; -- Drop the original users table
-CREATE TABLE users (
-    id INTEGER PRIMARY KEY,
-    language TEXT NOT NULL,
-    help_type TEXT NOT NULL,
-    speech_speed REAL NOT NULL DEFAULT 0.0 -- Recreate the users table with the new column
-);
-INSERT INTO users (id, language, help_type) SELECT id, language, help_type FROM temp_users;
-
-DROP TABLE IF EXISTS temp_users; -- Drop the temporary table
-
 -- Add indexes to queries table
 CREATE INDEX IF NOT EXISTS idx_queries_language ON queries (language, help_type, word);
-
--- Cached Responses Table
-CREATE TABLE IF NOT EXISTS cached_responses (
-    query_id INTEGER NOT NULL,
-    response TEXT NOT NULL,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (query_id) REFERENCES queries(id)
-);
 
 -- Reminders Table (spaced repetition)
 CREATE TABLE IF NOT EXISTS reminders (
@@ -58,4 +37,18 @@ CREATE TABLE IF NOT EXISTS reminders (
 );
 
 CREATE INDEX IF NOT EXISTS idx_reminders_send_at ON reminders (send_at, sent);
+
+-- Add learned_at column to reminders if not exists (migration-safe via temp table approach is handled in Go)
+
+
+-- Conversation history for passing context to Claude
+CREATE TABLE IF NOT EXISTS conversations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    user_message TEXT NOT NULL,
+    bot_response TEXT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_conversations_user ON conversations (user_id, created_at);
 
