@@ -139,6 +139,23 @@ func HandleCallbackQuery(bot *tgbotapi.BotAPI, clients *Clients, callbackQuery *
 		userID := int(callbackQuery.From.ID)
 		chatID := callbackQuery.Message.Chat.ID
 
+		if action == "learn" || action == "already_know" {
+			lastQuery, err := storage.GetLastUserQuery(db, userID)
+			if err != nil || lastQuery == nil {
+				bot.Send(tgbotapi.NewMessage(chatID, "Не могу найти слово. Напиши что-нибудь сначала."))
+				return
+			}
+			if action == "learn" {
+				if err := storage.ScheduleReminders(db, userID, lastQuery.Word, lastQuery.Language, lastQuery.Type); err != nil {
+					log.Printf("Error scheduling reminders: %v\n", err)
+				}
+				bot.Send(tgbotapi.NewMessage(chatID, fmt.Sprintf("Добавил «%s» в словарь. Буду напоминать!", lastQuery.Word)))
+			} else {
+				bot.Send(tgbotapi.NewMessage(chatID, "Окей, пропускаем."))
+			}
+			return
+		}
+
 		lastQuery, err := storage.GetLastUserQuery(db, userID)
 		if err != nil || lastQuery == nil {
 			bot.Send(tgbotapi.NewMessage(chatID, "Не могу найти последнее слово. Напиши что-нибудь сначала."))
@@ -349,6 +366,10 @@ func postResponseKeyboard() tgbotapi.InlineKeyboardMarkup {
 			tgbotapi.NewInlineKeyboardButtonData("Попробую сам", "action:practice"),
 			tgbotapi.NewInlineKeyboardButtonData("Объясни ещё раз", "action:explain"),
 		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("Выучить", "action:learn"),
+			tgbotapi.NewInlineKeyboardButtonData("Уже знаю", "action:already_know"),
+		),
 	)
 }
 
@@ -518,13 +539,6 @@ func ProcessQuery(helpType string, language string, message string, db *sql.DB, 
 	if err != nil {
 		log.Printf("Error storing query: %v\n", err)
 	}
-
-	// schedule spaced-repetition reminders (fire-and-forget)
-	go func() {
-		if err := storage.ScheduleReminders(db, userID, message, language, helpType); err != nil {
-			log.Printf("Error scheduling reminders: %v\n", err)
-		}
-	}()
 
 	var fewShot []claude_api.ChatMessage
 	if tunings, ok := cfg.GptPromptTunings[language]; ok {
