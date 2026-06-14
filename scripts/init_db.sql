@@ -58,3 +58,12 @@ CREATE TABLE IF NOT EXISTS reminders (
 
 CREATE INDEX IF NOT EXISTS idx_reminders_send_at ON reminders (send_at, sent);
 
+-- Quiz State Table (tracks pending spaced-repetition quizzes per user)
+CREATE TABLE IF NOT EXISTS user_quiz_state (
+    user_id INTEGER PRIMARY KEY,
+    word TEXT NOT NULL,
+    language TEXT NOT NULL,
+    help_type TEXT NOT NULL,
+    FOREIGN KEY (user_id) REFERENCES users(id)
+);
+

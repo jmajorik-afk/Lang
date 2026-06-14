@@ -406,6 +406,28 @@ type GptTemplateData struct {
 
 func HandleMessage(ctx context.Context, bot *tgbotapi.BotAPI, message *tgbotapi.Message, clients *Clients, db *sql.DB) {
 	userID := int(message.From.ID)
+
+	// If the user is answering a quiz reminder, reveal the word instead of treating their response as a new query.
+	quizState, err := storage.GetUserQuizState(db, userID)
+	if err != nil {
+		log.Printf("Error getting quiz state: %v\n", err)
+	}
+	if quizState != nil {
+		if err := storage.ClearUserQuizState(db, userID); err != nil {
+			log.Printf("Error clearing quiz state: %v\n", err)
+		}
+		text, _ := storage.GetCachedResponseByWordLangAndType(db, quizState.Language, quizState.HelpType, quizState.Word)
+		if text == "" {
+			text = quizState.Word
+		}
+		msg := tgbotapi.NewMessage(message.Chat.ID, text)
+		msg.ReplyMarkup = postResponseKeyboard()
+		if _, err := bot.Send(msg); err != nil {
+			log.Printf("Error sending quiz reveal: %v\n", err)
+		}
+		return
+	}
+
 	language, err := storage.GetUserLanguage(db, userID)
 	if err != nil {
 		log.Printf("Error getting user language: %v\n", err)
@@ -565,11 +587,20 @@ func IsAllowedUser(update tgbotapi.Update, allowedUsers []int64) bool {
 	return false
 }
 
-// SendReminderMessage sends a spaced-repetition reminder to the user.
-func SendReminderMessage(bot *tgbotapi.BotAPI, userID int, word, language, helpType string) {
-	text := fmt.Sprintf("🔔 Reminder: time to review \"%s\" (%s — %s)", word, language, helpType)
+// SendReminderMessage sends a spaced-repetition quiz reminder to the user.
+func SendReminderMessage(bot *tgbotapi.BotAPI, db *sql.DB, userID int, word, language, helpType string) {
+	runes := []rune(word)
+	hint := ""
+	if len(runes) > 0 {
+		hint = string(runes[0])
+	}
+	text := fmt.Sprintf("Помнишь это слово? Подсказка: первый символ — %s...", hint)
 	msg := tgbotapi.NewMessage(int64(userID), text)
 	if _, err := bot.Send(msg); err != nil {
 		log.Printf("Error sending reminder to user %d: %v\n", userID, err)
+		return
+	}
+	if err := storage.SetUserQuizState(db, userID, word, language, helpType); err != nil {
+		log.Printf("Error setting quiz state for user %d: %v\n", userID, err)
 	}
 }

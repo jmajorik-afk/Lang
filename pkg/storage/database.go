@@ -229,3 +229,35 @@ func CleanOldCachedResponses(db *sql.DB) error {
 	}
 	return nil
 }
+
+type QuizState struct {
+	Word     string
+	Language string
+	HelpType string
+}
+
+func SetUserQuizState(db *sql.DB, userID int, word, language, helpType string) error {
+	_, err := db.Exec(`
+		INSERT INTO user_quiz_state (user_id, word, language, help_type) VALUES (?, ?, ?, ?)
+		ON CONFLICT(user_id) DO UPDATE SET word=excluded.word, language=excluded.language, help_type=excluded.help_type`,
+		userID, word, language, helpType)
+	return err
+}
+
+func GetUserQuizState(db *sql.DB, userID int) (*QuizState, error) {
+	var q QuizState
+	err := db.QueryRow(`SELECT word, language, help_type FROM user_quiz_state WHERE user_id=?`, userID).
+		Scan(&q.Word, &q.Language, &q.HelpType)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &q, nil
+}
+
+func ClearUserQuizState(db *sql.DB, userID int) error {
+	_, err := db.Exec(`DELETE FROM user_quiz_state WHERE user_id=?`, userID)
+	return err
+}
