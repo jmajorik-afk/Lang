@@ -1,47 +1,42 @@
--- Initialize SQL Schema (init_db.sql)
+-- Schema for the Japanese learning bot (3 flows + /ask)
 
--- Users Table
 CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY,
-    language TEXT NOT NULL,
-    help_type TEXT NOT NULL,
-    speech_speed REAL NOT NULL DEFAULT 0.0 -- Set a default value for the speech_speed column
+    speech_speed REAL NOT NULL DEFAULT 1.0
 );
 
--- Queries Table
-CREATE TABLE IF NOT EXISTS queries (
+-- Saved vocabulary (only words the user explicitly pressed "Запомнить" on)
+CREATE TABLE IF NOT EXISTS vocab (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL,
     word TEXT NOT NULL,
-    language TEXT NOT NULL,
-    help_type TEXT NOT NULL,
-    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (user_id) REFERENCES users(id)
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(user_id, word)
 );
 
--- Add indexes to queries table
-CREATE INDEX IF NOT EXISTS idx_queries_language ON queries (language, help_type, word);
-
--- Reminders Table (spaced repetition)
+-- Spaced-repetition reminders (one pending row per word at a time)
 CREATE TABLE IF NOT EXISTS reminders (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL,
     word TEXT NOT NULL,
-    language TEXT NOT NULL,
-    help_type TEXT NOT NULL,
+    step INTEGER NOT NULL DEFAULT 1,
     send_at DATETIME NOT NULL,
     sent INTEGER NOT NULL DEFAULT 0,
-    step INTEGER NOT NULL DEFAULT 1,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (user_id) REFERENCES users(id)
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_reminders_due ON reminders (send_at, sent);
+
+-- Per-user interaction state machine
+CREATE TABLE IF NOT EXISTS user_state (
+    user_id INTEGER PRIMARY KEY,
+    mode TEXT NOT NULL DEFAULT '',          -- '' | practice_compose | practice_translate | reminder
+    word TEXT NOT NULL DEFAULT '',          -- current / active word
+    task_text TEXT NOT NULL DEFAULT '',     -- the sentence shown for practice
+    reminder_id INTEGER NOT NULL DEFAULT 0,
+    last_reminder_at DATETIME
 );
 
-CREATE INDEX IF NOT EXISTS idx_reminders_send_at ON reminders (send_at, sent);
-
--- Add learned_at column to reminders if not exists (migration-safe via temp table approach is handled in Go)
-
-
--- Conversation history for passing context to Claude
+-- Short conversation history fed back to Claude for word lookups
 CREATE TABLE IF NOT EXISTS conversations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL,
@@ -49,6 +44,4 @@ CREATE TABLE IF NOT EXISTS conversations (
     bot_response TEXT NOT NULL,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
-
 CREATE INDEX IF NOT EXISTS idx_conversations_user ON conversations (user_id, created_at);
-

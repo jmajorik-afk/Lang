@@ -31,17 +31,18 @@ func StartTelegramBot() {
 
 	_, err = tgbot.Request(tgbotapi.NewSetMyCommands(
 		tgbotapi.BotCommand{Command: "start", Description: "Начать"},
-		tgbotapi.BotCommand{Command: "speech_speed", Description: "Скорость произношения"},
-		tgbotapi.BotCommand{Command: "vocab", Description: "Показать все слова которые ты изучал"},
-		tgbotapi.BotCommand{Command: "healthz", Description: "Check service health status"},
+		tgbotapi.BotCommand{Command: "practice", Description: "Тренировка по выученным словам"},
+		tgbotapi.BotCommand{Command: "ask", Description: "Вопрос по грамматике"},
+		tgbotapi.BotCommand{Command: "vocab", Description: "Твой словарь"},
+		tgbotapi.BotCommand{Command: "speech_speed", Description: "Скорость озвучки"},
+		tgbotapi.BotCommand{Command: "healthz", Description: "Проверка работы"},
 	))
 	if err != nil {
 		log.Fatal("Error setting commands:", err)
 	}
 
-	claudeClient := claude_api.NewClient(os.Getenv("ANTHROPIC_API_KEY"))
 	clients := &bot.Clients{
-		Claude: claudeClient,
+		Claude: claude_api.NewClient(os.Getenv("ANTHROPIC_API_KEY")),
 		OpenAI: openai.NewClient(os.Getenv("OPENAI_API_TOKEN")),
 	}
 
@@ -78,11 +79,7 @@ func StartTelegramBot() {
 			}()
 
 			ctx := context.Background()
-
 			if !bot.IsAllowedUser(update, allowedUsers) {
-				if update.Message != nil {
-					log.Printf("User %d is not allowed", update.Message.From.ID)
-				}
 				return
 			}
 
@@ -117,21 +114,34 @@ func parseAllowedUsers(s string) []int64 {
 	return users
 }
 
-// scheduleReminders polls every 5 minutes and sends due spaced-repetition reminders.
+// scheduleReminders checks once a minute for due reminders and sends at most one
+// per user, throttled to one reminder per 30 minutes, never interrupting an
+// active practice or another pending reminder.
 func scheduleReminders(db *sql.DB, tgbot *tgbotapi.BotAPI) {
-	ticker := time.NewTicker(5 * time.Minute)
+	ticker := time.NewTicker(1 * time.Minute)
 	go func() {
 		for range ticker.C {
-			reminders, err := storage.GetDueReminders(db)
+			due, err := storage.GetDueReminders(db)
 			if err != nil {
 				log.Println("Error fetching reminders:", err)
 				continue
 			}
-			for _, r := range reminders {
-				bot.SendReminderMessage(tgbot, r.UserID, r.Word, r.Step)
-				if err := storage.MarkReminderSent(db, r.ID); err != nil {
-					log.Printf("Error marking reminder %d sent: %v\n", r.ID, err)
+			sent := map[int]bool{}
+			for _, r := range due {
+				if sent[r.UserID] {
+					continue
 				}
+				if last, ok := storage.GetLastReminderAt(db, r.UserID); ok && time.Since(last) < 30*time.Minute {
+					continue
+				}
+				if storage.GetState(db, r.UserID).Mode != "" {
+					continue // user is mid-practice or already answering a reminder
+				}
+				bot.SendReminder(tgbot, r.UserID, r.Word)
+				storage.MarkReminderSent(db, r.ID)
+				storage.SetLastReminderAt(db, r.UserID, time.Now())
+				storage.SetState(db, r.UserID, "reminder", r.Word, "", r.ID)
+				sent[r.UserID] = true
 			}
 		}
 	}()
