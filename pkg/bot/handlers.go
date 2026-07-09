@@ -102,15 +102,6 @@ func practiceOfferKeyboard() tgbotapi.InlineKeyboardMarkup {
 	)
 }
 
-// exitKeyboard — single "Закончить" (used by reminders, where there's no sentence to clarify).
-func exitKeyboard() tgbotapi.InlineKeyboardMarkup {
-	return tgbotapi.NewInlineKeyboardMarkup(
-		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("Закончить", "exit"),
-		),
-	)
-}
-
 // practiceKeyboard — "Закончить" + "Уточнить" (used during practice stages).
 func practiceKeyboard() tgbotapi.InlineKeyboardMarkup {
 	return tgbotapi.NewInlineKeyboardMarkup(
@@ -138,10 +129,22 @@ func roundKeyboard() tgbotapi.InlineKeyboardMarkup {
 	)
 }
 
-func askPracticeKeyboard() tgbotapi.InlineKeyboardMarkup {
+// askKeyboard — shown under a /ask answer: clarify further or practice the topic.
+func askKeyboard() tgbotapi.InlineKeyboardMarkup {
 	return tgbotapi.NewInlineKeyboardMarkup(
 		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("Хочешь попрактиковаться?", "ask_practice"),
+			tgbotapi.NewInlineKeyboardButtonData("Уточнить", "ask_clarify"),
+			tgbotapi.NewInlineKeyboardButtonData("Потренироваться", "ask_practice"),
+		),
+	)
+}
+
+// reminderKeyboard — shown under an SRS reminder.
+func reminderKeyboard() tgbotapi.InlineKeyboardMarkup {
+	return tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("Закончить", "exit"),
+			tgbotapi.NewInlineKeyboardButtonData("Не помню", "dont_remember"),
 		),
 	)
 }
@@ -191,6 +194,7 @@ func sendVocab(bot *tgbotapi.BotAPI, db *sql.DB, chatID int64, userID int) {
 
 func handleAsk(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, message *tgbotapi.Message) {
 	chatID := message.Chat.ID
+	userID := int(message.From.ID)
 	q := strings.TrimSpace(message.CommandArguments())
 	if q == "" {
 		send(bot, chatID, "Спроси что-нибудь про грамматику, например:\n/ask как работает частица は")
@@ -203,7 +207,10 @@ func handleAsk(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, message *tgbo
 		send(bot, chatID, "Ошибка, попробуй ещё раз.")
 		return
 	}
-	sendKb(bot, chatID, resp, askPracticeKeyboard())
+	// Remember the topic (question) and the answer so "Уточнить"/"Потренироваться"
+	// can build on them. Mode stays idle so plain word lookups still work.
+	storage.SetState(db, userID, "", q, resp, 0)
+	sendKb(bot, chatID, resp, askKeyboard())
 }
 
 // ---------- message entry (state router) ----------
@@ -219,11 +226,33 @@ func HandleMessage(ctx context.Context, bot *tgbotapi.BotAPI, message *tgbotapi.
 		checkPracticeTranslate(bot, clients, db, message, st)
 	case "clarify_compose", "clarify_translate":
 		handleClarify(bot, clients, db, message, st)
+	case "clarify_ask":
+		handleAskClarify(bot, clients, db, message, st)
 	case "reminder":
 		checkReminder(bot, clients, db, message, st)
 	default:
 		flow1Lookup(bot, clients, db, message)
 	}
+}
+
+// handleAskClarify answers a follow-up question about the previous /ask answer,
+// then keeps the user in the /ask context (clarify again or practice the topic).
+func handleAskClarify(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, message *tgbotapi.Message, st storage.State) {
+	chatID := message.Chat.ID
+	userID := int(message.From.ID)
+
+	think := sendThinking(bot, chatID)
+	sys := styleRules + " You are a friendly Japanese tutor. Reply in Russian. " +
+		"Earlier you explained this:\n" + st.TaskText + "\n" +
+		"Answer the user's follow-up question about it in 2-4 short lines."
+	resp, err := claudeOne(clients, sys, message.Text)
+	deleteMsg(bot, chatID, think)
+	if err != nil {
+		resp = "Не смог объяснить, попробуй переформулировать."
+	}
+	// stay in /ask context: keep the topic, update the answer for further drilling
+	storage.SetState(db, userID, "", st.Word, resp, 0)
+	sendKb(bot, chatID, resp, askKeyboard())
 }
 
 // handleClarify answers the user's question about the current practice sentence,
@@ -324,6 +353,27 @@ func startPracticeRandom(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, cha
 		return
 	}
 	startPractice(bot, clients, db, chatID, userID, word)
+}
+
+// startPracticeFromTopic builds a practice task around a grammar topic/question
+// (used by the /ask "Потренироваться" button) instead of a random vocab word.
+func startPracticeFromTopic(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, chatID int64, userID int, topic string) {
+	if strings.TrimSpace(topic) == "" {
+		startPracticeRandom(bot, clients, db, chatID, userID, "")
+		return
+	}
+	think := sendThinking(bot, chatID)
+	sys := styleRules + " You are a Japanese tutor. The user wants to practice this topic/question: «" + topic + "». " +
+		"Make a SHORT practice task in Russian: line 1 — one simple natural Russian sentence (5-8 words) that requires this grammar point or word. " +
+		"Then 2-3 helper words 'русское — японский(чтение, romaji)'. Do NOT translate the whole sentence into Japanese."
+	task, err := claudeOne(clients, sys, topic)
+	deleteMsg(bot, chatID, think)
+	if err != nil {
+		send(bot, chatID, "Ошибка, попробуй ещё раз.")
+		return
+	}
+	storage.SetState(db, userID, "practice_compose", topic, task, 0)
+	sendComposeTask(bot, chatID, task)
 }
 
 func startPractice(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, chatID int64, userID int, word string) {
@@ -458,7 +508,7 @@ func intervalFor(step int) time.Duration {
 func SendReminder(bot *tgbotapi.BotAPI, userID int, word string) {
 	sendKb(bot, int64(userID),
 		fmt.Sprintf("Повторение!\nКак будет «%s» по-японски? Напиши свой вариант.", word),
-		exitKeyboard())
+		reminderKeyboard())
 }
 
 // ---------- callbacks ----------
@@ -494,7 +544,33 @@ func HandleCallbackQuery(bot *tgbotapi.BotAPI, clients *Clients, callbackQuery *
 		send(bot, chatID, "Хорошо. Пиши, когда увидишь что-то интересное.")
 
 	case data == "ask_practice":
-		startPracticeRandom(bot, clients, db, chatID, userID, "")
+		startPracticeFromTopic(bot, clients, db, chatID, userID, storage.GetState(db, userID).Word)
+
+	case data == "ask_clarify":
+		st := storage.GetState(db, userID)
+		ctx := st.TaskText
+		if ctx == "" {
+			ctx = callbackQuery.Message.Text
+		}
+		storage.SetState(db, userID, "clarify_ask", st.Word, ctx, 0)
+		send(bot, chatID, "Что непонятно? Напиши вопрос.")
+
+	case data == "dont_remember":
+		st := storage.GetState(db, userID)
+		word := st.Word
+		if w, _, err := storage.GetReminder(db, st.ReminderID); err == nil && w != "" {
+			word = w
+		}
+		storage.ClearMode(db, userID)
+		if word == "" {
+			send(bot, chatID, "Окей.")
+			return
+		}
+		think := sendThinking(bot, chatID)
+		ans, _ := claudeOne(clients, styleRules+" Reply in Russian. Show how the word «"+word+"» is in Japanese: kanji(чтение) (romaji) — перевод, plus one short example.", word)
+		deleteMsg(bot, chatID, think)
+		storage.ScheduleReminder(db, userID, word, 1, time.Now().Add(intervalFor(1)))
+		send(bot, chatID, "Ничего страшного, вот как это:\n\n"+ans+"\n\nНапомню это слово снова скоро.")
 
 	case data == "exit":
 		storage.ClearMode(db, userID)
