@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	claude_api "language-learning-bot/pkg/claude"
 	"language-learning-bot/pkg/config"
@@ -22,6 +23,12 @@ import (
 )
 
 const historyTurns = 6
+
+// Interaction modes kept in user_state.mode for the "Запомнить" confirmation.
+const (
+	modeConfirmSave = "confirm_save" // bot asked «Запомнить слово «X»?»
+	modeAwaitWord   = "await_word"   // user rejected the guess and types the right word
+)
 
 // Clients bundles both API clients: Claude for text, OpenAI for TTS.
 type Clients struct {
@@ -139,6 +146,16 @@ func askKeyboard() tgbotapi.InlineKeyboardMarkup {
 	)
 }
 
+// confirmSaveKeyboard — shown under «Запомнить слово «X»?».
+func confirmSaveKeyboard() tgbotapi.InlineKeyboardMarkup {
+	return tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("Да", "save_yes"),
+			tgbotapi.NewInlineKeyboardButtonData("Нет", "save_no"),
+		),
+	)
+}
+
 // reminderKeyboard — shown under an SRS reminder.
 func reminderKeyboard() tgbotapi.InlineKeyboardMarkup {
 	return tgbotapi.NewInlineKeyboardMarkup(
@@ -230,9 +247,28 @@ func HandleMessage(ctx context.Context, bot *tgbotapi.BotAPI, message *tgbotapi.
 		handleAskClarify(bot, clients, db, message, st)
 	case "reminder":
 		checkReminder(bot, clients, db, message, st)
+	case modeAwaitWord:
+		handleAwaitWord(bot, clients, db, message)
 	default:
+		// modeConfirmSave lands here on purpose: if the user ignores the
+		// confirmation buttons and types something, treat it as a fresh lookup
+		// rather than trapping them in the save flow.
 		flow1Lookup(bot, clients, db, message)
 	}
+}
+
+// handleAwaitWord takes the word typed after the user rejected the bot's guess
+// and re-asks for confirmation instead of saving it blindly.
+func handleAwaitWord(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, message *tgbotapi.Message) {
+	chatID := message.Chat.ID
+	userID := int(message.From.ID)
+
+	word := resolveHeadword(clients, message.Text)
+	if word == "" {
+		send(bot, chatID, "Нужно одно слово, без лишнего. Попробуй ещё раз.")
+		return
+	}
+	askSaveConfirmation(bot, db, chatID, userID, word)
 }
 
 // handleAskClarify answers a follow-up question about the previous /ask answer,
@@ -342,6 +378,64 @@ func normalizeWord(message string) string {
 	// drop trailing/leading punctuation and collapse inner whitespace
 	m = strings.Trim(m, " \t?!.,;:")
 	return strings.Join(strings.Fields(m), " ")
+}
+
+// ---------- vocabulary word sanitation ----------
+
+// fillerPrefixes are conversational lead-ins typed before the actual word,
+// e.g. "А крыша ?" — without stripping these they end up saved verbatim.
+var fillerPrefixes = []string{"а ", "и ", "ну ", "вот ", "это ", "слово ", "ещё ", "еще "}
+
+// sanitizeWord reduces raw text to one clean lowercase word, or "" if it cannot
+// be reduced to a single word. "" is the signal that the caller must resolve it
+// (via Claude or by asking the user) rather than saving junk.
+func sanitizeWord(raw string) string {
+	w := strings.ToLower(normalizeWord(raw))
+	// peel repeated fillers: "а вот крыша" → "крыша"
+	for {
+		stripped := w
+		for _, p := range fillerPrefixes {
+			stripped = strings.TrimPrefix(stripped, p)
+		}
+		stripped = strings.TrimSpace(stripped)
+		if stripped == w {
+			break
+		}
+		w = stripped
+	}
+	w = strings.Trim(w, " \t?!.,;:«»\"'()")
+	if w == "" || strings.ContainsAny(w, " \t") {
+		return "" // still a phrase, not a single word
+	}
+	if utf8.RuneCountInString(w) > 32 {
+		return ""
+	}
+	return w
+}
+
+// resolveHeadword picks the single dictionary word to store in the vocabulary.
+// Clean single-word input is handled locally; only genuinely messy input costs
+// a Claude call.
+func resolveHeadword(clients *Clients, raw string) string {
+	if w := sanitizeWord(raw); w != "" {
+		return w
+	}
+	sys := "Extract the single Russian word the user asked about. " +
+		"Reply with exactly ONE word in dictionary form (nominative singular; infinitive for verbs), " +
+		"lowercase, no punctuation, no quotes, no explanation. " +
+		"If several words are present, pick the main noun or verb."
+	resp, err := claudeOne(clients, sys, raw)
+	if err != nil {
+		log.Printf("headword extraction error: %v", err)
+		return ""
+	}
+	return sanitizeWord(resp)
+}
+
+// askSaveConfirmation puts the user in the confirm step instead of saving blindly.
+func askSaveConfirmation(bot *tgbotapi.BotAPI, db *sql.DB, chatID int64, userID int, word string) {
+	storage.SetState(db, userID, modeConfirmSave, word, "", 0)
+	sendKb(bot, chatID, fmt.Sprintf("Запомнить слово «%s»?", word), confirmSaveKeyboard())
 }
 
 // ---------- Flow 2 — practice ----------
@@ -527,11 +621,37 @@ func HandleCallbackQuery(bot *tgbotapi.BotAPI, clients *Clients, callbackQuery *
 			send(bot, chatID, "Не понял, какое слово сохранить. Напиши слово ещё раз.")
 			return
 		}
-		storage.SaveVocab(db, userID, st.Word)
-		if !storage.HasPendingReminder(db, userID, st.Word) {
-			storage.ScheduleReminder(db, userID, st.Word, 1, time.Now().Add(intervalFor(1)))
+		think := sendThinking(bot, chatID)
+		word := resolveHeadword(clients, st.Word)
+		deleteMsg(bot, chatID, think)
+		if word == "" {
+			storage.SetState(db, userID, modeAwaitWord, "", "", 0)
+			send(bot, chatID, "Не понял, какое слово запомнить. Напиши его одним словом.")
+			return
 		}
-		send(bot, chatID, fmt.Sprintf("Добавил «%s» в словарь. Напомню по расписанию.", st.Word))
+		askSaveConfirmation(bot, db, chatID, userID, word)
+
+	case data == "save_yes":
+		st := storage.GetState(db, userID)
+		if st.Mode != modeConfirmSave {
+			send(bot, chatID, "Это подтверждение устарело. Нажми «Запомнить» ещё раз.")
+			return
+		}
+		word := sanitizeWord(st.Word)
+		if word == "" {
+			send(bot, chatID, "Не понял, какое слово сохранить. Напиши слово ещё раз.")
+			return
+		}
+		storage.SaveVocab(db, userID, word)
+		if !storage.HasPendingReminder(db, userID, word) {
+			storage.ScheduleReminder(db, userID, word, 1, time.Now().Add(intervalFor(1)))
+		}
+		storage.SetCurrentWord(db, userID, word) // also clears the confirm mode
+		send(bot, chatID, fmt.Sprintf("Добавил «%s» в словарь. Напомню по расписанию.", word))
+
+	case data == "save_no":
+		storage.SetState(db, userID, modeAwaitWord, "", "", 0)
+		send(bot, chatID, "Ок, не добавляю. Напиши одним словом, что запомнить.")
 
 	case data == "know":
 		sendKb(bot, chatID, "Хочешь попрактиковаться?", practiceOfferKeyboard())
