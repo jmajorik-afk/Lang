@@ -89,26 +89,43 @@ func SetLastReminderAt(db *sql.DB, userID int, at time.Time) error {
 
 // --- Vocabulary ---
 
-func SaveVocab(db *sql.DB, userID int, word string) error {
-	_, err := db.Exec(`INSERT OR IGNORE INTO vocab (user_id, word) VALUES (?, ?)`, userID, word)
+// VocabEntry is one saved word together with its Japanese translation/reading.
+type VocabEntry struct {
+	Word        string
+	Translation string // e.g. "植物(しょくぶつ) (shokubutsu)"; may be "" for legacy rows
+}
+
+// SaveVocab stores the word with its translation. If the word already exists,
+// its translation is refreshed.
+func SaveVocab(db *sql.DB, userID int, word, translation string) error {
+	_, err := db.Exec(`
+		INSERT INTO vocab (user_id, word, translation) VALUES (?, ?, ?)
+		ON CONFLICT(user_id, word) DO UPDATE SET translation=excluded.translation
+	`, userID, word, translation)
 	return err
 }
 
-func GetVocabList(db *sql.DB, userID int) ([]string, error) {
-	rows, err := db.Query(`SELECT word FROM vocab WHERE user_id=? ORDER BY created_at DESC`, userID)
+// SetVocabTranslation backfills the translation for an already-saved word.
+func SetVocabTranslation(db *sql.DB, userID int, word, translation string) error {
+	_, err := db.Exec(`UPDATE vocab SET translation=? WHERE user_id=? AND word=?`, translation, userID, word)
+	return err
+}
+
+func GetVocabList(db *sql.DB, userID int) ([]VocabEntry, error) {
+	rows, err := db.Query(`SELECT word, translation FROM vocab WHERE user_id=? ORDER BY created_at DESC`, userID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var words []string
+	var entries []VocabEntry
 	for rows.Next() {
-		var w string
-		if err := rows.Scan(&w); err != nil {
+		var e VocabEntry
+		if err := rows.Scan(&e.Word, &e.Translation); err != nil {
 			return nil, err
 		}
-		words = append(words, w)
+		entries = append(entries, e)
 	}
-	return words, nil
+	return entries, nil
 }
 
 // GetRandomVocabWord returns a random saved word, optionally excluding one.

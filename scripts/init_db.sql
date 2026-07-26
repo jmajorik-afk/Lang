@@ -10,6 +10,7 @@ CREATE TABLE IF NOT EXISTS vocab (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL,
     word TEXT NOT NULL,
+    translation TEXT NOT NULL DEFAULT '', -- Japanese: "kanji(чтение) (romaji)"
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(user_id, word)
 );
@@ -29,7 +30,7 @@ CREATE INDEX IF NOT EXISTS idx_reminders_due ON reminders (send_at, sent);
 -- Per-user interaction state machine
 CREATE TABLE IF NOT EXISTS user_state (
     user_id INTEGER PRIMARY KEY,
-    mode TEXT NOT NULL DEFAULT '',          -- '' | practice_compose | practice_translate | reminder | confirm_save | await_word
+    mode TEXT NOT NULL DEFAULT '',          -- '' | practice_compose | practice_translate | paused_compose | paused_translate | reminder | confirm_save | await_word
     word TEXT NOT NULL DEFAULT '',          -- current / active word
     task_text TEXT NOT NULL DEFAULT '',     -- the sentence shown for practice
     reminder_id INTEGER NOT NULL DEFAULT 0,

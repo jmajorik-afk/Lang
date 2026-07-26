@@ -156,6 +156,17 @@ func confirmSaveKeyboard() tgbotapi.InlineKeyboardMarkup {
 	)
 }
 
+// practiceExitKeyboard — shown when the user types something that doesn't look
+// like a practice answer (probably forgot they were mid-practice).
+func practiceExitKeyboard() tgbotapi.InlineKeyboardMarkup {
+	return tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("Да, закончить", "end_practice"),
+			tgbotapi.NewInlineKeyboardButtonData("Нет, продолжить", "resume_practice"),
+		),
+	)
+}
+
 // reminderKeyboard — shown under an SRS reminder.
 func reminderKeyboard() tgbotapi.InlineKeyboardMarkup {
 	return tgbotapi.NewInlineKeyboardMarkup(
@@ -186,7 +197,7 @@ func HandleCommand(ctx context.Context, bot *tgbotapi.BotAPI, message *tgbotapi.
 	case "ask":
 		handleAsk(bot, clients, db, message)
 	case "vocab":
-		sendVocab(bot, db, chatID, userID)
+		sendVocab(bot, clients, db, chatID, userID)
 	case "speech_speed":
 		sendKb(bot, chatID, "Выбери скорость озвучки:", speechSpeedInlineKeyboard())
 	case "healthz":
@@ -195,16 +206,43 @@ func HandleCommand(ctx context.Context, bot *tgbotapi.BotAPI, message *tgbotapi.
 	return nil
 }
 
-func sendVocab(bot *tgbotapi.BotAPI, db *sql.DB, chatID int64, userID int) {
-	words, _ := storage.GetVocabList(db, userID)
-	if len(words) == 0 {
+func sendVocab(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, chatID int64, userID int) {
+	entries, _ := storage.GetVocabList(db, userID)
+	if len(entries) == 0 {
 		send(bot, chatID, "Словарь пуст. Напиши слово и нажми «Запомнить».")
 		return
 	}
+
+	// Backfill Japanese for legacy rows saved before translations were stored.
+	missing := false
+	for _, e := range entries {
+		if e.Translation == "" {
+			missing = true
+			break
+		}
+	}
+	if missing {
+		think := sendThinking(bot, chatID)
+		for i := range entries {
+			if entries[i].Translation != "" {
+				continue
+			}
+			if tr := translateWord(clients, entries[i].Word); tr != "" {
+				storage.SetVocabTranslation(db, userID, entries[i].Word, tr)
+				entries[i].Translation = tr
+			}
+		}
+		deleteMsg(bot, chatID, think)
+	}
+
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("Твой словарь (%d):\n\n", len(words)))
-	for i, w := range words {
-		sb.WriteString(fmt.Sprintf("%d. %s\n", i+1, w))
+	sb.WriteString(fmt.Sprintf("Твой словарь (%d):\n\n", len(entries)))
+	for i, e := range entries {
+		if e.Translation != "" {
+			sb.WriteString(fmt.Sprintf("%d. %s — %s\n", i+1, e.Word, e.Translation))
+		} else {
+			sb.WriteString(fmt.Sprintf("%d. %s\n", i+1, e.Word))
+		}
 	}
 	send(bot, chatID, sb.String())
 }
@@ -234,13 +272,26 @@ func handleAsk(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, message *tgbo
 
 func HandleMessage(ctx context.Context, bot *tgbotapi.BotAPI, message *tgbotapi.Message, clients *Clients, db *sql.DB) {
 	userID := int(message.From.ID)
+	chatID := message.Chat.ID
 	storage.EnsureUser(db, userID)
 
 	switch st := storage.GetState(db, userID); st.Mode {
 	case "practice_compose":
+		if !looksLikePracticeAnswer(st.Mode, message.Text) {
+			offerPracticeExit(bot, db, chatID, userID, "paused_compose", st)
+			return
+		}
 		checkPracticeCompose(bot, clients, db, message, st)
 	case "practice_translate":
+		if !looksLikePracticeAnswer(st.Mode, message.Text) {
+			offerPracticeExit(bot, db, chatID, userID, "paused_translate", st)
+			return
+		}
 		checkPracticeTranslate(bot, clients, db, message, st)
+	case "paused_compose", "paused_translate":
+		// user typed instead of choosing a button — re-ask the exit question
+		// rather than leaving them stuck.
+		offerPracticeExit(bot, db, chatID, userID, st.Mode, st)
 	case "clarify_compose", "clarify_translate":
 		handleClarify(bot, clients, db, message, st)
 	case "clarify_ask":
@@ -263,12 +314,16 @@ func handleAwaitWord(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, message
 	chatID := message.Chat.ID
 	userID := int(message.From.ID)
 
+	think := sendThinking(bot, chatID)
 	word := resolveHeadword(clients, message.Text)
 	if word == "" {
+		deleteMsg(bot, chatID, think)
 		send(bot, chatID, "Нужно одно слово, без лишнего. Попробуй ещё раз.")
 		return
 	}
-	askSaveConfirmation(bot, db, chatID, userID, word)
+	translation := translateWord(clients, word)
+	deleteMsg(bot, chatID, think)
+	askSaveConfirmation(bot, db, chatID, userID, word, translation)
 }
 
 // handleAskClarify answers a follow-up question about the previous /ask answer,
@@ -432,10 +487,36 @@ func resolveHeadword(clients *Clients, raw string) string {
 	return sanitizeWord(resp)
 }
 
-// askSaveConfirmation puts the user in the confirm step instead of saving blindly.
-func askSaveConfirmation(bot *tgbotapi.BotAPI, db *sql.DB, chatID int64, userID int, word string) {
-	storage.SetState(db, userID, modeConfirmSave, word, "", 0)
-	sendKb(bot, chatID, fmt.Sprintf("Запомнить слово «%s»?", word), confirmSaveKeyboard())
+// translateWord returns the Japanese for a single Russian word as one compact
+// line "kanji(чтение) (romaji)", or "" on failure.
+func translateWord(clients *Clients, word string) string {
+	sys := "Translate the single Russian word «" + word + "» into Japanese. " +
+		"Reply with EXACTLY one line and nothing else: the Japanese word with every kanji immediately " +
+		"followed by its hiragana reading in round brackets, then one space, then the full romaji in round brackets. " +
+		"No Russian, no explanation, no example. Example for «растение»: 植物(しょくぶつ) (shokubutsu)"
+	resp, err := claudeOne(clients, sys, word)
+	if err != nil {
+		log.Printf("translateWord error: %v", err)
+		return ""
+	}
+	for _, line := range strings.Split(resp, "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			return line
+		}
+	}
+	return ""
+}
+
+// askSaveConfirmation puts the user in the confirm step (with the translation
+// already shown) instead of saving blindly. The translation is stashed in
+// task_text so "Да" can persist it without a second API call.
+func askSaveConfirmation(bot *tgbotapi.BotAPI, db *sql.DB, chatID int64, userID int, word, translation string) {
+	storage.SetState(db, userID, modeConfirmSave, word, translation, 0)
+	msg := fmt.Sprintf("Запомнить слово «%s»?", word)
+	if translation != "" {
+		msg = fmt.Sprintf("Запомнить слово «%s» — %s?", word, translation)
+	}
+	sendKb(bot, chatID, msg, confirmSaveKeyboard())
 }
 
 // ---------- Flow 2 — practice ----------
@@ -488,6 +569,43 @@ func startPractice(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, chatID in
 	}
 	storage.SetState(db, userID, "practice_compose", word, task, 0)
 	sendComposeTask(bot, chatID, task)
+}
+
+// looksLikePracticeAnswer guesses whether the message is a genuine attempt at
+// the current practice task, versus the user forgetting they are in practice and
+// typing something else (e.g. a Russian word to look up). False → offer to exit.
+func looksLikePracticeAnswer(mode, text string) bool {
+	t := strings.TrimSpace(text)
+	if t == "" {
+		return false
+	}
+	switch mode {
+	case "practice_compose":
+		// a compose answer is Japanese (kana/kanji) or romaji (Latin letters);
+		// pure Russian is never a valid answer to "compose this in Japanese".
+		return containsJapanese(t) || containsLatin(t)
+	case "practice_translate":
+		// a translate answer is a Russian phrase, so Cyrillic is expected here —
+		// only flag Japanese input, which clearly isn't a Russian translation.
+		return !containsJapanese(t)
+	}
+	return true
+}
+
+func containsLatin(s string) bool {
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') {
+			return true
+		}
+	}
+	return false
+}
+
+// offerPracticeExit pauses practice and asks whether to finish it. The task is
+// preserved so "Нет, продолжить" can resume exactly where the user was.
+func offerPracticeExit(bot *tgbotapi.BotAPI, db *sql.DB, chatID int64, userID int, pausedMode string, st storage.State) {
+	storage.SetState(db, userID, pausedMode, st.Word, st.TaskText, 0)
+	sendKb(bot, chatID, "Ты сейчас на практике. Закончить её?", practiceExitKeyboard())
 }
 
 func checkPracticeCompose(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, message *tgbotapi.Message, st storage.State) {
@@ -623,13 +741,15 @@ func HandleCallbackQuery(bot *tgbotapi.BotAPI, clients *Clients, callbackQuery *
 		}
 		think := sendThinking(bot, chatID)
 		word := resolveHeadword(clients, st.Word)
-		deleteMsg(bot, chatID, think)
 		if word == "" {
+			deleteMsg(bot, chatID, think)
 			storage.SetState(db, userID, modeAwaitWord, "", "", 0)
 			send(bot, chatID, "Не понял, какое слово запомнить. Напиши его одним словом.")
 			return
 		}
-		askSaveConfirmation(bot, db, chatID, userID, word)
+		translation := translateWord(clients, word)
+		deleteMsg(bot, chatID, think)
+		askSaveConfirmation(bot, db, chatID, userID, word, translation)
 
 	case data == "save_yes":
 		st := storage.GetState(db, userID)
@@ -642,12 +762,17 @@ func HandleCallbackQuery(bot *tgbotapi.BotAPI, clients *Clients, callbackQuery *
 			send(bot, chatID, "Не понял, какое слово сохранить. Напиши слово ещё раз.")
 			return
 		}
-		storage.SaveVocab(db, userID, word)
+		translation := st.TaskText // stashed by askSaveConfirmation
+		storage.SaveVocab(db, userID, word, translation)
 		if !storage.HasPendingReminder(db, userID, word) {
 			storage.ScheduleReminder(db, userID, word, 1, time.Now().Add(intervalFor(1)))
 		}
 		storage.SetCurrentWord(db, userID, word) // also clears the confirm mode
-		send(bot, chatID, fmt.Sprintf("Добавил «%s» в словарь. Напомню по расписанию.", word))
+		msg := fmt.Sprintf("Добавил «%s» в словарь. Напомню по расписанию.", word)
+		if translation != "" {
+			msg = fmt.Sprintf("Добавил «%s» — %s в словарь. Напомню по расписанию.", word, translation)
+		}
+		send(bot, chatID, msg)
 
 	case data == "save_no":
 		storage.SetState(db, userID, modeAwaitWord, "", "", 0)
@@ -691,6 +816,25 @@ func HandleCallbackQuery(bot *tgbotapi.BotAPI, clients *Clients, callbackQuery *
 		deleteMsg(bot, chatID, think)
 		storage.ScheduleReminder(db, userID, word, 1, time.Now().Add(intervalFor(1)))
 		send(bot, chatID, "Ничего страшного, вот как это:\n\n"+ans+"\n\nНапомню это слово снова скоро.")
+
+	case data == "end_practice":
+		storage.ClearMode(db, userID)
+		send(bot, chatID, "Практика завершена. Напиши слово — переведу и предложу запомнить.")
+
+	case data == "resume_practice":
+		st := storage.GetState(db, userID)
+		switch st.Mode {
+		case "paused_translate":
+			storage.SetState(db, userID, "practice_translate", st.Word, st.TaskText, 0)
+			send(bot, chatID, "Продолжаем практику.")
+			sendTranslateTask(bot, chatID, st.TaskText)
+		case "paused_compose":
+			storage.SetState(db, userID, "practice_compose", st.Word, st.TaskText, 0)
+			send(bot, chatID, "Продолжаем практику.")
+			sendComposeTask(bot, chatID, st.TaskText)
+		default:
+			send(bot, chatID, "Ок.")
+		}
 
 	case data == "exit":
 		storage.ClearMode(db, userID)
