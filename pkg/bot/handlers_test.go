@@ -1,6 +1,9 @@
 package bot
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 // TestSanitizeWord covers the junk that actually made it into the vocabulary
 // before the "Запомнить" flow normalized what it saved.
@@ -59,6 +62,37 @@ func TestLooksLikePracticeAnswer(t *testing.T) {
 	for _, c := range cases {
 		if got := looksLikePracticeAnswer(c.mode, c.text); got != c.want {
 			t.Errorf("looksLikePracticeAnswer(%q, %q) = %v, want %v", c.mode, c.text, got, c.want)
+		}
+	}
+}
+
+// TestIntervalFor pins the SRS schedule: growing intervals past the old 30-day
+// ceiling, capped at 180 days, and never shrinking as the step rises.
+func TestIntervalFor(t *testing.T) {
+	day := 24 * time.Hour
+	fixed := map[int]time.Duration{
+		0: 3 * time.Hour, 1: 3 * time.Hour, 2: day, 3: 7 * day,
+		4: 30 * day, 5: 60 * day, 6: 120 * day, 7: 180 * day, 42: 180 * day,
+	}
+	for step, want := range fixed {
+		if got := intervalFor(step); got != want {
+			t.Errorf("intervalFor(%d) = %v, want %v", step, got, want)
+		}
+	}
+	for step := 1; step < 12; step++ {
+		if intervalFor(step+1) < intervalFor(step) {
+			t.Errorf("intervalFor must not shrink: step %d→%d went %v→%v",
+				step, step+1, intervalFor(step), intervalFor(step+1))
+		}
+	}
+}
+
+// TestLapseStep — a wrong answer drops two steps (floor 1), not a full reset.
+func TestLapseStep(t *testing.T) {
+	cases := map[int]int{1: 1, 2: 1, 3: 1, 4: 2, 5: 3, 6: 4, 7: 5}
+	for step, want := range cases {
+		if got := lapseStep(step); got != want {
+			t.Errorf("lapseStep(%d) = %d, want %d", step, got, want)
 		}
 	}
 }

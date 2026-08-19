@@ -2,6 +2,10 @@ package storage
 
 import (
 	"database/sql"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
 	"time"
 )
 
@@ -128,16 +132,27 @@ func GetVocabList(db *sql.DB, userID int) ([]VocabEntry, error) {
 	return entries, nil
 }
 
-// GetRandomVocabWord returns a random saved word, optionally excluding one.
-func GetRandomVocabWord(db *sql.DB, userID int, exclude string) (string, error) {
+// GetWeakVocabWord picks the word the user knows least well: the one whose
+// latest SRS step is lowest (words never practiced count as step 0, i.e.
+// weakest). Random among ties, optionally excluding one word so consecutive
+// rounds don't repeat.
+func GetWeakVocabWord(db *sql.DB, userID int, exclude string) (string, error) {
+	const q = `
+		SELECT v.word
+		FROM vocab v
+		LEFT JOIN (
+			SELECT word, step FROM reminders
+			WHERE user_id = ?1
+			  AND id IN (SELECT MAX(id) FROM reminders WHERE user_id = ?1 GROUP BY word)
+		) s ON s.word = v.word
+		WHERE v.user_id = ?1 AND v.word <> ?2
+		ORDER BY COALESCE(s.step, 0) ASC, RANDOM()
+		LIMIT 1`
 	var w string
-	err := db.QueryRow(
-		`SELECT word FROM vocab WHERE user_id=? AND word<>? ORDER BY RANDOM() LIMIT 1`,
-		userID, exclude,
-	).Scan(&w)
+	err := db.QueryRow(q, userID, exclude).Scan(&w)
 	if err == sql.ErrNoRows && exclude != "" {
-		// only one word in vocab — fall back to it
-		err = db.QueryRow(`SELECT word FROM vocab WHERE user_id=? ORDER BY RANDOM() LIMIT 1`, userID).Scan(&w)
+		// only the excluded word exists — fall back to it
+		err = db.QueryRow(q, userID, "").Scan(&w)
 	}
 	if err != nil {
 		return "", err
@@ -211,6 +226,40 @@ func SaveConversationTurn(db *sql.DB, userID int, userMessage, botResponse strin
 		userID, userMessage, botResponse,
 	)
 	return err
+}
+
+// --- Backups ---
+
+// BackupDB writes a consistent snapshot of the live database into dir using
+// VACUUM INTO (safe while the bot is running) and prunes old snapshots so at
+// most keep newest files remain. Returns the path of the new snapshot.
+func BackupDB(db *sql.DB, dir string, keep int) (string, error) {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	path := filepath.Join(dir, "languagebot-"+time.Now().Format("20060102-150405")+".db")
+	// path is generated above — never user input — so inlining it is safe;
+	// VACUUM INTO does not support bound parameters.
+	if _, err := db.Exec("VACUUM INTO '" + path + "'"); err != nil {
+		return "", err
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return path, nil // backup itself succeeded; pruning is best-effort
+	}
+	var names []string
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasPrefix(e.Name(), "languagebot-") && strings.HasSuffix(e.Name(), ".db") {
+			names = append(names, e.Name())
+		}
+	}
+	sort.Strings(names) // timestamped names sort chronologically
+	for len(names) > keep {
+		os.Remove(filepath.Join(dir, names[0]))
+		names = names[1:]
+	}
+	return path, nil
 }
 
 func GetConversationHistory(db *sql.DB, userID int, n int) ([]ConversationTurn, error) {

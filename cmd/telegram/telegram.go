@@ -62,6 +62,7 @@ func StartTelegramBot() {
 
 	allowedUsers := parseAllowedUsers(os.Getenv("ALLOWED_TELEGRAM_USER_IDS"))
 
+	scheduleBackups(db)
 	scheduleReminders(db, tgbot)
 
 	u := tgbotapi.NewUpdate(0)
@@ -112,6 +113,26 @@ func parseAllowedUsers(s string) []int64 {
 		users = append(users, n)
 	}
 	return users
+}
+
+// scheduleBackups snapshots the database right away and then once a day,
+// keeping the 14 newest snapshots in ./backups. Losing the SRS state would
+// wipe the whole learning history, so this runs unconditionally.
+func scheduleBackups(db *sql.DB) {
+	backup := func() {
+		if path, err := storage.BackupDB(db, "backups", 14); err != nil {
+			log.Println("DB backup failed:", err)
+		} else {
+			log.Println("DB backup written:", path)
+		}
+	}
+	backup()
+	ticker := time.NewTicker(24 * time.Hour)
+	go func() {
+		for range ticker.C {
+			backup()
+		}
+	}()
 }
 
 // scheduleReminders checks once a minute for due reminders and sends at most one

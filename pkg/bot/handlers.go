@@ -193,7 +193,7 @@ func HandleCommand(ctx context.Context, bot *tgbotapi.BotAPI, message *tgbotapi.
 			"/vocab — твой словарь\n"+
 			"/speech_speed — скорость озвучки")
 	case "practice":
-		startPracticeRandom(bot, clients, db, chatID, userID, "")
+		startPracticeWeakest(bot, clients, db, chatID, userID, "")
 	case "ask":
 		handleAsk(bot, clients, db, message)
 	case "vocab":
@@ -521,8 +521,11 @@ func askSaveConfirmation(bot *tgbotapi.BotAPI, db *sql.DB, chatID int64, userID 
 
 // ---------- Flow 2 — practice ----------
 
-func startPracticeRandom(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, chatID int64, userID int, exclude string) {
-	word, err := storage.GetRandomVocabWord(db, userID, exclude)
+// startPracticeWeakest drills the word the user knows least well (lowest SRS
+// step; never-practiced words first) instead of a random one, so practice time
+// goes where it helps most.
+func startPracticeWeakest(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, chatID int64, userID int, exclude string) {
+	word, err := storage.GetWeakVocabWord(db, userID, exclude)
 	if err != nil || word == "" {
 		send(bot, chatID, "Сначала выучи пару слов — напиши слово и нажми «Запомнить».")
 		return
@@ -534,7 +537,7 @@ func startPracticeRandom(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, cha
 // (used by the /ask "Потренироваться" button) instead of a random vocab word.
 func startPracticeFromTopic(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, chatID int64, userID int, topic string) {
 	if strings.TrimSpace(topic) == "" {
-		startPracticeRandom(bot, clients, db, chatID, userID, "")
+		startPracticeWeakest(bot, clients, db, chatID, userID, "")
 		return
 	}
 	think := sendThinking(bot, chatID)
@@ -656,10 +659,14 @@ func checkPracticeTranslate(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, 
 // judge asks Claude to verdict an answer. Returns (ok, feedback-in-Russian).
 func judge(clients *Clients, task string) (bool, string) {
 	sys := styleRules + " You are a friendly Japanese tutor. Reply in Russian. Judge the user's answer to the task. " +
-		"Your VERY FIRST line must be exactly 'VERDICT: ok' if the answer is essentially correct " +
-		"(ignore minor typos and romaji-vs-kana), or 'VERDICT: retry' if it is wrong. " +
+		"Your VERY FIRST line must be exactly 'VERDICT: ok' or 'VERDICT: retry'. " +
+		"Say 'VERDICT: ok' if the answer is essentially correct: ignore minor typos and romaji-vs-kana, and accept any " +
+		"phrasing a native speaker would consider fine — there is usually more than one correct translation. " +
+		"When you are not confident the answer is actually wrong, prefer 'VERDICT: ok'. " +
+		"Say 'VERDICT: retry' ONLY for a real, identifiable mistake. " +
 		"Then a blank line, then short feedback: if ok — confirm and show the natural Japanese with kanji(чтение) and romaji. " +
-		"If retry — say what is off in 1-2 lines and show the correct version with romaji."
+		"If retry — name the exact mistake (which particle, conjugation or word, and why it is wrong) in 1-2 lines " +
+		"and show the correct version with romaji."
 	resp, err := claudeOne(clients, sys, task)
 	if err != nil {
 		return false, "Ошибка проверки, попробуй ещё раз."
@@ -692,28 +699,42 @@ func checkReminder(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, message *
 
 	if ok {
 		next := step + 1
-		if next > 4 {
-			next = 4
-		}
 		storage.ScheduleReminder(db, userID, word, next, time.Now().Add(intervalFor(next)))
 		send(bot, chatID, "Правильно!\n"+fb+"\n\nНапомню это слово ещё попозже.")
 	} else {
-		storage.ScheduleReminder(db, userID, word, 1, time.Now().Add(intervalFor(1)))
+		back := lapseStep(step)
+		storage.ScheduleReminder(db, userID, word, back, time.Now().Add(intervalFor(back)))
 		send(bot, chatID, fb+"\n\nНичего страшного — напомню это слово снова скоро.")
 	}
 }
 
 func intervalFor(step int) time.Duration {
-	switch step {
-	case 1:
+	switch {
+	case step <= 1:
 		return 3 * time.Hour
-	case 2:
+	case step == 2:
 		return 24 * time.Hour
-	case 3:
+	case step == 3:
 		return 7 * 24 * time.Hour
-	default:
+	case step == 4:
 		return 30 * 24 * time.Hour
+	case step == 5:
+		return 60 * 24 * time.Hour
+	case step == 6:
+		return 120 * 24 * time.Hour
+	default:
+		return 180 * 24 * time.Hour
 	}
+}
+
+// lapseStep is the SRS step after a wrong answer: drop two steps instead of a
+// full reset, so one bad day doesn't erase months of progress (Anki-style lapse).
+// An explicit «Не помню» still resets to step 1 — the user said they forgot.
+func lapseStep(step int) int {
+	if step <= 3 {
+		return 1
+	}
+	return step - 2
 }
 
 // SendReminder is called by the scheduler to ask the spaced-repetition question.
@@ -853,7 +874,7 @@ func HandleCallbackQuery(bot *tgbotapi.BotAPI, clients *Clients, callbackQuery *
 
 	case data == "round_yes":
 		st := storage.GetState(db, userID)
-		startPracticeRandom(bot, clients, db, chatID, userID, st.Word)
+		startPracticeWeakest(bot, clients, db, chatID, userID, st.Word)
 
 	case data == "round_no":
 		storage.ClearMode(db, userID)
