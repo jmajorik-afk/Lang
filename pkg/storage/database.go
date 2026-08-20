@@ -115,12 +115,42 @@ func SetVocabTranslation(db *sql.DB, userID int, word, translation string) error
 	return err
 }
 
-func GetVocabList(db *sql.DB, userID int) ([]VocabEntry, error) {
-	rows, err := db.Query(`SELECT word, translation FROM vocab WHERE user_id=? ORDER BY created_at DESC`, userID)
+// GetVocabPage returns the total number of saved words plus one page of them,
+// newest first (id breaks ties for words saved within the same second).
+func GetVocabPage(db *sql.DB, userID, offset, limit int) (int, []VocabEntry, error) {
+	var total int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM vocab WHERE user_id=?`, userID).Scan(&total); err != nil {
+		return 0, nil, err
+	}
+	rows, err := db.Query(
+		`SELECT word, translation FROM vocab WHERE user_id=?
+		 ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?`,
+		userID, limit, offset,
+	)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer rows.Close()
+	entries, err := scanVocab(rows)
+	return total, entries, err
+}
+
+// SearchVocab returns saved words containing the substring q (words are stored
+// lowercase, so pass q lowercased), newest first, capped at limit.
+func SearchVocab(db *sql.DB, userID int, q string, limit int) ([]VocabEntry, error) {
+	rows, err := db.Query(
+		`SELECT word, translation FROM vocab WHERE user_id=? AND instr(word, ?) > 0
+		 ORDER BY created_at DESC, id DESC LIMIT ?`,
+		userID, q, limit,
+	)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
+	return scanVocab(rows)
+}
+
+func scanVocab(rows *sql.Rows) ([]VocabEntry, error) {
 	var entries []VocabEntry
 	for rows.Next() {
 		var e VocabEntry
@@ -129,7 +159,7 @@ func GetVocabList(db *sql.DB, userID int) ([]VocabEntry, error) {
 		}
 		entries = append(entries, e)
 	}
-	return entries, nil
+	return entries, rows.Err()
 }
 
 // GetWeakVocabWord picks the word the user knows least well: the one whose

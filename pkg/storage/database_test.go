@@ -2,6 +2,7 @@ package storage
 
 import (
 	"database/sql"
+	"fmt"
 	"testing"
 	"time"
 
@@ -85,6 +86,62 @@ func TestGetWeakVocabWordFallsBackToExcluded(t *testing.T) {
 	}
 	if got != "крыша" {
 		t.Errorf("single-word vocab must fall back to the excluded word, got %q", got)
+	}
+}
+
+func TestGetVocabPage(t *testing.T) {
+	db := testDB(t)
+	const uid = 1
+	// 12 words; same created_at second, so id must break the tie (newest first)
+	for i := 1; i <= 12; i++ {
+		if err := SaveVocab(db, uid, fmt.Sprintf("слово%02d", i), ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	total, page, err := GetVocabPage(db, uid, 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 12 || len(page) != 10 {
+		t.Fatalf("page 1: total=%d len=%d, want 12/10", total, len(page))
+	}
+	if page[0].Word != "слово12" || page[9].Word != "слово03" {
+		t.Errorf("page 1 order: got %s..%s, want слово12..слово03", page[0].Word, page[9].Word)
+	}
+
+	total, page, err = GetVocabPage(db, uid, 10, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 12 || len(page) != 2 || page[0].Word != "слово02" || page[1].Word != "слово01" {
+		t.Errorf("page 2: total=%d len=%d %v, want the two oldest words", total, len(page), page)
+	}
+
+	_, page, err = GetVocabPage(db, uid, 20, 10) // past the end
+	if err != nil || len(page) != 0 {
+		t.Errorf("past-the-end page: len=%d err=%v, want empty and no error", len(page), err)
+	}
+}
+
+func TestSearchVocab(t *testing.T) {
+	db := testDB(t)
+	const uid = 1
+	for _, w := range []string{"крыша", "дерево", "игра"} {
+		if err := SaveVocab(db, uid, w, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := SearchVocab(db, uid, "рыш", 20)
+	if err != nil || len(got) != 1 || got[0].Word != "крыша" {
+		t.Errorf("search «рыш»: %v (err=%v), want just «крыша»", got, err)
+	}
+	got, _ = SearchVocab(db, uid, "е", 20)
+	if len(got) != 1 || got[0].Word != "дерево" {
+		t.Errorf("search «е»: %v, want just «дерево»", got)
+	}
+	if got, _ := SearchVocab(db, uid, "xyz", 20); len(got) != 0 {
+		t.Errorf("search «xyz»: %v, want no matches", got)
 	}
 }
 

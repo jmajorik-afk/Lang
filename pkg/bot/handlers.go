@@ -136,11 +136,12 @@ func roundKeyboard() tgbotapi.InlineKeyboardMarkup {
 	)
 }
 
-// askKeyboard — shown under a /ask answer: clarify further or practice the topic.
+// askKeyboard — shown under every answer in /ask mode. Follow-up questions are
+// typed directly (no button needed); «Закончить» leaves the mode.
 func askKeyboard() tgbotapi.InlineKeyboardMarkup {
 	return tgbotapi.NewInlineKeyboardMarkup(
 		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("Уточнить", "ask_clarify"),
+			tgbotapi.NewInlineKeyboardButtonData("Закончить", "exit"),
 			tgbotapi.NewInlineKeyboardButtonData("Потренироваться", "ask_practice"),
 		),
 	)
@@ -189,15 +190,19 @@ func HandleCommand(ctx context.Context, bot *tgbotapi.BotAPI, message *tgbotapi.
 	case "start":
 		send(bot, chatID, "Привет! Напиши любое слово — переведу, дам пример и предложу запомнить.\n\n"+
 			"/practice — тренировка по выученным словам\n"+
-			"/ask — вопрос по грамматике\n"+
-			"/vocab — твой словарь\n"+
+			"/ask — вопрос по грамматике (дальше уточняй просто сообщениями)\n"+
+			"/vocab — твой словарь; /vocab <часть слова> — поиск\n"+
 			"/speech_speed — скорость озвучки")
 	case "practice":
 		startPracticeWeakest(bot, clients, db, chatID, userID, "")
 	case "ask":
 		handleAsk(bot, clients, db, message)
 	case "vocab":
-		sendVocab(bot, clients, db, chatID, userID)
+		if q := strings.TrimSpace(message.CommandArguments()); q != "" {
+			sendVocabSearch(bot, db, chatID, userID, q)
+		} else {
+			sendVocab(bot, clients, db, chatID, userID, 0)
+		}
 	case "speech_speed":
 		sendKb(bot, chatID, "Выбери скорость озвучки:", speechSpeedInlineKeyboard())
 	case "healthz":
@@ -206,14 +211,20 @@ func HandleCommand(ctx context.Context, bot *tgbotapi.BotAPI, message *tgbotapi.
 	return nil
 }
 
-func sendVocab(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, chatID int64, userID int) {
-	entries, _ := storage.GetVocabList(db, userID)
-	if len(entries) == 0 {
-		send(bot, chatID, "Словарь пуст. Напиши слово и нажми «Запомнить».")
-		return
-	}
+// vocabPageSize keeps /vocab pages far under Telegram's 4096-char message cap.
+const vocabPageSize = 10
 
-	// Backfill Japanese for legacy rows saved before translations were stored.
+func vocabMoreKeyboard(offset int) tgbotapi.InlineKeyboardMarkup {
+	return tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("Показать ещё 10", fmt.Sprintf("vocab_more#%d", offset)),
+		),
+	)
+}
+
+// backfillTranslations fills missing Japanese for the rows about to be shown —
+// bounded by the page size, so at most a page worth of API calls.
+func backfillTranslations(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, chatID int64, userID int, entries []storage.VocabEntry) {
 	missing := false
 	for _, e := range entries {
 		if e.Translation == "" {
@@ -221,28 +232,77 @@ func sendVocab(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, chatID int64,
 			break
 		}
 	}
-	if missing {
-		think := sendThinking(bot, chatID)
-		for i := range entries {
-			if entries[i].Translation != "" {
-				continue
-			}
-			if tr := translateWord(clients, entries[i].Word); tr != "" {
-				storage.SetVocabTranslation(db, userID, entries[i].Word, tr)
-				entries[i].Translation = tr
-			}
+	if !missing {
+		return
+	}
+	think := sendThinking(bot, chatID)
+	for i := range entries {
+		if entries[i].Translation != "" {
+			continue
 		}
-		deleteMsg(bot, chatID, think)
+		if tr := translateWord(clients, entries[i].Word); tr != "" {
+			storage.SetVocabTranslation(db, userID, entries[i].Word, tr)
+			entries[i].Translation = tr
+		}
+	}
+	deleteMsg(bot, chatID, think)
+}
+
+func vocabLine(sb *strings.Builder, n int, e storage.VocabEntry) {
+	if e.Translation != "" {
+		fmt.Fprintf(sb, "%d. %s — %s\n", n, e.Word, e.Translation)
+	} else {
+		fmt.Fprintf(sb, "%d. %s\n", n, e.Word)
+	}
+}
+
+// sendVocab shows one page of the vocabulary (newest first) with a
+// «Показать ещё 10» button while more pages remain.
+func sendVocab(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, chatID int64, userID, offset int) {
+	total, entries, err := storage.GetVocabPage(db, userID, offset, vocabPageSize)
+	if err != nil || total == 0 {
+		send(bot, chatID, "Словарь пуст. Напиши слово и нажми «Запомнить».")
+		return
+	}
+	if len(entries) == 0 { // stale «ещё» button pointing past the end
+		send(bot, chatID, "Это уже всё — слов больше нет.")
+		return
 	}
 
+	backfillTranslations(bot, clients, db, chatID, userID, entries)
+
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("Твой словарь (%d):\n\n", len(entries)))
+	switch {
+	case offset == 0 && total <= vocabPageSize:
+		fmt.Fprintf(&sb, "Твой словарь (%d):\n\n", total)
+	case offset == 0:
+		fmt.Fprintf(&sb, "Твой словарь (%d), последние %d:\n\n", total, len(entries))
+	default:
+		fmt.Fprintf(&sb, "Твой словарь (%d), слова %d–%d:\n\n", total, offset+1, offset+len(entries))
+	}
 	for i, e := range entries {
-		if e.Translation != "" {
-			sb.WriteString(fmt.Sprintf("%d. %s — %s\n", i+1, e.Word, e.Translation))
-		} else {
-			sb.WriteString(fmt.Sprintf("%d. %s\n", i+1, e.Word))
-		}
+		vocabLine(&sb, offset+i+1, e)
+	}
+
+	if next := offset + len(entries); next < total {
+		sendKb(bot, chatID, sb.String(), vocabMoreKeyboard(next))
+		return
+	}
+	send(bot, chatID, sb.String())
+}
+
+// sendVocabSearch handles «/vocab <часть слова>» — a plain local substring
+// search over saved words, no API calls involved.
+func sendVocabSearch(bot *tgbotapi.BotAPI, db *sql.DB, chatID int64, userID int, q string) {
+	entries, err := storage.SearchVocab(db, userID, strings.ToLower(q), 20)
+	if err != nil || len(entries) == 0 {
+		send(bot, chatID, fmt.Sprintf("По «%s» ничего не нашёл. /vocab — весь список.", q))
+		return
+	}
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "Нашёл (%d):\n\n", len(entries))
+	for i, e := range entries {
+		vocabLine(&sb, i+1, e)
 	}
 	send(bot, chatID, sb.String())
 }
@@ -262,9 +322,10 @@ func handleAsk(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, message *tgbo
 		send(bot, chatID, "Ошибка, попробуй ещё раз.")
 		return
 	}
-	// Remember the topic (question) and the answer so "Уточнить"/"Потренироваться"
-	// can build on them. Mode stays idle so plain word lookups still work.
-	storage.SetState(db, userID, "", q, resp, 0)
+	// Enter ask mode: the topic (question) and answer are kept so follow-up
+	// messages and «Потренироваться» build on them. The user stays in this
+	// mode — typing more questions, no buttons — until «Закончить».
+	storage.SetState(db, userID, "ask", q, resp, 0)
 	sendKb(bot, chatID, resp, askKeyboard())
 }
 
@@ -294,8 +355,8 @@ func HandleMessage(ctx context.Context, bot *tgbotapi.BotAPI, message *tgbotapi.
 		offerPracticeExit(bot, db, chatID, userID, st.Mode, st)
 	case "clarify_compose", "clarify_translate":
 		handleClarify(bot, clients, db, message, st)
-	case "clarify_ask":
-		handleAskClarify(bot, clients, db, message, st)
+	case "ask", "clarify_ask": // clarify_ask: legacy state left by the old «Уточнить» button
+		handleAskFollowup(bot, clients, db, message, st)
 	case "reminder":
 		checkReminder(bot, clients, db, message, st)
 	case modeAwaitWord:
@@ -326,9 +387,9 @@ func handleAwaitWord(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, message
 	askSaveConfirmation(bot, db, chatID, userID, word, translation)
 }
 
-// handleAskClarify answers a follow-up question about the previous /ask answer,
-// then keeps the user in the /ask context (clarify again or practice the topic).
-func handleAskClarify(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, message *tgbotapi.Message, st storage.State) {
+// handleAskFollowup answers the next question typed in /ask mode and keeps the
+// user in the mode: every message is a follow-up until «Закончить».
+func handleAskFollowup(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, message *tgbotapi.Message, st storage.State) {
 	chatID := message.Chat.ID
 	userID := int(message.From.ID)
 
@@ -341,8 +402,8 @@ func handleAskClarify(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, messag
 	if err != nil {
 		resp = "Не смог объяснить, попробуй переформулировать."
 	}
-	// stay in /ask context: keep the topic, update the answer for further drilling
-	storage.SetState(db, userID, "", st.Word, resp, 0)
+	// keep the topic, remember the latest answer as context for the next question
+	storage.SetState(db, userID, "ask", st.Word, resp, 0)
 	sendKb(bot, chatID, resp, askKeyboard())
 }
 
@@ -812,14 +873,19 @@ func HandleCallbackQuery(bot *tgbotapi.BotAPI, clients *Clients, callbackQuery *
 	case data == "ask_practice":
 		startPracticeFromTopic(bot, clients, db, chatID, userID, storage.GetState(db, userID).Word)
 
-	case data == "ask_clarify":
+	case data == "ask_clarify": // legacy «Уточнить» buttons on old messages
 		st := storage.GetState(db, userID)
 		ctx := st.TaskText
 		if ctx == "" {
 			ctx = callbackQuery.Message.Text
 		}
-		storage.SetState(db, userID, "clarify_ask", st.Word, ctx, 0)
-		send(bot, chatID, "Что непонятно? Напиши вопрос.")
+		storage.SetState(db, userID, "ask", st.Word, ctx, 0)
+		send(bot, chatID, "Просто напиши свой вопрос сообщением.")
+
+	case strings.HasPrefix(data, "vocab_more#"):
+		if off, err := strconv.Atoi(strings.TrimPrefix(data, "vocab_more#")); err == nil && off > 0 {
+			sendVocab(bot, clients, db, chatID, userID, off)
+		}
 
 	case data == "dont_remember":
 		st := storage.GetState(db, userID)
