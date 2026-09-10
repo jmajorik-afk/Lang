@@ -46,8 +46,18 @@ const styleRules = "Plain text only — no Markdown, no #, no *, no bold, no hea
 	"never mix Cyrillic into romaji, never leave part of a word without romaji. Example: 育(そだ)っています (sodatte imasu). " +
 	"No emojis."
 
+// uncertaintyRule (research 1a): a wrong explanation reads exactly as fluently
+// as a right one, so the model must flag its own shaky points — but not hedge
+// on textbook basics, which would just be noise.
+const uncertaintyRule = " If you are not fully sure about a point — a rare usage, a dialect or register nuance, " +
+	"something native speakers disagree on, or anything you might be misremembering — say so in one short phrase " +
+	"(например: 'тут не уверен на 100%') instead of stating it as confidently as basic grammar. " +
+	"Never invent a rule to sound complete. Do NOT hedge on standard textbook grammar (particles, basic conjugation, " +
+	"common structures) — hedge only where the uncertainty is real."
+
 const grammarSystem = styleRules + " You are a friendly Japanese tutor. " +
-	"The user asks a grammar question in Russian. Answer in Russian, casually. Do not ask follow-up questions."
+	"The user asks a grammar question in Russian. Answer in Russian, casually. Do not ask follow-up questions." +
+	uncertaintyRule
 
 // ---------- small send helpers ----------
 
@@ -468,7 +478,7 @@ func handleAskFollowup(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, messa
 	think := sendThinking(bot, chatID)
 	sys := styleRules + " You are a friendly Japanese tutor. Reply in Russian. " +
 		"Earlier you explained this:\n" + st.TaskText + "\n" +
-		"Answer the user's follow-up question about it in 2-4 short lines."
+		"Answer the user's follow-up question about it in 2-4 short lines." + uncertaintyRule
 	resp, err := claudeOne(clients, sys, message.Text)
 	deleteMsg(bot, chatID, think)
 	if err != nil {
@@ -488,7 +498,7 @@ func handleClarify(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, message *
 	think := sendThinking(bot, chatID)
 	sys := styleRules + " You are a friendly Japanese tutor. Reply in Russian. " +
 		"The user is practicing with this task/sentence:\n" + st.TaskText + "\n" +
-		"Answer their question about it (grammar, particles, word meaning) in 2-4 short lines."
+		"Answer their question about it (grammar, particles, word meaning) in 2-4 short lines." + uncertaintyRule
 	resp, err := claudeOne(clients, sys, message.Text)
 	deleteMsg(bot, chatID, think)
 	if err != nil {
@@ -816,9 +826,12 @@ func startPractice(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, chatID in
 	sendComposeTask(bot, chatID, task)
 }
 
-// looksLikePracticeAnswer guesses whether the message is a genuine attempt at
-// the current practice task, versus the user forgetting they are in practice and
-// typing something else (e.g. a Russian word to look up). False → offer to exit.
+// looksLikePracticeAnswer is the free, zero-false-positive pre-filter for "this
+// cannot be an answer": pure Russian where Japanese/romaji is expected, or
+// Japanese where a Russian translation is expected. False → offer to exit
+// without spending an API call. Everything that passes is still classified by
+// the judge, whose 'offtrack' verdict catches the ambiguous cases — e.g. a
+// stray Russian word typed during the translate stage.
 func looksLikePracticeAnswer(mode, text string) bool {
 	t := strings.TrimSpace(text)
 	if t == "" {
@@ -857,14 +870,17 @@ func checkPracticeCompose(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, me
 	chatID := message.Chat.ID
 	userID := int(message.From.ID)
 	think := sendThinking(bot, chatID)
-	ok, fb := judge(clients, composeTask(st.TaskText, message.Text))
+	v, fb := judge(clients, composeTask(st.TaskText, message.Text))
 	deleteMsg(bot, chatID, think)
-	if !ok {
+	switch v {
+	case verdictOffTrack:
+		offerPracticeExit(bot, db, chatID, userID, "paused_compose", st)
+	case verdictRetry:
 		storage.SetLastAnswer(db, userID, message.Text)
 		sendKb(bot, chatID, fb+"\n\nПопробуй ещё раз.", practiceRetryKeyboard())
-		return
+	default:
+		advanceToTranslateStage(bot, clients, db, chatID, userID, st, "Правильно!\n"+fb)
 	}
-	advanceToTranslateStage(bot, clients, db, chatID, userID, st, "Правильно!\n"+fb)
 }
 
 func composeTask(task, answer string) string {
@@ -899,15 +915,18 @@ func checkPracticeTranslate(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, 
 	userID := int(message.From.ID)
 	think := sendThinking(bot, chatID)
 
-	ok, fb := judge(clients, translateTask(st.TaskText, message.Text))
+	v, fb := judge(clients, translateTask(st.TaskText, message.Text))
 	deleteMsg(bot, chatID, think)
-	if !ok {
+	switch v {
+	case verdictOffTrack:
+		offerPracticeExit(bot, db, chatID, userID, "paused_translate", st)
+	case verdictRetry:
 		storage.SetLastAnswer(db, userID, message.Text)
 		sendKb(bot, chatID, fb+"\n\nПопробуй ещё раз.", practiceRetryKeyboard())
-		return
+	default:
+		storage.ClearMode(db, userID)
+		sendKb(bot, chatID, "Правильно!\n"+fb+"\n\nЕщё раунд?", roundKeyboard())
 	}
-	storage.ClearMode(db, userID)
-	sendKb(bot, chatID, "Правильно!\n"+fb+"\n\nЕщё раунд?", roundKeyboard())
 }
 
 // handleContestPractice is «Оспорить» on a practice verdict: a second,
@@ -923,10 +942,10 @@ func handleContestPractice(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, c
 		task = translateTask(st.TaskText, st.LastAnswer)
 	}
 	think := sendThinking(bot, chatID)
-	ok, fb := judgeWith(clients, contestSystem, task)
+	v, fb := judgeWith(clients, contestSystem, task)
 	deleteMsg(bot, chatID, think)
 	storage.SetLastAnswer(db, userID, "") // one appeal per answer
-	if !ok {
+	if v != verdictOK {
 		sendKb(bot, chatID, "Перепроверил внимательно — всё же ошибка.\n"+fb+"\n\nПопробуй ещё раз.", practiceKeyboard())
 		return
 	}
@@ -948,10 +967,10 @@ func handleContestReminder(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, c
 		return
 	}
 	think := sendThinking(bot, chatID)
-	ok, fb := judgeWith(clients, contestSystem, "How do you say the word «"+word+"» in Japanese? User's answer: "+st.LastAnswer)
+	v, fb := judgeWith(clients, contestSystem, "How do you say the word «"+word+"» in Japanese? User's answer: "+st.LastAnswer)
 	deleteMsg(bot, chatID, think)
 	storage.SetLastAnswer(db, userID, "")
-	if !ok {
+	if v != verdictOK {
 		send(bot, chatID, "Перепроверил внимательно — всё же не то.\n"+fb)
 		return
 	}
@@ -961,17 +980,22 @@ func handleContestReminder(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, c
 	send(bot, chatID, "Ты прав, засчитываю!\n"+fb+"\n\nНапомню это слово ещё попозже.")
 }
 
-// judgeSystem grades an answer; it leans toward accepting valid alternatives
-// and must name the exact mistake when it does reject.
+// judgeSystem grades an answer. It leans toward accepting valid alternatives,
+// must name the exact mistake when it rejects (research 6, with one alternative
+// natural phrasing), and classifies non-answers as 'offtrack' (research 5) so
+// a stray lookup never gets scored as a wrong answer.
 const judgeSystem = styleRules + " You are a friendly Japanese tutor. Reply in Russian. Judge the user's answer to the task. " +
-	"Your VERY FIRST line must be exactly 'VERDICT: ok' or 'VERDICT: retry'. " +
-	"Say 'VERDICT: ok' if the answer is essentially correct: ignore minor typos and romaji-vs-kana, and accept any " +
+	"Your VERY FIRST line must be exactly one of: 'VERDICT: ok', 'VERDICT: retry', 'VERDICT: offtrack'. " +
+	"'VERDICT: offtrack' — the message is not an attempt at the task at all: an unrelated word or phrase " +
+	"(probably something to look up), a question, a request, small talk, or gibberish. Output nothing after it. " +
+	"'VERDICT: ok' — the answer is essentially correct: ignore minor typos and romaji-vs-kana, and accept any " +
 	"phrasing a native speaker would consider fine — there is usually more than one correct translation. " +
-	"When you are not confident the answer is actually wrong, prefer 'VERDICT: ok'. " +
-	"Say 'VERDICT: retry' ONLY for a real, identifiable mistake. " +
-	"Then a blank line, then short feedback: if ok — confirm and show the natural Japanese with kanji(чтение) and romaji. " +
-	"If retry — name the exact mistake (which particle, conjugation or word, and why it is wrong) in 1-2 lines " +
-	"and show the correct version with romaji."
+	"When you are not confident the answer is actually wrong, prefer ok. " +
+	"'VERDICT: retry' — ONLY for a real, identifiable mistake in a genuine attempt. " +
+	"Then a blank line, then short feedback. If ok: confirm and show the natural Japanese with kanji(чтение) and romaji, " +
+	"then, if a common natural alternative exists, ONE more line 'Ещё можно: ...' with kanji(чтение) and romaji. " +
+	"If retry: name the exact mistake (which particle, conjugation or word, and why it is wrong) in 1-2 lines, " +
+	"show the correct version with romaji, then, if a common natural alternative exists, ONE line 'Ещё можно: ...'."
 
 // contestSystem is the second, independent review used when the user disputes
 // a 'retry' verdict — explicitly generous about acceptable variants.
@@ -984,23 +1008,43 @@ const contestSystem = styleRules + " You are a careful Japanese tutor doing a SE
 	"grammatical or meaning error. Then a blank line, then 1-3 lines: if ok — say the answer is fine and show its " +
 	"natural form with kanji(чтение) and romaji; if retry — name the exact error and show the correct version with romaji."
 
-// judge asks Claude to verdict an answer. Returns (ok, feedback-in-Russian).
-func judge(clients *Clients, task string) (bool, string) {
+// verdict is the judge's classification of a user message.
+type verdict int
+
+const (
+	verdictRetry    verdict = iota // a genuine attempt with a real mistake (also the fallback for unparseable replies)
+	verdictOK                      // essentially correct
+	verdictOffTrack                // not an attempt at the task at all — never scored, never lapses SRS
+)
+
+// judge asks Claude to verdict an answer. Returns (verdict, feedback-in-Russian).
+func judge(clients *Clients, task string) (verdict, string) {
 	return judgeWith(clients, judgeSystem, task)
 }
 
-func judgeWith(clients *Clients, system, task string) (bool, string) {
+func judgeWith(clients *Clients, system, task string) (verdict, string) {
 	resp, err := claudeOne(clients, system, task)
 	if err != nil {
-		return false, "Ошибка проверки, попробуй ещё раз."
+		return verdictRetry, "Ошибка проверки, попробуй ещё раз."
 	}
-	ok := strings.HasPrefix(strings.ToLower(strings.TrimSpace(resp)), "verdict: ok")
+	return parseVerdict(resp)
+}
+
+// parseVerdict splits the model reply into its first-line verdict and the
+// feedback below it. Anything unrecognised counts as retry — the safe default
+// that keeps the user in the current stage.
+func parseVerdict(resp string) (verdict, string) {
+	first, rest := resp, ""
 	if i := strings.IndexByte(resp, '\n'); i >= 0 {
-		resp = strings.TrimSpace(resp[i+1:])
-	} else {
-		resp = ""
+		first, rest = resp[:i], strings.TrimSpace(resp[i+1:])
 	}
-	return ok, resp
+	switch strings.ToLower(strings.TrimSpace(first)) {
+	case "verdict: ok":
+		return verdictOK, rest
+	case "verdict: offtrack":
+		return verdictOffTrack, rest
+	}
+	return verdictRetry, rest
 }
 
 // ---------- Flow 3 — SRS reminder answer ----------
@@ -1016,11 +1060,18 @@ func checkReminder(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, message *
 	}
 
 	think := sendThinking(bot, chatID)
-	ok, fb := judge(clients, "How do you say the word «"+word+"» in Japanese? User's answer: "+message.Text)
+	v, fb := judge(clients, "How do you say the word «"+word+"» in Japanese? User's answer: "+message.Text)
 	deleteMsg(bot, chatID, think)
+
+	if v == verdictOffTrack {
+		// not an answer at all — don't lapse the word, just ask again
+		sendKb(bot, chatID, fmt.Sprintf("Это не похоже на ответ. Как будет «%s» по-японски? Или нажми «Закончить».", word),
+			reminderKeyboard())
+		return
+	}
 	storage.ClearMode(db, userID)
 
-	if ok {
+	if v == verdictOK {
 		next := step + 1
 		storage.ScheduleReminder(db, userID, word, next, time.Now().Add(intervalFor(next)))
 		send(bot, chatID, "Правильно!\n"+fb+"\n\nНапомню это слово ещё попозже.")

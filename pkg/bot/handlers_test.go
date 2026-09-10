@@ -110,6 +110,30 @@ func TestSplitHeadword(t *testing.T) {
 	}
 }
 
+// TestParseVerdict pins the judge protocol: first line is the verdict, the rest
+// is feedback; anything unrecognised is a retry so the user stays in the stage.
+func TestParseVerdict(t *testing.T) {
+	cases := []struct {
+		resp string
+		want verdict
+		fb   string
+	}{
+		{"VERDICT: ok\n\nОтлично, 屋根(やね) (yane)", verdictOK, "Отлично, 屋根(やね) (yane)"},
+		{"VERDICT: retry\n\nЧастица は вместо が.", verdictRetry, "Частица は вместо が."},
+		{"VERDICT: offtrack", verdictOffTrack, ""},
+		{"verdict: OK\nfine", verdictOK, "fine"},         // case-insensitive
+		{"  VERDICT: offtrack  \n", verdictOffTrack, ""}, // stray whitespace
+		{"Хм, сложно сказать", verdictRetry, ""},         // no verdict line → safe default
+		{"", verdictRetry, ""},
+	}
+	for _, c := range cases {
+		v, fb := parseVerdict(c.resp)
+		if v != c.want || fb != c.fb {
+			t.Errorf("parseVerdict(%q) = (%v, %q), want (%v, %q)", c.resp, v, fb, c.want, c.fb)
+		}
+	}
+}
+
 // TestLapseStep — a wrong answer drops two steps (floor 1), not a full reset.
 func TestLapseStep(t *testing.T) {
 	cases := map[int]int{1: 1, 2: 1, 3: 1, 4: 2, 5: 3, 6: 4, 7: 5}
