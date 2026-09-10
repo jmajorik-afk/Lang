@@ -37,16 +37,26 @@ type State struct {
 	Word       string
 	TaskText   string
 	ReminderID int
+	LastAnswer string // the user's most recent judged answer, kept so it can be contested
 }
 
 func GetState(db *sql.DB, userID int) State {
 	var s State
-	err := db.QueryRow(`SELECT mode, word, task_text, reminder_id FROM user_state WHERE user_id=?`, userID).
-		Scan(&s.Mode, &s.Word, &s.TaskText, &s.ReminderID)
+	err := db.QueryRow(`SELECT mode, word, task_text, reminder_id, last_answer FROM user_state WHERE user_id=?`, userID).
+		Scan(&s.Mode, &s.Word, &s.TaskText, &s.ReminderID, &s.LastAnswer)
 	if err != nil {
 		return State{}
 	}
 	return s
+}
+
+// SetLastAnswer remembers the answer that was just judged (for «Оспорить»).
+func SetLastAnswer(db *sql.DB, userID int, answer string) error {
+	_, err := db.Exec(`
+		INSERT INTO user_state (user_id, last_answer) VALUES (?, ?)
+		ON CONFLICT(user_id) DO UPDATE SET last_answer=excluded.last_answer
+	`, userID, answer)
+	return err
 }
 
 func upsertState(db *sql.DB, userID int, mode, word, task string, reminderID int) error {
@@ -95,6 +105,7 @@ func SetLastReminderAt(db *sql.DB, userID int, at time.Time) error {
 
 // VocabEntry is one saved word together with its Japanese translation/reading.
 type VocabEntry struct {
+	ID          int
 	Word        string
 	Translation string // e.g. "植物(しょくぶつ) (shokubutsu)"; may be "" for legacy rows
 }
@@ -123,7 +134,7 @@ func GetVocabPage(db *sql.DB, userID, offset, limit int) (int, []VocabEntry, err
 		return 0, nil, err
 	}
 	rows, err := db.Query(
-		`SELECT word, translation FROM vocab WHERE user_id=?
+		`SELECT id, word, translation FROM vocab WHERE user_id=?
 		 ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?`,
 		userID, limit, offset,
 	)
@@ -139,7 +150,7 @@ func GetVocabPage(db *sql.DB, userID, offset, limit int) (int, []VocabEntry, err
 // lowercase, so pass q lowercased), newest first, capped at limit.
 func SearchVocab(db *sql.DB, userID int, q string, limit int) ([]VocabEntry, error) {
 	rows, err := db.Query(
-		`SELECT word, translation FROM vocab WHERE user_id=? AND instr(word, ?) > 0
+		`SELECT id, word, translation FROM vocab WHERE user_id=? AND instr(word, ?) > 0
 		 ORDER BY created_at DESC, id DESC LIMIT ?`,
 		userID, q, limit,
 	)
@@ -154,12 +165,28 @@ func scanVocab(rows *sql.Rows) ([]VocabEntry, error) {
 	var entries []VocabEntry
 	for rows.Next() {
 		var e VocabEntry
-		if err := rows.Scan(&e.Word, &e.Translation); err != nil {
+		if err := rows.Scan(&e.ID, &e.Word, &e.Translation); err != nil {
 			return nil, err
 		}
 		entries = append(entries, e)
 	}
 	return entries, rows.Err()
+}
+
+// FindVocab returns the user's saved entry for a word.
+func FindVocab(db *sql.DB, userID int, word string) (VocabEntry, error) {
+	var e VocabEntry
+	err := db.QueryRow(`SELECT id, word, translation FROM vocab WHERE user_id=? AND word=?`, userID, word).
+		Scan(&e.ID, &e.Word, &e.Translation)
+	return e, err
+}
+
+// GetVocabEntry returns one saved entry by id, scoped to the user.
+func GetVocabEntry(db *sql.DB, userID, id int) (VocabEntry, error) {
+	var e VocabEntry
+	err := db.QueryRow(`SELECT id, word, translation FROM vocab WHERE user_id=? AND id=?`, userID, id).
+		Scan(&e.ID, &e.Word, &e.Translation)
+	return e, err
 }
 
 // GetWeakVocabWord picks the word the user knows least well: the one whose
@@ -213,6 +240,13 @@ func HasPendingReminder(db *sql.DB, userID int, word string) bool {
 	return n > 0
 }
 
+// DeletePendingReminders drops unsent reminders for a word (used when a
+// contested verdict is overturned and the lapse it scheduled must be undone).
+func DeletePendingReminders(db *sql.DB, userID int, word string) error {
+	_, err := db.Exec(`DELETE FROM reminders WHERE user_id=? AND word=? AND sent=0`, userID, word)
+	return err
+}
+
 func GetDueReminders(db *sql.DB) ([]DueReminder, error) {
 	rows, err := db.Query(
 		`SELECT id, user_id, word, step FROM reminders WHERE sent=0 AND send_at<=? ORDER BY send_at ASC`,
@@ -255,6 +289,47 @@ func SaveConversationTurn(db *sql.DB, userID int, userMessage, botResponse strin
 		`INSERT INTO conversations (user_id, user_message, bot_response) VALUES (?,?,?)`,
 		userID, userMessage, botResponse,
 	)
+	return err
+}
+
+// --- API budget ---
+
+// BumpDailyUsage counts one user-initiated API interaction for the given day
+// (YYYY-MM-DD) and returns the new total.
+func BumpDailyUsage(db *sql.DB, userID int, day string) (int, error) {
+	if _, err := db.Exec(`
+		INSERT INTO api_usage (user_id, day, calls) VALUES (?, ?, 1)
+		ON CONFLICT(user_id, day) DO UPDATE SET calls = calls + 1
+	`, userID, day); err != nil {
+		return 0, err
+	}
+	var n int
+	err := db.QueryRow(`SELECT calls FROM api_usage WHERE user_id=? AND day=?`, userID, day).Scan(&n)
+	return n, err
+}
+
+// --- Translation cache ---
+// A word's Japanese translation doesn't depend on the user, so it is cached
+// globally: saving or backfilling the same word twice never pays for Claude twice.
+
+func GetCachedTranslation(db *sql.DB, word string) (translation string, verified, ok bool) {
+	var v int
+	if err := db.QueryRow(`SELECT translation, verified FROM translation_cache WHERE word=?`, word).
+		Scan(&translation, &v); err != nil {
+		return "", false, false
+	}
+	return translation, v == 1, true
+}
+
+func SetCachedTranslation(db *sql.DB, word, translation string, verified bool) error {
+	v := 0
+	if verified {
+		v = 1
+	}
+	_, err := db.Exec(`
+		INSERT INTO translation_cache (word, translation, verified) VALUES (?, ?, ?)
+		ON CONFLICT(word) DO UPDATE SET translation=excluded.translation, verified=excluded.verified
+	`, word, translation, v)
 	return err
 }
 

@@ -34,6 +34,27 @@ func testDB(t *testing.T) *sql.DB {
 			sent INTEGER NOT NULL DEFAULT 0,
 			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 		)`,
+		`CREATE TABLE user_state (
+			user_id INTEGER PRIMARY KEY,
+			mode TEXT NOT NULL DEFAULT '',
+			word TEXT NOT NULL DEFAULT '',
+			task_text TEXT NOT NULL DEFAULT '',
+			reminder_id INTEGER NOT NULL DEFAULT 0,
+			last_reminder_at DATETIME,
+			last_answer TEXT NOT NULL DEFAULT ''
+		)`,
+		`CREATE TABLE api_usage (
+			user_id INTEGER NOT NULL,
+			day TEXT NOT NULL,
+			calls INTEGER NOT NULL DEFAULT 0,
+			PRIMARY KEY (user_id, day)
+		)`,
+		`CREATE TABLE translation_cache (
+			word TEXT PRIMARY KEY,
+			translation TEXT NOT NULL,
+			verified INTEGER NOT NULL DEFAULT 0,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		)`,
 	} {
 		if _, err := db.Exec(ddl); err != nil {
 			t.Fatal(err)
@@ -142,6 +163,94 @@ func TestSearchVocab(t *testing.T) {
 	}
 	if got, _ := SearchVocab(db, uid, "xyz", 20); len(got) != 0 {
 		t.Errorf("search «xyz»: %v, want no matches", got)
+	}
+}
+
+func TestSetLastAnswerRoundTrip(t *testing.T) {
+	db := testDB(t)
+	if err := SetLastAnswer(db, 1, "やね"); err != nil {
+		t.Fatal(err)
+	}
+	if got := GetState(db, 1).LastAnswer; got != "やね" {
+		t.Errorf("LastAnswer = %q, want やね", got)
+	}
+	SetLastAnswer(db, 1, "")
+	if got := GetState(db, 1).LastAnswer; got != "" {
+		t.Errorf("LastAnswer after clearing = %q, want empty", got)
+	}
+}
+
+func TestBumpDailyUsage(t *testing.T) {
+	db := testDB(t)
+	for want := 1; want <= 3; want++ {
+		n, err := BumpDailyUsage(db, 1, "2026-09-10")
+		if err != nil || n != want {
+			t.Fatalf("bump #%d: n=%d err=%v", want, n, err)
+		}
+	}
+	if n, _ := BumpDailyUsage(db, 1, "2026-09-11"); n != 1 {
+		t.Errorf("a new day must start from 1, got %d", n)
+	}
+	if n, _ := BumpDailyUsage(db, 2, "2026-09-10"); n != 1 {
+		t.Errorf("another user must start from 1, got %d", n)
+	}
+}
+
+func TestTranslationCache(t *testing.T) {
+	db := testDB(t)
+	if _, _, ok := GetCachedTranslation(db, "крыша"); ok {
+		t.Fatal("empty cache must miss")
+	}
+	SetCachedTranslation(db, "крыша", "屋根(やね) (yane)", false)
+	tr, verified, ok := GetCachedTranslation(db, "крыша")
+	if !ok || tr != "屋根(やね) (yane)" || verified {
+		t.Errorf("got (%q, verified=%v, ok=%v)", tr, verified, ok)
+	}
+	SetCachedTranslation(db, "крыша", "屋根(やね) (yane)", true) // later verified by Jisho
+	if _, verified, _ := GetCachedTranslation(db, "крыша"); !verified {
+		t.Error("cache must upgrade to verified")
+	}
+}
+
+func TestDeletePendingRemindersKeepsSentHistory(t *testing.T) {
+	db := testDB(t)
+	now := time.Now()
+	ScheduleReminder(db, 1, "крыша", 1, now)
+	MarkReminderSent(db, 1)                  // answered → history
+	ScheduleReminder(db, 1, "крыша", 1, now) // the lapse we want to undo
+	ScheduleReminder(db, 1, "дерево", 1, now)
+
+	if err := DeletePendingReminders(db, 1, "крыша"); err != nil {
+		t.Fatal(err)
+	}
+	if HasPendingReminder(db, 1, "крыша") {
+		t.Error("pending «крыша» reminder must be gone")
+	}
+	if !HasPendingReminder(db, 1, "дерево") {
+		t.Error("other words' reminders must be untouched")
+	}
+	var n int
+	db.QueryRow(`SELECT COUNT(*) FROM reminders WHERE word='крыша'`).Scan(&n)
+	if n != 1 {
+		t.Errorf("sent history must survive, got %d «крыша» rows", n)
+	}
+}
+
+func TestFindVocabAndGetVocabEntry(t *testing.T) {
+	db := testDB(t)
+	if err := SaveVocab(db, 1, "крыша", "屋根(やね) (yane)"); err != nil {
+		t.Fatal(err)
+	}
+	e, err := FindVocab(db, 1, "крыша")
+	if err != nil || e.ID == 0 || e.Translation != "屋根(やね) (yane)" {
+		t.Fatalf("FindVocab = %+v, err=%v", e, err)
+	}
+	byID, err := GetVocabEntry(db, 1, e.ID)
+	if err != nil || byID.Word != "крыша" {
+		t.Errorf("GetVocabEntry = %+v, err=%v", byID, err)
+	}
+	if _, err := GetVocabEntry(db, 2, e.ID); err == nil {
+		t.Error("an entry must only be readable by its owner")
 	}
 }
 

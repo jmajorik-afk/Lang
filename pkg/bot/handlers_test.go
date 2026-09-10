@@ -87,6 +87,29 @@ func TestIntervalFor(t *testing.T) {
 	}
 }
 
+// TestSplitHeadword pins how a translation line is taken apart — the written
+// form goes to Jisho and to TTS, the reading is compared with the dictionary.
+func TestSplitHeadword(t *testing.T) {
+	cases := []struct{ in, written, reading string }{
+		{"屋根(やね) (yane)", "屋根", "やね"},
+		{"遊(あそ)び (asobi)", "遊び", "あそび"}, // okurigana stays in the written form
+		{"植物(しょくぶつ) (shokubutsu)", "植物", "しょくぶつ"},
+		{"食(た)べ物(もの) (tabemono)", "食べ物", "たべもの"}, // two kanji runs
+		{"ありがとう (arigatou)", "ありがとう", "ありがとう"},   // kana-only word
+		{"", "", ""},
+		{"just latin", "", ""},
+	}
+	for _, c := range cases {
+		w, r := splitHeadword(c.in)
+		if w != c.written || r != c.reading {
+			t.Errorf("splitHeadword(%q) = (%q, %q), want (%q, %q)", c.in, w, r, c.written, c.reading)
+		}
+	}
+	if got := japaneseHeadword("屋根(やね) (yane)"); got != "屋根" {
+		t.Errorf("japaneseHeadword = %q, want 屋根", got)
+	}
+}
+
 // TestLapseStep — a wrong answer drops two steps (floor 1), not a full reset.
 func TestLapseStep(t *testing.T) {
 	cases := map[int]int{1: 1, 2: 1, 3: 1, 4: 2, 5: 3, 6: 4, 7: 5}

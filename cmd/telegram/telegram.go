@@ -42,8 +42,9 @@ func StartTelegramBot() {
 	}
 
 	clients := &bot.Clients{
-		Claude: claude_api.NewClient(os.Getenv("ANTHROPIC_API_KEY")),
-		OpenAI: openai.NewClient(os.Getenv("OPENAI_API_TOKEN")),
+		Claude:   claude_api.NewClient(os.Getenv("ANTHROPIC_API_KEY")),
+		OpenAI:   openai.NewClient(os.Getenv("OPENAI_API_TOKEN")),
+		DailyCap: envInt("DAILY_API_CAP", 300),
 	}
 
 	db, err := sql.Open("sqlite3", os.Getenv("SQLITE_PATH"))
@@ -97,6 +98,20 @@ func StartTelegramBot() {
 			}
 		}(update)
 	}
+}
+
+// envInt reads an integer env var, falling back to def when unset or invalid.
+func envInt(name string, def int) int {
+	s := strings.TrimSpace(os.Getenv(name))
+	if s == "" {
+		return def
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		log.Printf("invalid %s=%q, using default %d", name, s, def)
+		return def
+	}
+	return n
 }
 
 func parseAllowedUsers(s string) []int64 {

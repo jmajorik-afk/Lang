@@ -2,13 +2,21 @@ package claude_api
 
 import (
 	"context"
+	"time"
 
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/option"
 )
 
+// requestTimeout bounds one model call; the SDK retries transient failures
+// (429/5xx/network) with backoff up to maxRetries times inside that budget.
+const (
+	requestTimeout = 60 * time.Second
+	maxRetries     = 3
+)
+
 func NewClient(apiKey string) anthropic.Client {
-	return anthropic.NewClient(option.WithAPIKey(apiKey))
+	return anthropic.NewClient(option.WithAPIKey(apiKey), option.WithMaxRetries(maxRetries))
 }
 
 type ClaudeRequest struct {
@@ -23,6 +31,9 @@ type ChatMessage struct {
 }
 
 func GetClaudeResponse(ctx context.Context, client *anthropic.Client, req ClaudeRequest) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, requestTimeout)
+	defer cancel()
+
 	var msgParams []anthropic.MessageParam
 
 	for _, m := range req.Messages {

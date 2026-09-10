@@ -14,6 +14,7 @@ import (
 
 	claude_api "language-learning-bot/pkg/claude"
 	"language-learning-bot/pkg/config"
+	"language-learning-bot/pkg/jisho"
 	openai_api "language-learning-bot/pkg/openai"
 	storage "language-learning-bot/pkg/storage"
 
@@ -32,8 +33,9 @@ const (
 
 // Clients bundles both API clients: Claude for text, OpenAI for TTS.
 type Clients struct {
-	Claude anthropic.Client
-	OpenAI *openai.Client
+	Claude   anthropic.Client
+	OpenAI   *openai.Client
+	DailyCap int // max user-initiated API interactions per user per day; 0 = unlimited
 }
 
 // styleRules is prepended to every model prompt so all answers share one style.
@@ -119,6 +121,35 @@ func practiceKeyboard() tgbotapi.InlineKeyboardMarkup {
 	)
 }
 
+// practiceRetryKeyboard — shown after a 'retry' verdict: the user may dispute it.
+func practiceRetryKeyboard() tgbotapi.InlineKeyboardMarkup {
+	return tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("Закончить", "exit"),
+			tgbotapi.NewInlineKeyboardButtonData("Уточнить", "clarify"),
+			tgbotapi.NewInlineKeyboardButtonData("Оспорить", "contest#practice"),
+		),
+	)
+}
+
+// contestKeyboard — a lone «Оспорить» button (reminder answers).
+func contestKeyboard(data string) tgbotapi.InlineKeyboardMarkup {
+	return tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("Оспорить", data),
+		),
+	)
+}
+
+// playKeyboard — a lone 🔊 button that plays one saved vocab entry.
+func playKeyboard(vocabID int) tgbotapi.InlineKeyboardMarkup {
+	return tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("🔊", fmt.Sprintf("vocab_play#%d", vocabID)),
+		),
+	)
+}
+
 func sendComposeTask(bot *tgbotapi.BotAPI, chatID int64, task string) {
 	sendKb(bot, chatID, "Составь это предложение по-японски:\n\n"+task, practiceKeyboard())
 }
@@ -194,9 +225,14 @@ func HandleCommand(ctx context.Context, bot *tgbotapi.BotAPI, message *tgbotapi.
 			"/vocab — твой словарь; /vocab <часть слова> — поиск\n"+
 			"/speech_speed — скорость озвучки")
 	case "practice":
-		startPracticeWeakest(bot, clients, db, chatID, userID, "")
+		if capOK(bot, clients, db, chatID, userID) {
+			startPracticeWeakest(bot, clients, db, chatID, userID, "")
+		}
 	case "ask":
-		handleAsk(bot, clients, db, message)
+		// an empty /ask only prints the usage hint — no API call, no budget spent
+		if strings.TrimSpace(message.CommandArguments()) == "" || capOK(bot, clients, db, chatID, userID) {
+			handleAsk(bot, clients, db, message)
+		}
 	case "vocab":
 		if q := strings.TrimSpace(message.CommandArguments()); q != "" {
 			sendVocabSearch(bot, db, chatID, userID, q)
@@ -214,12 +250,27 @@ func HandleCommand(ctx context.Context, bot *tgbotapi.BotAPI, message *tgbotapi.
 // vocabPageSize keeps /vocab pages far under Telegram's 4096-char message cap.
 const vocabPageSize = 10
 
-func vocabMoreKeyboard(offset int) tgbotapi.InlineKeyboardMarkup {
-	return tgbotapi.NewInlineKeyboardMarkup(
+// vocabPageKeyboard — 🔊 to pick a word to hear, plus paging while more remain.
+func vocabPageKeyboard(offset int, more bool) tgbotapi.InlineKeyboardMarkup {
+	kb := tgbotapi.NewInlineKeyboardMarkup(
 		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("Показать ещё 10", fmt.Sprintf("vocab_more#%d", offset)),
+			tgbotapi.NewInlineKeyboardButtonData("🔊 Озвучить слово", fmt.Sprintf("vocab_audio#%d", offset)),
 		),
 	)
+	if more {
+		kb.InlineKeyboard = append(kb.InlineKeyboard, tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("Показать ещё 10", fmt.Sprintf("vocab_more#%d", offset+vocabPageSize)),
+		))
+	}
+	return kb
+}
+
+// vocabAudioKeyboard — one numbered 🔊 per word on the page, keyed by vocab id
+// so the buttons stay valid even if the list shifts underneath.
+func vocabAudioKeyboard(entries []storage.VocabEntry, offset int) tgbotapi.InlineKeyboardMarkup {
+	return numberedAudioKeyboard(len(entries),
+		func(i int) string { return fmt.Sprintf("vocab_play#%d", entries[i-1].ID) },
+		fmt.Sprintf("vocab_back#%d", offset))
 }
 
 // backfillTranslations fills missing Japanese for the rows about to be shown —
@@ -240,7 +291,7 @@ func backfillTranslations(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, ch
 		if entries[i].Translation != "" {
 			continue
 		}
-		if tr := translateWord(clients, entries[i].Word); tr != "" {
+		if tr, _ := translateWord(clients, db, entries[i].Word); tr != "" {
 			storage.SetVocabTranslation(db, userID, entries[i].Word, tr)
 			entries[i].Translation = tr
 		}
@@ -284,11 +335,22 @@ func sendVocab(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, chatID int64,
 		vocabLine(&sb, offset+i+1, e)
 	}
 
-	if next := offset + len(entries); next < total {
-		sendKb(bot, chatID, sb.String(), vocabMoreKeyboard(next))
+	sendKb(bot, chatID, sb.String(), vocabPageKeyboard(offset, offset+len(entries) < total))
+}
+
+// playVocabWord voices the Japanese headword of one saved entry.
+func playVocabWord(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, chatID int64, userID, id int) {
+	e, err := storage.GetVocabEntry(db, userID, id)
+	if err != nil {
+		send(bot, chatID, "Не нашёл это слово в словаре.")
 		return
 	}
-	send(bot, chatID, sb.String())
+	jp := japaneseHeadword(e.Translation)
+	if jp == "" {
+		send(bot, chatID, "У этого слова ещё нет японского перевода — открой /vocab, он подтянется.")
+		return
+	}
+	sendAudioMessage(clients, db, jp, userID, bot)
 }
 
 // sendVocabSearch handles «/vocab <часть слова>» — a plain local substring
@@ -336,7 +398,17 @@ func HandleMessage(ctx context.Context, bot *tgbotapi.BotAPI, message *tgbotapi.
 	chatID := message.Chat.ID
 	storage.EnsureUser(db, userID)
 
-	switch st := storage.GetState(db, userID); st.Mode {
+	st := storage.GetState(db, userID)
+	switch st.Mode {
+	case "paused_compose", "paused_translate", "reminder":
+		// paused: just a re-prompt, no API; reminder: SRS answers are never capped
+	default:
+		if !capOK(bot, clients, db, chatID, userID) {
+			return
+		}
+	}
+
+	switch st.Mode {
 	case "practice_compose":
 		if !looksLikePracticeAnswer(st.Mode, message.Text) {
 			offerPracticeExit(bot, db, chatID, userID, "paused_compose", st)
@@ -382,9 +454,9 @@ func handleAwaitWord(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, message
 		send(bot, chatID, "Нужно одно слово, без лишнего. Попробуй ещё раз.")
 		return
 	}
-	translation := translateWord(clients, word)
+	translation, verified := translateWord(clients, db, word)
 	deleteMsg(bot, chatID, think)
-	askSaveConfirmation(bot, db, chatID, userID, word, translation)
+	askSaveConfirmation(bot, db, chatID, userID, word, translation, verified)
 }
 
 // handleAskFollowup answers the next question typed in /ask mode and keeps the
@@ -549,8 +621,20 @@ func resolveHeadword(clients *Clients, raw string) string {
 }
 
 // translateWord returns the Japanese for a single Russian word as one compact
-// line "kanji(чтение) (romaji)", or "" on failure.
-func translateWord(clients *Clients, word string) string {
+// line "kanji(чтение) (romaji)", or "" on failure, plus whether Jisho confirmed
+// the reading. Results are cached globally (a word's translation doesn't depend
+// on the user); an unverified cached line is re-checked against Jisho on the
+// next hit, so a temporary Jisho outage never sticks.
+func translateWord(clients *Clients, db *sql.DB, word string) (string, bool) {
+	if tr, verified, ok := storage.GetCachedTranslation(db, word); ok {
+		if !verified {
+			if fixed, v := verifyWithJisho(clients, tr); v {
+				storage.SetCachedTranslation(db, word, fixed, true)
+				return fixed, true
+			}
+		}
+		return tr, verified
+	}
 	sys := "Translate the single Russian word «" + word + "» into Japanese. " +
 		"Reply with EXACTLY one line and nothing else: the Japanese word with every kanji immediately " +
 		"followed by its hiragana reading in round brackets, then one space, then the full romaji in round brackets. " +
@@ -558,9 +642,84 @@ func translateWord(clients *Clients, word string) string {
 	resp, err := claudeOne(clients, sys, word)
 	if err != nil {
 		log.Printf("translateWord error: %v", err)
-		return ""
+		return "", false
 	}
-	for _, line := range strings.Split(resp, "\n") {
+	tr := firstLine(resp)
+	if tr == "" {
+		return "", false
+	}
+	tr, verified := verifyWithJisho(clients, tr)
+	storage.SetCachedTranslation(db, word, tr, verified)
+	return tr, verified
+}
+
+// kanjiReadingRe matches one kanji run with its bracketed reading: 遊(あそ).
+var kanjiReadingRe = regexp.MustCompile(`[\p{Han}々〆ヶ]+[(（]([^)）]*)[)）]`)
+
+// splitHeadword takes a translation line like "遊(あそ)び (asobi)" and returns
+// the written form "遊び" and its full kana reading "あそび". A kana-only line
+// ("ありがとう (arigatou)") yields the same string for both. Returns "", "" when
+// there is no Japanese to work with.
+func splitHeadword(tr string) (written, reading string) {
+	jp := strings.TrimSpace(tr)
+	if i := strings.LastIndex(jp, " ("); i >= 0 { // drop the trailing romaji group
+		jp = strings.TrimSpace(jp[:i])
+	}
+	written = strings.TrimSpace(parenGroupRe.ReplaceAllString(jp, ""))
+	reading = strings.TrimSpace(kanjiReadingRe.ReplaceAllString(jp, "$1"))
+	if !containsJapanese(written) {
+		return "", ""
+	}
+	return written, reading
+}
+
+// japaneseHeadword is the bare Japanese word from a translation line — what TTS
+// should read aloud ("屋根(やね) (yane)" → "屋根").
+func japaneseHeadword(tr string) string {
+	written, _ := splitHeadword(tr)
+	return written
+}
+
+// verifyWithJisho checks the model's translation against the Jisho dictionary:
+// the written form must exist and its reading must match. On a mismatch the
+// dictionary wins and the line is re-rendered with the correct reading. If
+// Jisho is unreachable or doesn't know the word, the model's line is kept
+// (graceful degradation). Returns the possibly-corrected line and whether the
+// reading was confirmed.
+func verifyWithJisho(clients *Clients, tr string) (string, bool) {
+	written, reading := splitHeadword(tr)
+	if written == "" {
+		return tr, false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	entries, err := jisho.Lookup(ctx, written)
+	if err != nil {
+		log.Printf("jisho lookup %q failed, keeping model reading: %v", written, err)
+		return tr, false
+	}
+	dict := jisho.VerifyReading(entries, written)
+	if dict == "" {
+		log.Printf("jisho: %q not in dictionary, keeping model reading", written)
+		return tr, false
+	}
+	if dict == reading {
+		return tr, true
+	}
+	log.Printf("jisho: reading mismatch for %q — model %q, dictionary %q; using dictionary", written, reading, dict)
+	sys := styleRules + " The dictionary reading of «" + written + "» is «" + dict + "». " +
+		"Output exactly one line and nothing else: «" + written + "» with every kanji immediately followed by its " +
+		"reading in round brackets (the readings together must spell exactly «" + dict + "»), then a space, " +
+		"then the romaji of that reading in round brackets."
+	fixed, err := claudeOne(clients, sys, written)
+	if err != nil || firstLine(fixed) == "" {
+		return written + "(" + dict + ")", true // right reading even without romaji beats a wrong one
+	}
+	return firstLine(fixed), true
+}
+
+func firstLine(s string) string {
+	for _, line := range strings.Split(s, "\n") {
 		if line = strings.TrimSpace(line); line != "" {
 			return line
 		}
@@ -571,13 +730,35 @@ func translateWord(clients *Clients, word string) string {
 // askSaveConfirmation puts the user in the confirm step (with the translation
 // already shown) instead of saving blindly. The translation is stashed in
 // task_text so "Да" can persist it without a second API call.
-func askSaveConfirmation(bot *tgbotapi.BotAPI, db *sql.DB, chatID int64, userID int, word, translation string) {
+func askSaveConfirmation(bot *tgbotapi.BotAPI, db *sql.DB, chatID int64, userID int, word, translation string, verified bool) {
 	storage.SetState(db, userID, modeConfirmSave, word, translation, 0)
 	msg := fmt.Sprintf("Запомнить слово «%s»?", word)
 	if translation != "" {
 		msg = fmt.Sprintf("Запомнить слово «%s» — %s?", word, translation)
+		if verified {
+			msg += "\n(чтение сверено с Jisho)"
+		}
 	}
 	sendKb(bot, chatID, msg, confirmSaveKeyboard())
+}
+
+// capOK counts one user-initiated API interaction against the daily budget and
+// tells the user when it is exhausted. A DB hiccup never locks anyone out.
+func capOK(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, chatID int64, userID int) bool {
+	if clients.DailyCap <= 0 {
+		return true
+	}
+	n, err := storage.BumpDailyUsage(db, userID, time.Now().Format("2006-01-02"))
+	if err != nil {
+		log.Printf("usage counter error: %v", err)
+		return true
+	}
+	if n > clients.DailyCap {
+		send(bot, chatID, fmt.Sprintf("На сегодня лимит запросов исчерпан (%d в день). "+
+			"Напоминания продолжат приходить, а новые слова и практика — завтра.", clients.DailyCap))
+		return false
+	}
+	return true
 }
 
 // ---------- Flow 2 — practice ----------
@@ -676,16 +857,28 @@ func checkPracticeCompose(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, me
 	chatID := message.Chat.ID
 	userID := int(message.From.ID)
 	think := sendThinking(bot, chatID)
-
-	ok, fb := judge(clients, "Translate the Russian sentence into Japanese.\nRussian task:\n"+st.TaskText+
-		"\n\nUser's Japanese attempt: "+message.Text)
+	ok, fb := judge(clients, composeTask(st.TaskText, message.Text))
+	deleteMsg(bot, chatID, think)
 	if !ok {
-		deleteMsg(bot, chatID, think)
-		sendKb(bot, chatID, fb+"\n\nПопробуй ещё раз.", practiceKeyboard())
+		storage.SetLastAnswer(db, userID, message.Text)
+		sendKb(bot, chatID, fb+"\n\nПопробуй ещё раз.", practiceRetryKeyboard())
 		return
 	}
+	advanceToTranslateStage(bot, clients, db, chatID, userID, st, "Правильно!\n"+fb)
+}
 
-	// correct → move to stage 2 (translate a Japanese sentence to Russian)
+func composeTask(task, answer string) string {
+	return "Translate the Russian sentence into Japanese.\nRussian task:\n" + task + "\n\nUser's Japanese attempt: " + answer
+}
+
+func translateTask(task, answer string) string {
+	return "Translate the Japanese sentence into Russian.\nJapanese:\n" + task + "\n\nUser's Russian attempt: " + answer
+}
+
+// advanceToTranslateStage is the shared "compose answer accepted" path: show the
+// praise, then generate the stage-2 Japanese sentence to translate into Russian.
+func advanceToTranslateStage(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, chatID int64, userID int, st storage.State, praise string) {
+	think := sendThinking(bot, chatID)
 	sys := styleRules + " Generate ONE short simple Japanese sentence that uses «" + st.Word + "» for the user to translate into Russian. " +
 		"Output ONLY the Japanese sentence (every kanji with its reading in brackets) followed by ' (' + full romaji + ')'. " +
 		"Then optional helper lines 'японский(чтение, romaji) — русский'. Do NOT give the Russian translation of the sentence."
@@ -697,7 +890,7 @@ func checkPracticeCompose(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, me
 		return
 	}
 	storage.SetState(db, userID, "practice_translate", st.Word, jp, 0)
-	send(bot, chatID, "Правильно!\n"+fb)
+	send(bot, chatID, praise)
 	sendTranslateTask(bot, chatID, jp)
 }
 
@@ -706,29 +899,98 @@ func checkPracticeTranslate(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, 
 	userID := int(message.From.ID)
 	think := sendThinking(bot, chatID)
 
-	ok, fb := judge(clients, "Translate the Japanese sentence into Russian.\nJapanese:\n"+st.TaskText+
-		"\n\nUser's Russian attempt: "+message.Text)
+	ok, fb := judge(clients, translateTask(st.TaskText, message.Text))
 	deleteMsg(bot, chatID, think)
 	if !ok {
-		sendKb(bot, chatID, fb+"\n\nПопробуй ещё раз.", practiceKeyboard())
+		storage.SetLastAnswer(db, userID, message.Text)
+		sendKb(bot, chatID, fb+"\n\nПопробуй ещё раз.", practiceRetryKeyboard())
 		return
 	}
 	storage.ClearMode(db, userID)
 	sendKb(bot, chatID, "Правильно!\n"+fb+"\n\nЕщё раунд?", roundKeyboard())
 }
 
+// handleContestPractice is «Оспорить» on a practice verdict: a second,
+// independent and deliberately more permissive review of the same answer.
+func handleContestPractice(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, chatID int64, userID int) {
+	st := storage.GetState(db, userID)
+	if st.LastAnswer == "" || (st.Mode != "practice_compose" && st.Mode != "practice_translate") {
+		send(bot, chatID, "Оспаривать уже нечего — это задание закрыто.")
+		return
+	}
+	task := composeTask(st.TaskText, st.LastAnswer)
+	if st.Mode == "practice_translate" {
+		task = translateTask(st.TaskText, st.LastAnswer)
+	}
+	think := sendThinking(bot, chatID)
+	ok, fb := judgeWith(clients, contestSystem, task)
+	deleteMsg(bot, chatID, think)
+	storage.SetLastAnswer(db, userID, "") // one appeal per answer
+	if !ok {
+		sendKb(bot, chatID, "Перепроверил внимательно — всё же ошибка.\n"+fb+"\n\nПопробуй ещё раз.", practiceKeyboard())
+		return
+	}
+	if st.Mode == "practice_translate" {
+		storage.ClearMode(db, userID)
+		sendKb(bot, chatID, "Ты прав, засчитываю!\n"+fb+"\n\nЕщё раунд?", roundKeyboard())
+		return
+	}
+	advanceToTranslateStage(bot, clients, db, chatID, userID, st, "Ты прав, засчитываю!\n"+fb)
+}
+
+// handleContestReminder is «Оспорить» on a reminder verdict. If overturned, the
+// lapse that was scheduled is dropped and the word advances as if correct.
+func handleContestReminder(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, chatID int64, userID, reminderID int) {
+	st := storage.GetState(db, userID)
+	word, step, err := storage.GetReminder(db, reminderID)
+	if err != nil || word == "" || st.LastAnswer == "" {
+		send(bot, chatID, "Оспаривать уже нечего.")
+		return
+	}
+	think := sendThinking(bot, chatID)
+	ok, fb := judgeWith(clients, contestSystem, "How do you say the word «"+word+"» in Japanese? User's answer: "+st.LastAnswer)
+	deleteMsg(bot, chatID, think)
+	storage.SetLastAnswer(db, userID, "")
+	if !ok {
+		send(bot, chatID, "Перепроверил внимательно — всё же не то.\n"+fb)
+		return
+	}
+	storage.DeletePendingReminders(db, userID, word)
+	next := step + 1
+	storage.ScheduleReminder(db, userID, word, next, time.Now().Add(intervalFor(next)))
+	send(bot, chatID, "Ты прав, засчитываю!\n"+fb+"\n\nНапомню это слово ещё попозже.")
+}
+
+// judgeSystem grades an answer; it leans toward accepting valid alternatives
+// and must name the exact mistake when it does reject.
+const judgeSystem = styleRules + " You are a friendly Japanese tutor. Reply in Russian. Judge the user's answer to the task. " +
+	"Your VERY FIRST line must be exactly 'VERDICT: ok' or 'VERDICT: retry'. " +
+	"Say 'VERDICT: ok' if the answer is essentially correct: ignore minor typos and romaji-vs-kana, and accept any " +
+	"phrasing a native speaker would consider fine — there is usually more than one correct translation. " +
+	"When you are not confident the answer is actually wrong, prefer 'VERDICT: ok'. " +
+	"Say 'VERDICT: retry' ONLY for a real, identifiable mistake. " +
+	"Then a blank line, then short feedback: if ok — confirm and show the natural Japanese with kanji(чтение) and romaji. " +
+	"If retry — name the exact mistake (which particle, conjugation or word, and why it is wrong) in 1-2 lines " +
+	"and show the correct version with romaji."
+
+// contestSystem is the second, independent review used when the user disputes
+// a 'retry' verdict — explicitly generous about acceptable variants.
+const contestSystem = styleRules + " You are a careful Japanese tutor doing a SECOND, independent review. Reply in Russian. " +
+	"The user disputes an earlier 'incorrect' verdict on their answer. Re-examine it from scratch. " +
+	"Accept the answer if ANY reasonable native speaker would consider it correct: casual or polite forms, " +
+	"a different but natural word order, an omitted subject, an alternative particle where both are natural, " +
+	"minor typos, romaji-vs-kana. " +
+	"Your VERY FIRST line must be exactly 'VERDICT: ok' or 'VERDICT: retry'. Keep 'retry' ONLY for a definite " +
+	"grammatical or meaning error. Then a blank line, then 1-3 lines: if ok — say the answer is fine and show its " +
+	"natural form with kanji(чтение) and romaji; if retry — name the exact error and show the correct version with romaji."
+
 // judge asks Claude to verdict an answer. Returns (ok, feedback-in-Russian).
 func judge(clients *Clients, task string) (bool, string) {
-	sys := styleRules + " You are a friendly Japanese tutor. Reply in Russian. Judge the user's answer to the task. " +
-		"Your VERY FIRST line must be exactly 'VERDICT: ok' or 'VERDICT: retry'. " +
-		"Say 'VERDICT: ok' if the answer is essentially correct: ignore minor typos and romaji-vs-kana, and accept any " +
-		"phrasing a native speaker would consider fine — there is usually more than one correct translation. " +
-		"When you are not confident the answer is actually wrong, prefer 'VERDICT: ok'. " +
-		"Say 'VERDICT: retry' ONLY for a real, identifiable mistake. " +
-		"Then a blank line, then short feedback: if ok — confirm and show the natural Japanese with kanji(чтение) and romaji. " +
-		"If retry — name the exact mistake (which particle, conjugation or word, and why it is wrong) in 1-2 lines " +
-		"and show the correct version with romaji."
-	resp, err := claudeOne(clients, sys, task)
+	return judgeWith(clients, judgeSystem, task)
+}
+
+func judgeWith(clients *Clients, system, task string) (bool, string) {
+	resp, err := claudeOne(clients, system, task)
 	if err != nil {
 		return false, "Ошибка проверки, попробуй ещё раз."
 	}
@@ -765,7 +1027,9 @@ func checkReminder(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, message *
 	} else {
 		back := lapseStep(step)
 		storage.ScheduleReminder(db, userID, word, back, time.Now().Add(intervalFor(back)))
-		send(bot, chatID, fb+"\n\nНичего страшного — напомню это слово снова скоро.")
+		storage.SetLastAnswer(db, userID, message.Text)
+		sendKb(bot, chatID, fb+"\n\nНичего страшного — напомню это слово снова скоро.",
+			contestKeyboard(fmt.Sprintf("contest#rem#%d", st.ReminderID)))
 	}
 }
 
@@ -814,6 +1078,14 @@ func HandleCallbackQuery(bot *tgbotapi.BotAPI, clients *Clients, callbackQuery *
 	answerCallback(bot, callbackQuery)
 	storage.EnsureUser(db, userID)
 
+	// Buttons that lead to a model or TTS call count against the daily budget.
+	apiCall := data == "memorize" || data == "ask_practice" || data == "practice_yes" || data == "round_yes" ||
+		data == "dont_remember" || data == "audio" || strings.HasPrefix(data, "audplay#") ||
+		strings.HasPrefix(data, "contest#") || strings.HasPrefix(data, "vocab_play#")
+	if apiCall && !capOK(bot, clients, db, chatID, userID) {
+		return
+	}
+
 	switch {
 	case data == "memorize":
 		st := storage.GetState(db, userID)
@@ -829,9 +1101,9 @@ func HandleCallbackQuery(bot *tgbotapi.BotAPI, clients *Clients, callbackQuery *
 			send(bot, chatID, "Не понял, какое слово запомнить. Напиши его одним словом.")
 			return
 		}
-		translation := translateWord(clients, word)
+		translation, verified := translateWord(clients, db, word)
 		deleteMsg(bot, chatID, think)
-		askSaveConfirmation(bot, db, chatID, userID, word, translation)
+		askSaveConfirmation(bot, db, chatID, userID, word, translation, verified)
 
 	case data == "save_yes":
 		st := storage.GetState(db, userID)
@@ -854,7 +1126,11 @@ func HandleCallbackQuery(bot *tgbotapi.BotAPI, clients *Clients, callbackQuery *
 		if translation != "" {
 			msg = fmt.Sprintf("Добавил «%s» — %s в словарь. Напомню по расписанию.", word, translation)
 		}
-		send(bot, chatID, msg)
+		if e, err := storage.FindVocab(db, userID, word); err == nil && japaneseHeadword(e.Translation) != "" {
+			sendKb(bot, chatID, msg, playKeyboard(e.ID))
+		} else {
+			send(bot, chatID, msg)
+		}
 
 	case data == "save_no":
 		storage.SetState(db, userID, modeAwaitWord, "", "", 0)
@@ -885,6 +1161,31 @@ func HandleCallbackQuery(bot *tgbotapi.BotAPI, clients *Clients, callbackQuery *
 	case strings.HasPrefix(data, "vocab_more#"):
 		if off, err := strconv.Atoi(strings.TrimPrefix(data, "vocab_more#")); err == nil && off > 0 {
 			sendVocab(bot, clients, db, chatID, userID, off)
+		}
+
+	case strings.HasPrefix(data, "vocab_audio#"): // expand into one 🔊 per word on this page
+		off, _ := strconv.Atoi(strings.TrimPrefix(data, "vocab_audio#"))
+		if _, entries, err := storage.GetVocabPage(db, userID, off, vocabPageSize); err == nil && len(entries) > 0 {
+			bot.Send(tgbotapi.NewEditMessageReplyMarkup(chatID, callbackQuery.Message.MessageID, vocabAudioKeyboard(entries, off)))
+		}
+
+	case strings.HasPrefix(data, "vocab_back#"): // collapse back to the page keyboard
+		off, _ := strconv.Atoi(strings.TrimPrefix(data, "vocab_back#"))
+		if total, entries, err := storage.GetVocabPage(db, userID, off, vocabPageSize); err == nil {
+			bot.Send(tgbotapi.NewEditMessageReplyMarkup(chatID, callbackQuery.Message.MessageID, vocabPageKeyboard(off, off+len(entries) < total)))
+		}
+
+	case strings.HasPrefix(data, "vocab_play#"):
+		if id, err := strconv.Atoi(strings.TrimPrefix(data, "vocab_play#")); err == nil {
+			playVocabWord(bot, clients, db, chatID, userID, id)
+		}
+
+	case data == "contest#practice":
+		handleContestPractice(bot, clients, db, chatID, userID)
+
+	case strings.HasPrefix(data, "contest#rem#"):
+		if id, err := strconv.Atoi(strings.TrimPrefix(data, "contest#rem#")); err == nil {
+			handleContestReminder(bot, clients, db, chatID, userID, id)
 		}
 
 	case data == "dont_remember":
@@ -985,18 +1286,24 @@ func handleAudio(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, cq *tgbotap
 	}
 }
 
+// audioNumberKeyboard — numbered 🔊 buttons for the sentences in a lookup message.
 func audioNumberKeyboard(n int) tgbotapi.InlineKeyboardMarkup {
+	return numberedAudioKeyboard(n, func(i int) string { return fmt.Sprintf("audplay#%d", i) }, "audback")
+}
+
+// numberedAudioKeyboard lays out n "🔊 i" buttons four per row plus a back button.
+func numberedAudioKeyboard(n int, playData func(i int) string, backData string) tgbotapi.InlineKeyboardMarkup {
 	keyboard := tgbotapi.NewInlineKeyboardMarkup()
 	row := tgbotapi.NewInlineKeyboardRow()
 	for i := 1; i <= n; i++ {
-		row = append(row, tgbotapi.NewInlineKeyboardButtonData(fmt.Sprintf("🔊 %d", i), fmt.Sprintf("audplay#%d", i)))
+		row = append(row, tgbotapi.NewInlineKeyboardButtonData(fmt.Sprintf("🔊 %d", i), playData(i)))
 		if i%4 == 0 || i == n {
 			keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, row)
 			row = tgbotapi.NewInlineKeyboardRow()
 		}
 	}
 	keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, tgbotapi.NewInlineKeyboardRow(
-		tgbotapi.NewInlineKeyboardButtonData("← Назад", "audback"),
+		tgbotapi.NewInlineKeyboardButtonData("← Назад", backData),
 	))
 	return keyboard
 }
@@ -1033,7 +1340,9 @@ func sendAudioMessage(clients *Clients, db *sql.DB, text string, userID int, bot
 	speed := storage.GetUserSpeechSpeed(db, userID)
 	audio, err := openai_api.GetTTSResponse(context.Background(), clients.OpenAI, speed, text)
 	if err != nil {
+		// graceful degradation: say so instead of silently sending nothing
 		log.Printf("TTS error: %v", err)
+		send(bot, int64(userID), "Озвучка сейчас недоступна, попробуй чуть позже.")
 		return
 	}
 	voice := tgbotapi.NewVoice(int64(userID), tgbotapi.FileBytes{Name: "audio.mp3", Bytes: audio})

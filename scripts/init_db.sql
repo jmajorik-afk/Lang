@@ -34,7 +34,8 @@ CREATE TABLE IF NOT EXISTS user_state (
     word TEXT NOT NULL DEFAULT '',          -- current / active word
     task_text TEXT NOT NULL DEFAULT '',     -- the sentence shown for practice
     reminder_id INTEGER NOT NULL DEFAULT 0,
-    last_reminder_at DATETIME
+    last_reminder_at DATETIME,
+    last_answer TEXT NOT NULL DEFAULT ''   -- most recent judged answer, for «Оспорить»
 );
 
 -- Short conversation history fed back to Claude for word lookups
@@ -46,3 +47,19 @@ CREATE TABLE IF NOT EXISTS conversations (
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_conversations_user ON conversations (user_id, created_at);
+
+-- Per-user daily count of user-initiated API interactions (cost control)
+CREATE TABLE IF NOT EXISTS api_usage (
+    user_id INTEGER NOT NULL,
+    day TEXT NOT NULL,                      -- YYYY-MM-DD
+    calls INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (user_id, day)
+);
+
+-- Global cache of word → Japanese translation, with Jisho verification flag
+CREATE TABLE IF NOT EXISTS translation_cache (
+    word TEXT PRIMARY KEY,
+    translation TEXT NOT NULL,
+    verified INTEGER NOT NULL DEFAULT 0,    -- 1 = reading confirmed by Jisho
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
