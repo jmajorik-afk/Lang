@@ -15,7 +15,10 @@ set -euo pipefail
 
 SERVER="${1:?usage: deploy/deploy.sh user@host}"
 APP_DIR=/opt/langekko
-SSH="ssh -o StrictHostKeyChecking=accept-new $SERVER"
+# ControlMaster: the first connection stays open and every later ssh/scp/rsync
+# reuses it — with password auth you type the password once, not five times.
+SSH_OPTS="-o StrictHostKeyChecking=accept-new -o ControlMaster=auto -o ControlPath=$HOME/.ssh/cm-%C -o ControlPersist=10m"
+SSH="ssh $SSH_OPTS $SERVER"
 
 cd "$(dirname "$0")/.."
 
@@ -45,7 +48,7 @@ mkdir -p /opt/langekko/src /opt/langekko/backups
 REMOTE
 
 echo "==> [2/4] syncing source"
-rsync -az --delete \
+rsync -az --delete -e "ssh $SSH_OPTS" \
   --exclude .git --exclude '.env*' --exclude 'languagebot.db*' --exclude backups/ --exclude '*.backup-*' \
   ./ "$SERVER:$APP_DIR/src/"
 
@@ -54,7 +57,7 @@ if [ -f .env ]; then
     echo "    server already has .env — leaving it alone (edit it there if the token changed)"
   else
     echo "    copying local .env (first deploy)"
-    scp -q -o StrictHostKeyChecking=accept-new .env "$SERVER:$APP_DIR/.env"
+    scp -q $SSH_OPTS .env "$SERVER:$APP_DIR/.env"
   fi
 else
   echo "    no local .env — create $APP_DIR/.env on the server before starting"
@@ -74,7 +77,7 @@ chmod 600 /opt/langekko/.env 2>/dev/null || true
 REMOTE
 
 echo "==> [4/4] installing service"
-scp -q -o StrictHostKeyChecking=accept-new deploy/langekko.service "$SERVER:/etc/systemd/system/langekko.service"
+scp -q $SSH_OPTS deploy/langekko.service "$SERVER:/etc/systemd/system/langekko.service"
 $SSH bash -s <<'REMOTE'
 set -euo pipefail
 systemctl daemon-reload
