@@ -234,7 +234,7 @@ func srsOfferKeyboard() tgbotapi.InlineKeyboardMarkup {
 
 // ---------- command entry ----------
 
-func HandleCommand(ctx context.Context, bot *tgbotapi.BotAPI, message *tgbotapi.Message, db *sql.DB, clients *Clients) error {
+func HandleCommand(bot *tgbotapi.BotAPI, message *tgbotapi.Message, db *sql.DB, clients *Clients) {
 	log.Printf("%d [%s] %s", message.From.ID, message.From.UserName, message.Text)
 	userID := int(message.From.ID)
 	chatID := message.Chat.ID
@@ -270,7 +270,6 @@ func HandleCommand(ctx context.Context, bot *tgbotapi.BotAPI, message *tgbotapi.
 	case "healthz":
 		send(bot, chatID, "OK")
 	}
-	return nil
 }
 
 // vocabPageSize keeps /vocab pages far under Telegram's 4096-char message cap.
@@ -482,7 +481,7 @@ func handleAsk(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, message *tgbo
 
 // ---------- message entry (state router) ----------
 
-func HandleMessage(ctx context.Context, bot *tgbotapi.BotAPI, message *tgbotapi.Message, clients *Clients, db *sql.DB) {
+func HandleMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, clients *Clients, db *sql.DB) {
 	userID := int(message.From.ID)
 	chatID := message.Chat.ID
 	storage.EnsureUser(db, userID)
@@ -1631,11 +1630,11 @@ func HandleCallbackQuery(bot *tgbotapi.BotAPI, clients *Clients, callbackQuery *
 
 	case data == "ask_clarify": // legacy «Уточнить» buttons on old messages
 		st := storage.GetState(db, userID)
-		ctx := st.TaskText
-		if ctx == "" {
-			ctx = callbackQuery.Message.Text
+		prev := st.TaskText // the answer the follow-up question will refer to
+		if prev == "" {
+			prev = callbackQuery.Message.Text
 		}
-		storage.SetState(db, userID, "ask", st.Word, ctx, 0)
+		storage.SetState(db, userID, "ask", st.Word, prev, 0)
 		send(bot, chatID, "Просто напиши свой вопрос сообщением.")
 
 	case strings.HasPrefix(data, "vocab_more#"):

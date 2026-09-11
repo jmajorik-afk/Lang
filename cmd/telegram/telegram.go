@@ -1,7 +1,6 @@
 package telegram
 
 import (
-	"context"
 	"database/sql"
 	"fmt"
 	"log"
@@ -89,18 +88,15 @@ func StartTelegramBot() {
 				}
 			}()
 
-			ctx := context.Background()
 			if !bot.IsAllowedUser(update, allowedUsers) {
 				return
 			}
 
 			if update.Message != nil {
 				if update.Message.IsCommand() {
-					if err := bot.HandleCommand(ctx, tgbot, update.Message, db, clients); err != nil {
-						log.Printf("Error handling command: %v\n", err)
-					}
+					bot.HandleCommand(tgbot, update.Message, db, clients)
 				} else {
-					bot.HandleMessage(ctx, tgbot, update.Message, clients, db)
+					bot.HandleMessage(tgbot, update.Message, clients, db)
 				}
 			} else if update.CallbackQuery != nil {
 				bot.HandleCallbackQuery(tgbot, clients, update.CallbackQuery, db)
