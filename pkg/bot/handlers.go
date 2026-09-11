@@ -1184,6 +1184,19 @@ const (
 	modeSrsOffer   = "srs_offer" // announcement sent, waiting for «Начать»
 )
 
+const (
+	// ReminderThrottle is the minimum gap between reminder rounds the scheduler
+	// starts for one user.
+	ReminderThrottle = 30 * time.Minute
+	// srsSessionWindow: a batch covers everything coming due within this span,
+	// not just the words due this very minute — with 3-hour steps words ripen
+	// one at a time, and "3 due at once" almost never happened for an active
+	// user. Asking a word a few hours early is the usual day-granularity of SRS.
+	srsSessionWindow = 12 * time.Hour
+	// srsSnooze is how long «Позже» postpones the announcement.
+	srsSnooze = 2 * time.Hour
+)
+
 // pluralRu picks the Russian plural form: 1 слово, 2 слова, 5 слов.
 func pluralRu(n int, one, few, many string) string {
 	n %= 100
@@ -1204,7 +1217,7 @@ func pluralRu(n int, one, few, many string) string {
 // just asks the first word, as before.
 func StartReminderRound(bot *tgbotapi.BotAPI, db *sql.DB, userID int) {
 	storage.SetLastReminderAt(db, userID, time.Now())
-	n, err := storage.CountDueReminders(db, userID)
+	n, err := storage.CountDueReminders(db, userID, time.Now().Add(srsSessionWindow))
 	if err != nil || n == 0 {
 		return
 	}
@@ -1220,7 +1233,11 @@ func StartReminderRound(bot *tgbotapi.BotAPI, db *sql.DB, userID int) {
 // sendNextDueReminder asks the next due word, reporting how many are left when
 // working through a batch. Returns false when nothing is due any more.
 func sendNextDueReminder(bot *tgbotapi.BotAPI, db *sql.DB, userID int, session bool) bool {
-	r, err := storage.NextDueReminder(db, userID)
+	horizon := time.Now() // a lone reminder waits for its exact time…
+	if session {
+		horizon = horizon.Add(srsSessionWindow) // …a batch takes the whole day's worth
+	}
+	r, err := storage.NextDueReminder(db, userID, horizon)
 	if err != nil {
 		return false
 	}
@@ -1234,7 +1251,7 @@ func sendNextDueReminder(bot *tgbotapi.BotAPI, db *sql.DB, userID int, session b
 
 	text := fmt.Sprintf("Повторение!\nКак будет «%s» по-японски? Напиши свой вариант.", r.Word)
 	if session {
-		if left, err := storage.CountDueReminders(db, userID); err == nil && left > 0 {
+		if left, err := storage.CountDueReminders(db, userID, horizon); err == nil && left > 0 {
 			text += fmt.Sprintf("\n\nПосле этого останется ещё %d.", left)
 		}
 	}
@@ -1398,7 +1415,10 @@ func HandleCallbackQuery(bot *tgbotapi.BotAPI, clients *Clients, callbackQuery *
 
 	case data == "srs_later":
 		storage.ClearMode(db, userID)
-		send(bot, chatID, "Хорошо, напомню попозже.")
+		// push last_reminder_at into the future so the throttle holds the
+		// announcement back for srsSnooze instead of re-offering in 30 minutes
+		storage.SetLastReminderAt(db, userID, time.Now().Add(srsSnooze-ReminderThrottle))
+		send(bot, chatID, "Хорошо, напомню через пару часов.")
 
 	case data == "end_practice":
 		storage.ClearMode(db, userID)

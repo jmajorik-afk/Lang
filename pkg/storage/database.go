@@ -97,7 +97,7 @@ func SetLastReminderAt(db *sql.DB, userID int, at time.Time) error {
 	_, err := db.Exec(`
 		INSERT INTO user_state (user_id, last_reminder_at) VALUES (?, ?)
 		ON CONFLICT(user_id) DO UPDATE SET last_reminder_at=excluded.last_reminder_at
-	`, userID, at)
+	`, userID, at.UTC())
 	return err
 }
 
@@ -226,12 +226,39 @@ type DueReminder struct {
 	Step   int
 }
 
+// Timestamps are always written in UTC. go-sqlite3 stores time.Time as text
+// carrying the process's local offset, and SQLite compares that text
+// lexicographically — so a row written on a UTC+5 laptop and compared on a
+// UTC+2 server fired three hours late. Every writer here calls .UTC() and every
+// comparison passes a UTC value; NormalizeReminderTimes fixes rows from before.
 func ScheduleReminder(db *sql.DB, userID int, word string, step int, sendAt time.Time) error {
 	_, err := db.Exec(
 		`INSERT INTO reminders (user_id, word, step, send_at, sent) VALUES (?,?,?,?,0)`,
-		userID, word, step, sendAt,
+		userID, word, step, sendAt.UTC(),
 	)
 	return err
+}
+
+// NormalizeReminderTimes rewrites timestamps stored with a non-UTC offset as
+// UTC text so they compare correctly. Idempotent; run at startup. Returns the
+// number of rows fixed.
+func NormalizeReminderTimes(db *sql.DB) (int64, error) {
+	res, err := db.Exec(`
+		UPDATE reminders SET send_at = strftime('%Y-%m-%d %H:%M:%f', send_at) || '+00:00'
+		WHERE send_at NOT LIKE '%+00:00' AND strftime('%Y-%m-%d %H:%M:%f', send_at) IS NOT NULL`)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	res, err = db.Exec(`
+		UPDATE user_state SET last_reminder_at = strftime('%Y-%m-%d %H:%M:%f', last_reminder_at) || '+00:00'
+		WHERE last_reminder_at IS NOT NULL AND last_reminder_at NOT LIKE '%+00:00'
+		  AND strftime('%Y-%m-%d %H:%M:%f', last_reminder_at) IS NOT NULL`)
+	if err != nil {
+		return n, err
+	}
+	m, _ := res.RowsAffected()
+	return n + m, nil
 }
 
 func HasPendingReminder(db *sql.DB, userID int, word string) bool {
@@ -247,20 +274,21 @@ func DeletePendingReminders(db *sql.DB, userID int, word string) error {
 	return err
 }
 
-// CountDueReminders is how many words are waiting for this user right now.
-func CountDueReminders(db *sql.DB, userID int) (int, error) {
+// CountDueReminders is how many unsent words come due by the given moment —
+// pass time.Now() for "due right now", or a later horizon for "due today".
+func CountDueReminders(db *sql.DB, userID int, by time.Time) (int, error) {
 	var n int
 	err := db.QueryRow(`SELECT COUNT(*) FROM reminders WHERE user_id=? AND sent=0 AND send_at<=?`,
-		userID, time.Now()).Scan(&n)
+		userID, by.UTC()).Scan(&n)
 	return n, err
 }
 
-// NextDueReminder returns the longest-overdue word waiting for this user.
-func NextDueReminder(db *sql.DB, userID int) (DueReminder, error) {
+// NextDueReminder returns the earliest unsent word due by the given moment.
+func NextDueReminder(db *sql.DB, userID int, by time.Time) (DueReminder, error) {
 	var r DueReminder
 	err := db.QueryRow(
 		`SELECT id, user_id, word, step FROM reminders WHERE user_id=? AND sent=0 AND send_at<=?
-		 ORDER BY send_at ASC, id ASC LIMIT 1`, userID, time.Now()).
+		 ORDER BY send_at ASC, id ASC LIMIT 1`, userID, by.UTC()).
 		Scan(&r.ID, &r.UserID, &r.Word, &r.Step)
 	return r, err
 }
@@ -268,7 +296,7 @@ func NextDueReminder(db *sql.DB, userID int) (DueReminder, error) {
 func GetDueReminders(db *sql.DB) ([]DueReminder, error) {
 	rows, err := db.Query(
 		`SELECT id, user_id, word, step FROM reminders WHERE sent=0 AND send_at<=? ORDER BY send_at ASC`,
-		time.Now(),
+		time.Now().UTC(),
 	)
 	if err != nil {
 		return nil, err

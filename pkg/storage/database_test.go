@@ -3,6 +3,7 @@ package storage
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -245,28 +246,79 @@ func TestDueReminderQueue(t *testing.T) {
 	ScheduleReminder(db, uid, "игра", 1, now.Add(time.Hour)) // not due yet
 	ScheduleReminder(db, 2, "чужое", 1, now.Add(-time.Hour)) // another user
 
-	n, err := CountDueReminders(db, uid)
+	n, err := CountDueReminders(db, uid, now)
 	if err != nil || n != 2 {
 		t.Fatalf("CountDueReminders = %d (err=%v), want 2 — future and other users excluded", n, err)
 	}
 
-	r, err := NextDueReminder(db, uid)
+	r, err := NextDueReminder(db, uid, now)
 	if err != nil || r.Word != "крыша" {
 		t.Fatalf("NextDueReminder = %+v (err=%v), want the most overdue word", r, err)
 	}
 
 	// working through the batch: answered words drop out of the queue
 	MarkReminderSent(db, r.ID)
-	if n, _ := CountDueReminders(db, uid); n != 1 {
+	if n, _ := CountDueReminders(db, uid, now); n != 1 {
 		t.Errorf("after answering one, %d left, want 1", n)
 	}
-	r, err = NextDueReminder(db, uid)
+	r, err = NextDueReminder(db, uid, now)
 	if err != nil || r.Word != "дерево" {
 		t.Fatalf("next word = %+v (err=%v), want дерево", r, err)
 	}
 	MarkReminderSent(db, r.ID)
-	if _, err := NextDueReminder(db, uid); err == nil {
+	if _, err := NextDueReminder(db, uid, now); err == nil {
 		t.Error("an empty queue must return an error so the session can close")
+	}
+}
+
+func TestScheduleReminderStoresUTC(t *testing.T) {
+	db := testDB(t)
+	plus5 := time.FixedZone("UTC+5", 5*3600)
+	ScheduleReminder(db, 1, "крыша", 1, time.Date(2026, 9, 11, 10, 0, 0, 0, plus5)) // = 05:00 UTC
+	// `|| ''` yields a plain TEXT expression, so the driver hands back the raw
+	// stored string instead of parsing the DATETIME column into a time.Time.
+	var raw string
+	db.QueryRow(`SELECT send_at || '' FROM reminders`).Scan(&raw)
+	if !strings.HasPrefix(raw, "2026-09-11 05:00:00") || !strings.HasSuffix(raw, "+00:00") {
+		t.Errorf("send_at stored as %q, want UTC text starting 2026-09-11 05:00:00 and ending +00:00", raw)
+	}
+}
+
+// TestMixedOffsetsAndHorizon reproduces the production bug — rows written on a
+// UTC+5 laptop compared as text against a UTC+2/UTC "now" fired hours late —
+// and checks the startup normalization plus the "due within a window" horizon.
+func TestMixedOffsetsAndHorizon(t *testing.T) {
+	db := testDB(t)
+	const uid = 1
+	// legacy row: 10:00+05:00 is 05:00 UTC
+	db.Exec(`INSERT INTO reminders (user_id, word, step, send_at, sent)
+	         VALUES (?, 'мак', 1, '2026-09-11 10:00:00.000+05:00', 0)`, uid)
+	at0600 := time.Date(2026, 9, 11, 6, 0, 0, 0, time.UTC)
+
+	if n, _ := CountDueReminders(db, uid, at0600); n != 0 {
+		t.Fatalf("the bug: before normalization the +05:00 row must NOT compare as due, got %d", n)
+	}
+	fixed, err := NormalizeReminderTimes(db)
+	if err != nil || fixed != 1 {
+		t.Fatalf("NormalizeReminderTimes = %d, %v; want 1 row fixed", fixed, err)
+	}
+	if n, _ := CountDueReminders(db, uid, at0600); n != 1 {
+		t.Errorf("after normalization the 05:00 UTC row must be due at 06:00 UTC, got %d", n)
+	}
+	if again, _ := NormalizeReminderTimes(db); again != 0 {
+		t.Errorf("normalization must be idempotent, touched %d rows on second run", again)
+	}
+
+	// horizon: a word due in 2h is part of today's batch but not "due now"
+	ScheduleReminder(db, uid, "скоро", 1, at0600.Add(2*time.Hour))
+	if n, _ := CountDueReminders(db, uid, at0600); n != 1 {
+		t.Errorf("due-now count = %d, want 1", n)
+	}
+	if n, _ := CountDueReminders(db, uid, at0600.Add(12*time.Hour)); n != 2 {
+		t.Errorf("12h-window count = %d, want 2", n)
+	}
+	if r, _ := NextDueReminder(db, uid, at0600.Add(12*time.Hour)); r.Word != "мак" {
+		t.Errorf("batch must start with the earliest word, got %q", r.Word)
 	}
 }
 

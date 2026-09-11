@@ -3,6 +3,7 @@ package telegram
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"log"
 	"os"
 	"strconv"
@@ -24,7 +25,9 @@ func StartTelegramBot() {
 		log.Printf("Error loading .env file: %v\n", err)
 	}
 
-	tgbot, err := tgbotapi.NewBotAPI(os.Getenv("TELEGRAM_TOKEN"))
+	token := os.Getenv("TELEGRAM_TOKEN")
+	tgbotapi.SetLogger(maskedLogger{token: token})
+	tgbot, err := tgbotapi.NewBotAPI(token)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -59,6 +62,11 @@ func StartTelegramBot() {
 	}
 	if _, err = db.Exec(string(initDBSQL)); err != nil {
 		log.Fatal("Error executing init_db.sql:", err)
+	}
+	if n, err := storage.NormalizeReminderTimes(db); err != nil {
+		log.Println("normalizing reminder times:", err)
+	} else if n > 0 {
+		log.Printf("normalized %d reminder timestamps to UTC", n)
 	}
 
 	allowedUsers := parseAllowedUsers(os.Getenv("ALLOWED_TELEGRAM_USER_IDS"))
@@ -98,6 +106,25 @@ func StartTelegramBot() {
 			}
 		}(update)
 	}
+}
+
+// maskedLogger keeps the bot token out of the journal: telegram-bot-api logs
+// the full request URL on network errors, and that URL embeds the token.
+type maskedLogger struct{ token string }
+
+func (m maskedLogger) mask(s string) string {
+	if m.token == "" {
+		return s
+	}
+	return strings.ReplaceAll(s, m.token, "<token>")
+}
+
+func (m maskedLogger) Println(v ...interface{}) {
+	log.Println(m.mask(strings.TrimRight(fmt.Sprintln(v...), "\n")))
+}
+
+func (m maskedLogger) Printf(format string, v ...interface{}) {
+	log.Println(m.mask(fmt.Sprintf(format, v...)))
 }
 
 // envInt reads an integer env var, falling back to def when unset or invalid.
@@ -169,7 +196,7 @@ func scheduleReminders(db *sql.DB, tgbot *tgbotapi.BotAPI) {
 				if started[r.UserID] {
 					continue
 				}
-				if last, ok := storage.GetLastReminderAt(db, r.UserID); ok && time.Since(last) < 30*time.Minute {
+				if last, ok := storage.GetLastReminderAt(db, r.UserID); ok && time.Since(last) < bot.ReminderThrottle {
 					continue
 				}
 				if storage.GetState(db, r.UserID).Mode != "" {
