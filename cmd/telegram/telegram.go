@@ -37,6 +37,7 @@ func StartTelegramBot() {
 		tgbotapi.BotCommand{Command: "practice", Description: "Тренировка по выученным словам"},
 		tgbotapi.BotCommand{Command: "ask", Description: "Вопрос по грамматике"},
 		tgbotapi.BotCommand{Command: "vocab", Description: "Твой словарь"},
+		tgbotapi.BotCommand{Command: "stats", Description: "Статистика и слабые места"},
 		tgbotapi.BotCommand{Command: "speech_speed", Description: "Скорость озвучки"},
 		tgbotapi.BotCommand{Command: "healthz", Description: "Проверка работы"},
 	))

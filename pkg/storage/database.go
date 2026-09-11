@@ -60,14 +60,30 @@ func SetLastAnswer(db *sql.DB, userID int, answer string) error {
 }
 
 func upsertState(db *sql.DB, userID int, mode, word, task string, reminderID int) error {
+	// attempt resets here on purpose: SetState marks the start of a new task
+	// or stage, so the next judged answer is a first try again.
 	_, err := db.Exec(`
-		INSERT INTO user_state (user_id, mode, word, task_text, reminder_id)
-		VALUES (?,?,?,?,?)
+		INSERT INTO user_state (user_id, mode, word, task_text, reminder_id, attempt)
+		VALUES (?,?,?,?,?,0)
 		ON CONFLICT(user_id) DO UPDATE SET
 			mode=excluded.mode, word=excluded.word,
-			task_text=excluded.task_text, reminder_id=excluded.reminder_id
+			task_text=excluded.task_text, reminder_id=excluded.reminder_id, attempt=0
 	`, userID, mode, word, task, reminderID)
 	return err
+}
+
+// BumpAttempts counts one more judged attempt at the current task and returns
+// the new count (1 = first try).
+func BumpAttempts(db *sql.DB, userID int) (int, error) {
+	if _, err := db.Exec(`
+		INSERT INTO user_state (user_id, attempt) VALUES (?, 1)
+		ON CONFLICT(user_id) DO UPDATE SET attempt = attempt + 1
+	`, userID); err != nil {
+		return 0, err
+	}
+	var n int
+	err := db.QueryRow(`SELECT attempt FROM user_state WHERE user_id=?`, userID).Scan(&n)
+	return n, err
 }
 
 // SetCurrentWord records the last looked-up word and resets the interaction mode.
@@ -377,6 +393,158 @@ func SetCachedTranslation(db *sql.DB, word, translation string, verified bool) e
 		ON CONFLICT(word) DO UPDATE SET translation=excluded.translation, verified=excluded.verified
 	`, word, translation, v)
 	return err
+}
+
+// --- Outcomes: the practice/reminder journal ---
+// Every judged answer is recorded. This is the raw material for /stats and,
+// later, for aiming practice at weak grammar points and calibrating difficulty.
+
+func LogOutcome(db *sql.DB, userID int, kind, word string, ok, firstTry bool, tag, detail string) error {
+	_, err := db.Exec(`
+		INSERT INTO outcomes (user_id, kind, word, ok, first_try, tag, detail)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		userID, kind, word, b2i(ok), b2i(firstTry), tag, detail)
+	return err
+}
+
+// OverturnLastMistake marks the user's most recent unreversed mistake on a word
+// as overturned — «Оспорить» won — so it no longer counts against them.
+func OverturnLastMistake(db *sql.DB, userID int, word string) error {
+	_, err := db.Exec(`
+		UPDATE outcomes SET overturned=1 WHERE id = (
+			SELECT id FROM outcomes WHERE user_id=? AND word=? AND ok=0 AND overturned=0
+			ORDER BY id DESC LIMIT 1)`, userID, word)
+	return err
+}
+
+type TagCount struct {
+	Tag   string
+	Count int
+}
+
+type WordCount struct {
+	Word  string
+	Count int
+}
+
+// Stats backs /stats. Windowed figures cover the last 30 days; an overturned
+// mistake counts as correct everywhere.
+type Stats struct {
+	VocabTotal   int
+	Learned      int // words whose latest SRS step is 4+ (30-day interval or longer)
+	Streak       int // consecutive UTC days with a judged answer, still alive today or as of yesterday
+	RemTotal     int // reminder answers in the window
+	RemOK        int
+	PracTasks    int         // practice tasks attempted in the window (first attempts)
+	PracFirstTry int         // ...solved on the first try
+	WeakTags     []TagCount  // mistakes per bucket, most frequent first (top 3)
+	MissedWords  []WordCount // words with most mistakes (top 3)
+}
+
+func GetStats(db *sql.DB, userID int) (Stats, error) {
+	var s Stats
+	count := func(dst *int, query string) error {
+		return db.QueryRow(query, userID).Scan(dst)
+	}
+	const win = " AND created_at >= datetime('now', '-30 days')"
+	steps := []struct {
+		dst   *int
+		query string
+	}{
+		{&s.VocabTotal, `SELECT COUNT(*) FROM vocab WHERE user_id=?`},
+		{&s.Learned, `SELECT COUNT(*) FROM reminders WHERE user_id=?1 AND step>=4
+			AND id IN (SELECT MAX(id) FROM reminders WHERE user_id=?1 GROUP BY word)`},
+		{&s.RemTotal, `SELECT COUNT(*) FROM outcomes WHERE user_id=? AND kind='reminder'` + win},
+		{&s.RemOK, `SELECT COUNT(*) FROM outcomes WHERE user_id=? AND kind='reminder' AND (ok=1 OR overturned=1)` + win},
+		{&s.PracTasks, `SELECT COUNT(*) FROM outcomes WHERE user_id=? AND kind<>'reminder' AND first_try=1` + win},
+		{&s.PracFirstTry, `SELECT COUNT(*) FROM outcomes WHERE user_id=? AND kind<>'reminder' AND first_try=1 AND (ok=1 OR overturned=1)` + win},
+	}
+	for _, st := range steps {
+		if err := count(st.dst, st.query); err != nil {
+			return s, err
+		}
+	}
+
+	rows, err := db.Query(`SELECT tag, COUNT(*) FROM outcomes
+		WHERE user_id=? AND ok=0 AND overturned=0 AND tag<>'' AND tag<>'other'`+win+`
+		GROUP BY tag ORDER BY 2 DESC, tag LIMIT 3`, userID)
+	if err != nil {
+		return s, err
+	}
+	for rows.Next() {
+		var tc TagCount
+		if err := rows.Scan(&tc.Tag, &tc.Count); err != nil {
+			rows.Close()
+			return s, err
+		}
+		s.WeakTags = append(s.WeakTags, tc)
+	}
+	rows.Close()
+
+	rows, err = db.Query(`SELECT word, COUNT(*) FROM outcomes
+		WHERE user_id=? AND ok=0 AND overturned=0`+win+`
+		GROUP BY word ORDER BY 2 DESC, word LIMIT 3`, userID)
+	if err != nil {
+		return s, err
+	}
+	for rows.Next() {
+		var wc WordCount
+		if err := rows.Scan(&wc.Word, &wc.Count); err != nil {
+			rows.Close()
+			return s, err
+		}
+		s.MissedWords = append(s.MissedWords, wc)
+	}
+	rows.Close()
+
+	s.Streak, err = streakDays(db, userID)
+	return s, err
+}
+
+// streakDays counts consecutive UTC days with at least one judged answer,
+// counting back from today. Not having practised yet today does not break a
+// streak that was alive yesterday.
+func streakDays(db *sql.DB, userID int) (int, error) {
+	rows, err := db.Query(`SELECT DISTINCT date(created_at) FROM outcomes WHERE user_id=? ORDER BY 1 DESC`, userID)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+	var days []string
+	for rows.Next() {
+		var d string
+		if err := rows.Scan(&d); err != nil {
+			return 0, err
+		}
+		days = append(days, d)
+	}
+	if len(days) == 0 {
+		return 0, nil
+	}
+	const layout = "2006-01-02"
+	expect := time.Now().UTC()
+	if days[0] != expect.Format(layout) {
+		expect = expect.AddDate(0, 0, -1)
+		if days[0] != expect.Format(layout) {
+			return 0, nil
+		}
+	}
+	streak := 0
+	for _, d := range days {
+		if d != expect.Format(layout) {
+			break
+		}
+		streak++
+		expect = expect.AddDate(0, 0, -1)
+	}
+	return streak, nil
+}
+
+func b2i(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 // --- Backups ---

@@ -110,26 +110,32 @@ func TestSplitHeadword(t *testing.T) {
 	}
 }
 
-// TestParseVerdict pins the judge protocol: first line is the verdict, the rest
-// is feedback; anything unrecognised is a retry so the user stays in the stage.
+// TestParseVerdict pins the judge protocol: verdict line, optional TAG line on
+// mistakes, then feedback; anything unrecognised is a retry so the user stays
+// in the stage.
 func TestParseVerdict(t *testing.T) {
 	cases := []struct {
 		resp string
 		want verdict
+		tag  string
 		fb   string
 	}{
-		{"VERDICT: ok\n\nОтлично, 屋根(やね) (yane)", verdictOK, "Отлично, 屋根(やね) (yane)"},
-		{"VERDICT: retry\n\nЧастица は вместо が.", verdictRetry, "Частица は вместо が."},
-		{"VERDICT: offtrack", verdictOffTrack, ""},
-		{"verdict: OK\nfine", verdictOK, "fine"},         // case-insensitive
-		{"  VERDICT: offtrack  \n", verdictOffTrack, ""}, // stray whitespace
-		{"Хм, сложно сказать", verdictRetry, ""},         // no verdict line → safe default
-		{"", verdictRetry, ""},
+		{"VERDICT: ok\n\nОтлично, 屋根(やね) (yane)", verdictOK, "", "Отлично, 屋根(やね) (yane)"},
+		{"VERDICT: retry\nTAG: particle\n\nЧастица は вместо が.", verdictRetry, "particle", "Частица は вместо が."},
+		{"VERDICT: retry\n\nTag: Verb-Form\nне та форма", verdictRetry, "verb-form", "не та форма"}, // blank line + odd case tolerated
+		{"VERDICT: retry\nTAG: something-new\n\nx", verdictRetry, "other", "x"},                     // unknown bucket → other
+		{"VERDICT: retry\n\nЧастица は вместо が.", verdictRetry, "", "Частица は вместо が."},          // no TAG line at all
+		{"VERDICT: ok\nTAG: particle\nfine", verdictOK, "", "fine"},                                 // a bucket on ok is ignored
+		{"VERDICT: offtrack", verdictOffTrack, "", ""},
+		{"verdict: OK\nfine", verdictOK, "", "fine"},         // case-insensitive
+		{"  VERDICT: offtrack  \n", verdictOffTrack, "", ""}, // stray whitespace
+		{"Хм, сложно сказать", verdictRetry, "", ""},         // no verdict line → safe default
+		{"", verdictRetry, "", ""},
 	}
 	for _, c := range cases {
-		v, fb := parseVerdict(c.resp)
-		if v != c.want || fb != c.fb {
-			t.Errorf("parseVerdict(%q) = (%v, %q), want (%v, %q)", c.resp, v, fb, c.want, c.fb)
+		v, tag, fb := parseVerdict(c.resp)
+		if v != c.want || tag != c.tag || fb != c.fb {
+			t.Errorf("parseVerdict(%q) = (%v, %q, %q), want (%v, %q, %q)", c.resp, v, tag, fb, c.want, c.tag, c.fb)
 		}
 	}
 }

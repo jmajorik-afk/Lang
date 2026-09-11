@@ -246,6 +246,7 @@ func HandleCommand(ctx context.Context, bot *tgbotapi.BotAPI, message *tgbotapi.
 			"/practice — тренировка по выученным словам\n"+
 			"/ask — вопрос по грамматике (дальше уточняй просто сообщениями)\n"+
 			"/vocab — твой словарь; /vocab <часть слова> — поиск\n"+
+			"/stats — статистика и слабые места\n"+
 			"/speech_speed — скорость озвучки")
 	case "practice":
 		if capOK(bot, clients, db, chatID, userID) {
@@ -262,6 +263,8 @@ func HandleCommand(ctx context.Context, bot *tgbotapi.BotAPI, message *tgbotapi.
 		} else {
 			sendVocab(bot, clients, db, chatID, userID, 0)
 		}
+	case "stats":
+		sendStats(bot, db, chatID, userID)
 	case "speech_speed":
 		sendKb(bot, chatID, "Выбери скорость озвучки:", speechSpeedInlineKeyboard())
 	case "healthz":
@@ -374,6 +377,61 @@ func playVocabWord(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, chatID in
 		return
 	}
 	sendAudioMessage(clients, db, jp, userID, bot)
+}
+
+// sendStats renders /stats from the outcome journal. Weak spots appear only
+// once a bucket has weakTagMin mistakes — before that the honest answer is
+// "not enough data", not a pattern invented from one slip.
+func sendStats(bot *tgbotapi.BotAPI, db *sql.DB, chatID int64, userID int) {
+	s, err := storage.GetStats(db, userID)
+	if err != nil {
+		log.Printf("stats error: %v", err)
+		send(bot, chatID, "Не смог собрать статистику, попробуй позже.")
+		return
+	}
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "Словарь: %d %s, на длинных интервалах (от 30 дней): %d.\n",
+		s.VocabTotal, pluralRu(s.VocabTotal, "слово", "слова", "слов"), s.Learned)
+	if s.Streak > 0 {
+		fmt.Fprintf(&sb, "Серия: %d %s подряд.\n", s.Streak, pluralRu(s.Streak, "день", "дня", "дней"))
+	} else {
+		sb.WriteString("Серия: пока нет — ответь на повторение или задание, и она начнётся.\n")
+	}
+
+	sb.WriteString("\nЗа 30 дней:\n")
+	if s.RemTotal > 0 {
+		fmt.Fprintf(&sb, "Повторения: %d, верно %d%%.\n", s.RemTotal, 100*s.RemOK/s.RemTotal)
+	} else {
+		sb.WriteString("Повторения: ещё не было.\n")
+	}
+	if s.PracTasks > 0 {
+		fmt.Fprintf(&sb, "Практика: %d %s, с первой попытки %d%%.\n",
+			s.PracTasks, pluralRu(s.PracTasks, "задание", "задания", "заданий"), 100*s.PracFirstTry/s.PracTasks)
+	} else {
+		sb.WriteString("Практика: ещё не было.\n")
+	}
+
+	var weak []string
+	for _, t := range s.WeakTags {
+		if t.Count >= weakTagMin {
+			weak = append(weak, fmt.Sprintf("%s (%d)", errorTags[t.Tag], t.Count))
+		}
+	}
+	if len(weak) > 0 {
+		sb.WriteString("\nСлабые места: " + strings.Join(weak, ", ") + ".\n")
+	} else {
+		sb.WriteString("\nСлабые места: пока мало данных — нужно больше практики.\n")
+	}
+	var missed []string
+	for _, w := range s.MissedWords {
+		if w.Count >= 2 {
+			missed = append(missed, fmt.Sprintf("%s (%d)", w.Word, w.Count))
+		}
+	}
+	if len(missed) > 0 {
+		sb.WriteString("Чаще всего ошибаешься в: " + strings.Join(missed, ", ") + ".\n")
+	}
+	send(bot, chatID, sb.String())
 }
 
 // sendVocabSearch handles «/vocab <часть слова>» — a plain local substring
@@ -887,15 +945,19 @@ func checkPracticeCompose(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, me
 	chatID := message.Chat.ID
 	userID := int(message.From.ID)
 	think := sendThinking(bot, chatID)
-	v, fb := judgeAnswer(clients, composeTask(st.TaskText, message.Text), message.Text, true)
+	v, tag, fb := judgeAnswer(clients, composeTask(st.TaskText, message.Text), message.Text, true)
 	deleteMsg(bot, chatID, think)
 	switch v {
+	case verdictError:
+		sendKb(bot, chatID, fb, practiceKeyboard())
 	case verdictOffTrack:
 		offerPracticeExit(bot, db, chatID, userID, "paused_compose", st)
 	case verdictRetry:
+		recordOutcome(db, userID, "compose", st.Word, v, tag, fb)
 		storage.SetLastAnswer(db, userID, message.Text)
 		sendKb(bot, chatID, fb+"\n\nПопробуй ещё раз.", practiceRetryKeyboard())
 	default:
+		recordOutcome(db, userID, "compose", st.Word, v, tag, fb)
 		advanceToTranslateStage(bot, clients, db, chatID, userID, st, "Правильно!\n"+fb)
 	}
 }
@@ -932,15 +994,19 @@ func checkPracticeTranslate(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, 
 	userID := int(message.From.ID)
 	think := sendThinking(bot, chatID)
 
-	v, fb := judgeAnswer(clients, translateTask(st.TaskText, message.Text), message.Text, false)
+	v, tag, fb := judgeAnswer(clients, translateTask(st.TaskText, message.Text), message.Text, false)
 	deleteMsg(bot, chatID, think)
 	switch v {
+	case verdictError:
+		sendKb(bot, chatID, fb, practiceKeyboard())
 	case verdictOffTrack:
 		offerPracticeExit(bot, db, chatID, userID, "paused_translate", st)
 	case verdictRetry:
+		recordOutcome(db, userID, "translate", st.Word, v, tag, fb)
 		storage.SetLastAnswer(db, userID, message.Text)
 		sendKb(bot, chatID, fb+"\n\nПопробуй ещё раз.", practiceRetryKeyboard())
 	default:
+		recordOutcome(db, userID, "translate", st.Word, v, tag, fb)
 		storage.ClearMode(db, userID)
 		sendKb(bot, chatID, "Правильно!\n"+fb+"\n\nЕщё раунд?", roundKeyboard())
 	}
@@ -959,13 +1025,18 @@ func handleContestPractice(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, c
 		task = translateTask(st.TaskText, st.LastAnswer)
 	}
 	think := sendThinking(bot, chatID)
-	v, fb := judgeWith(clients, contestSystem, task)
+	v, _, fb := judgeWith(clients, contestSystem, task)
 	deleteMsg(bot, chatID, think)
+	if v == verdictError {
+		sendKb(bot, chatID, fb, practiceRetryKeyboard()) // appeal still open
+		return
+	}
 	storage.SetLastAnswer(db, userID, "") // one appeal per answer
 	if v != verdictOK {
 		sendKb(bot, chatID, "Перепроверил внимательно — всё же ошибка.\n"+fb+"\n\nПопробуй ещё раз.", practiceKeyboard())
 		return
 	}
+	storage.OverturnLastMistake(db, userID, st.Word)
 	if st.Mode == "practice_translate" {
 		storage.ClearMode(db, userID)
 		sendKb(bot, chatID, "Ты прав, засчитываю!\n"+fb+"\n\nЕщё раунд?", roundKeyboard())
@@ -984,13 +1055,18 @@ func handleContestReminder(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, c
 		return
 	}
 	think := sendThinking(bot, chatID)
-	v, fb := judgeWith(clients, contestSystem, "How do you say the word «"+word+"» in Japanese? User's answer: "+st.LastAnswer)
+	v, _, fb := judgeWith(clients, contestSystem, "How do you say the word «"+word+"» in Japanese? User's answer: "+st.LastAnswer)
 	deleteMsg(bot, chatID, think)
+	if v == verdictError {
+		send(bot, chatID, fb) // appeal still open
+		return
+	}
 	storage.SetLastAnswer(db, userID, "")
 	if v != verdictOK {
 		send(bot, chatID, "Перепроверил внимательно — всё же не то.\n"+fb)
 		return
 	}
+	storage.OverturnLastMistake(db, userID, word)
 	storage.DeletePendingReminders(db, userID, word)
 	next := step + 1
 	storage.ScheduleReminder(db, userID, word, next, time.Now().Add(intervalFor(next)))
@@ -1011,6 +1087,8 @@ const judgeGrading = "'VERDICT: ok' — the answer is essentially correct: ignor
 	"with doubled vowels, or not following Hepburn. Accept any phrasing a native speaker would consider fine — there " +
 	"is usually more than one correct translation. When you are not confident the answer is actually wrong, prefer ok. " +
 	"'VERDICT: retry' — ONLY for a real, identifiable mistake in a genuine attempt. " +
+	"After a retry verdict the SECOND line must be 'TAG: <bucket>' where <bucket> is exactly one of: " + errorTagList +
+	" — the single best bucket for the main mistake. No TAG line after ok. " +
 	"Then a blank line, then short feedback. If ok: confirm and show the natural Japanese with kanji(чтение) and romaji, " +
 	"then, if a common natural alternative exists, ONE more line 'Ещё можно: ...' with kanji(чтение) and romaji. " +
 	"If retry: name the exact mistake (which particle, conjugation or word, and why it is wrong) in 1-2 lines, " +
@@ -1049,7 +1127,61 @@ const (
 	verdictRetry    verdict = iota // a genuine attempt with a real mistake (also the fallback for unparseable replies)
 	verdictOK                      // essentially correct
 	verdictOffTrack                // not an attempt at the task at all — never scored, never lapses SRS
+	verdictError                   // the judge itself failed (API error): shown as a hiccup, never journaled
 )
+
+// errorTags are the coarse buckets the judge sorts a mistake into. Deliberately
+// few: with a handful of practice rounds a week, fine-grained categories would
+// never accumulate enough hits to mean anything. The specific mistake travels
+// as free text (the judge's first feedback line) alongside the bucket.
+var errorTags = map[string]string{
+	"particle":       "частицы",
+	"verb-form":      "формы глаголов",
+	"adjective-form": "формы прилагательных",
+	"politeness":     "вежливость и стиль",
+	"word-order":     "порядок слов",
+	"word-choice":    "выбор слова",
+	"counter":        "счётные слова",
+	"kana-kanji":     "написание (кана/кандзи)",
+	"omission":       "пропущенное слово или частица",
+	"meaning":        "смысл перевода",
+	"other":          "другое",
+}
+
+const errorTagList = "particle, verb-form, adjective-form, politeness, word-order, word-choice, counter, kana-kanji, omission, meaning, other"
+
+// weakTagMin is how many mistakes in one bucket make it a pattern worth
+// showing — a single slip is not a weak spot.
+const weakTagMin = 3
+
+// normalizeTag maps whatever the model wrote to a known bucket ("other" if unknown).
+func normalizeTag(raw string) string {
+	t := strings.Trim(strings.ToLower(strings.TrimSpace(raw)), "'\"`. ")
+	if _, ok := errorTags[t]; ok {
+		return t
+	}
+	return "other"
+}
+
+// recordOutcome journals a judged attempt. Off-track messages and API errors
+// never get here — they are not attempts.
+func recordOutcome(db *sql.DB, userID int, kind, word string, v verdict, tag, fb string) {
+	n, err := storage.BumpAttempts(db, userID)
+	if err != nil {
+		log.Printf("attempt counter: %v", err)
+		n = 1
+	}
+	detail := ""
+	if v == verdictRetry {
+		detail = firstLine(fb)
+		if r := []rune(detail); len(r) > 200 {
+			detail = string(r[:200])
+		}
+	}
+	if err := storage.LogOutcome(db, userID, kind, word, v == verdictOK, n <= 1, tag, detail); err != nil {
+		log.Printf("outcome journal: %v", err)
+	}
+}
 
 // offtrackAllowed decides whether the judge may answer "this is not an attempt".
 // When the task expects Japanese and the user wrote Japanese or Latin letters,
@@ -1066,36 +1198,52 @@ func offtrackAllowed(expectJapanese bool, text string) bool {
 
 // judgeAnswer verdicts a user answer, picking the prompt that fits what the
 // task expects.
-func judgeAnswer(clients *Clients, task, answer string, expectJapanese bool) (verdict, string) {
+func judgeAnswer(clients *Clients, task, answer string, expectJapanese bool) (verdict, string, string) {
 	if offtrackAllowed(expectJapanese, answer) {
 		return judgeWith(clients, judgeSystem, task)
 	}
 	return judgeWith(clients, judgeBinarySystem, task)
 }
 
-func judgeWith(clients *Clients, system, task string) (verdict, string) {
+// judgeWith returns (verdict, error bucket, feedback). The bucket is only set
+// on a retry verdict.
+func judgeWith(clients *Clients, system, task string) (verdict, string, string) {
 	resp, err := claudeOne(clients, system, task)
 	if err != nil {
-		return verdictRetry, "Ошибка проверки, попробуй ещё раз."
+		log.Printf("judge error: %v", err)
+		return verdictError, "", "Ошибка проверки, попробуй ещё раз."
 	}
 	return parseVerdict(resp)
 }
 
-// parseVerdict splits the model reply into its first-line verdict and the
-// feedback below it. Anything unrecognised counts as retry — the safe default
-// that keeps the user in the current stage.
-func parseVerdict(resp string) (verdict, string) {
+// parseVerdict splits the model reply into its first-line verdict, an optional
+// 'TAG: bucket' line (mistakes only), and the feedback below. Anything
+// unrecognised counts as retry — the safe default that keeps the user in the
+// current stage.
+func parseVerdict(resp string) (verdict, string, string) {
 	first, rest := resp, ""
 	if i := strings.IndexByte(resp, '\n'); i >= 0 {
-		first, rest = resp[:i], strings.TrimSpace(resp[i+1:])
+		first, rest = resp[:i], resp[i+1:]
 	}
+	v := verdictRetry
 	switch strings.ToLower(strings.TrimSpace(first)) {
 	case "verdict: ok":
-		return verdictOK, rest
+		v = verdictOK
 	case "verdict: offtrack":
-		return verdictOffTrack, rest
+		v = verdictOffTrack
 	}
-	return verdictRetry, rest
+	tag := ""
+	if r := strings.TrimLeft(rest, " \t\n"); strings.HasPrefix(strings.ToUpper(r), "TAG:") {
+		line, after := r, ""
+		if i := strings.IndexByte(r, '\n'); i >= 0 {
+			line, after = r[:i], r[i+1:]
+		}
+		tag, rest = normalizeTag(line[4:]), after
+	}
+	if v != verdictRetry {
+		tag = "" // a bucket only means something on a mistake
+	}
+	return v, tag, strings.TrimSpace(rest)
 }
 
 // ---------- Flow 3 — SRS reminder answer ----------
@@ -1111,10 +1259,14 @@ func checkReminder(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, message *
 	}
 
 	think := sendThinking(bot, chatID)
-	v, fb := judgeAnswer(clients, "How do you say the word «"+word+"» in Japanese? User's answer: "+message.Text,
+	v, tag, fb := judgeAnswer(clients, "How do you say the word «"+word+"» in Japanese? User's answer: "+message.Text,
 		message.Text, true)
 	deleteMsg(bot, chatID, think)
 
+	if v == verdictError {
+		sendKb(bot, chatID, fb, reminderKeyboard()) // stay on the word, nothing recorded
+		return
+	}
 	if v == verdictOffTrack {
 		// not an answer at all — don't lapse the word, just ask again; «Оспорить»
 		// is offered in case the classification itself was wrong
@@ -1124,6 +1276,7 @@ func checkReminder(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, message *
 		return
 	}
 	storage.ClearMode(db, userID)
+	recordOutcome(db, userID, "reminder", word, v, tag, fb)
 
 	session := st.TaskText == srsSessionFlag
 	if v == verdictOK {

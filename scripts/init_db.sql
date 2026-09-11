@@ -36,7 +36,8 @@ CREATE TABLE IF NOT EXISTS user_state (
     task_text TEXT NOT NULL DEFAULT '',     -- the sentence shown for practice
     reminder_id INTEGER NOT NULL DEFAULT 0,
     last_reminder_at DATETIME,
-    last_answer TEXT NOT NULL DEFAULT ''   -- most recent judged answer, for «Оспорить»
+    last_answer TEXT NOT NULL DEFAULT '',  -- most recent judged answer, for «Оспорить»
+    attempt INTEGER NOT NULL DEFAULT 0     -- judged attempts at the current task (reset by SetState)
 );
 
 -- Short conversation history fed back to Claude for word lookups
@@ -64,3 +65,18 @@ CREATE TABLE IF NOT EXISTS translation_cache (
     verified INTEGER NOT NULL DEFAULT 0,    -- 1 = reading confirmed by Jisho
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
+
+-- Journal of every judged answer: feeds /stats, weak-point targeting, difficulty
+CREATE TABLE IF NOT EXISTS outcomes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    kind TEXT NOT NULL,                     -- compose | translate | reminder
+    word TEXT NOT NULL,                     -- vocab word or /ask topic the task was about
+    ok INTEGER NOT NULL,                    -- 1 correct, 0 mistake
+    first_try INTEGER NOT NULL DEFAULT 1,
+    tag TEXT NOT NULL DEFAULT '',           -- coarse error bucket on mistakes (particle, verb-form, ...)
+    detail TEXT NOT NULL DEFAULT '',        -- the judge's one-line description of the mistake
+    overturned INTEGER NOT NULL DEFAULT 0,  -- 1 if «Оспорить» reversed the mistake
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_outcomes_user ON outcomes (user_id, created_at);

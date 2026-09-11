@@ -42,7 +42,20 @@ func testDB(t *testing.T) *sql.DB {
 			task_text TEXT NOT NULL DEFAULT '',
 			reminder_id INTEGER NOT NULL DEFAULT 0,
 			last_reminder_at DATETIME,
-			last_answer TEXT NOT NULL DEFAULT ''
+			last_answer TEXT NOT NULL DEFAULT '',
+			attempt INTEGER NOT NULL DEFAULT 0
+		)`,
+		`CREATE TABLE outcomes (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			user_id INTEGER NOT NULL,
+			kind TEXT NOT NULL,
+			word TEXT NOT NULL,
+			ok INTEGER NOT NULL,
+			first_try INTEGER NOT NULL DEFAULT 1,
+			tag TEXT NOT NULL DEFAULT '',
+			detail TEXT NOT NULL DEFAULT '',
+			overturned INTEGER NOT NULL DEFAULT 0,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 		)`,
 		`CREATE TABLE api_usage (
 			user_id INTEGER NOT NULL,
@@ -319,6 +332,63 @@ func TestMixedOffsetsAndHorizon(t *testing.T) {
 	}
 	if r, _ := NextDueReminder(db, uid, at0600.Add(12*time.Hour)); r.Word != "мак" {
 		t.Errorf("batch must start with the earliest word, got %q", r.Word)
+	}
+}
+
+func TestAttemptsResetPerTask(t *testing.T) {
+	db := testDB(t)
+	SetState(db, 1, "practice_compose", "крыша", "task", 0)
+	n1, _ := BumpAttempts(db, 1)
+	n2, _ := BumpAttempts(db, 1)
+	if n1 != 1 || n2 != 2 {
+		t.Errorf("attempts = %d, %d; want 1, 2", n1, n2)
+	}
+	SetState(db, 1, "practice_translate", "крыша", "task2", 0) // next stage = new task
+	if n, _ := BumpAttempts(db, 1); n != 1 {
+		t.Errorf("a new task must restart the attempt count, got %d", n)
+	}
+}
+
+func TestOutcomesAndStats(t *testing.T) {
+	db := testDB(t)
+	const uid = 1
+	SaveVocab(db, uid, "крыша", "")
+	SaveVocab(db, uid, "дерево", "")
+	now := time.Now()
+	ScheduleReminder(db, uid, "крыша", 4, now.Add(30*24*time.Hour)) // long interval → "learned"
+	ScheduleReminder(db, uid, "дерево", 2, now.Add(24*time.Hour))
+
+	// practice: крыша failed twice on particles then passed; дерево right first try
+	LogOutcome(db, uid, "compose", "крыша", false, true, "particle", "を вместо が")
+	LogOutcome(db, uid, "compose", "крыша", false, false, "particle", "снова が")
+	LogOutcome(db, uid, "compose", "крыша", true, false, "", "")
+	LogOutcome(db, uid, "compose", "дерево", true, true, "", "")
+	// reminders: one right, one wrong but overturned by «Оспорить»
+	LogOutcome(db, uid, "reminder", "дерево", true, true, "", "")
+	LogOutcome(db, uid, "reminder", "крыша", false, true, "word-choice", "x")
+	OverturnLastMistake(db, uid, "крыша")
+
+	s, err := GetStats(db, uid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.VocabTotal != 2 || s.Learned != 1 {
+		t.Errorf("vocab=%d learned=%d, want 2/1", s.VocabTotal, s.Learned)
+	}
+	if s.Streak != 1 {
+		t.Errorf("streak = %d, want 1 (everything logged today)", s.Streak)
+	}
+	if s.RemTotal != 2 || s.RemOK != 2 {
+		t.Errorf("reminders %d/%d, want 2/2 — an overturned mistake counts as correct", s.RemOK, s.RemTotal)
+	}
+	if s.PracTasks != 2 || s.PracFirstTry != 1 {
+		t.Errorf("practice first-try %d/%d, want 1/2", s.PracFirstTry, s.PracTasks)
+	}
+	if len(s.WeakTags) != 1 || s.WeakTags[0].Tag != "particle" || s.WeakTags[0].Count != 2 {
+		t.Errorf("weak tags = %+v, want just particle×2 (the overturned word-choice must not count)", s.WeakTags)
+	}
+	if len(s.MissedWords) != 1 || s.MissedWords[0].Word != "крыша" || s.MissedWords[0].Count != 2 {
+		t.Errorf("missed words = %+v, want just крыша×2", s.MissedWords)
 	}
 }
 
