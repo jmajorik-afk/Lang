@@ -43,7 +43,8 @@ func testDB(t *testing.T) *sql.DB {
 			reminder_id INTEGER NOT NULL DEFAULT 0,
 			last_reminder_at DATETIME,
 			last_answer TEXT NOT NULL DEFAULT '',
-			attempt INTEGER NOT NULL DEFAULT 0
+			attempt INTEGER NOT NULL DEFAULT 0,
+			target TEXT NOT NULL DEFAULT ''
 		)`,
 		`CREATE TABLE outcomes (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -55,6 +56,7 @@ func testDB(t *testing.T) *sql.DB {
 			tag TEXT NOT NULL DEFAULT '',
 			detail TEXT NOT NULL DEFAULT '',
 			overturned INTEGER NOT NULL DEFAULT 0,
+			target TEXT NOT NULL DEFAULT '',
 			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 		)`,
 		`CREATE TABLE api_usage (
@@ -359,13 +361,13 @@ func TestOutcomesAndStats(t *testing.T) {
 	ScheduleReminder(db, uid, "дерево", 2, now.Add(24*time.Hour))
 
 	// practice: крыша failed twice on particles then passed; дерево right first try
-	LogOutcome(db, uid, "compose", "крыша", false, true, "particle", "を вместо が")
-	LogOutcome(db, uid, "compose", "крыша", false, false, "particle", "снова が")
-	LogOutcome(db, uid, "compose", "крыша", true, false, "", "")
-	LogOutcome(db, uid, "compose", "дерево", true, true, "", "")
+	LogOutcome(db, uid, "compose", "крыша", false, true, "particle", "を вместо が", "")
+	LogOutcome(db, uid, "compose", "крыша", false, false, "particle", "снова が", "")
+	LogOutcome(db, uid, "compose", "крыша", true, false, "", "", "")
+	LogOutcome(db, uid, "compose", "дерево", true, true, "", "", "")
 	// reminders: one right, one wrong but overturned by «Оспорить»
-	LogOutcome(db, uid, "reminder", "дерево", true, true, "", "")
-	LogOutcome(db, uid, "reminder", "крыша", false, true, "word-choice", "x")
+	LogOutcome(db, uid, "reminder", "дерево", true, true, "", "", "")
+	LogOutcome(db, uid, "reminder", "крыша", false, true, "word-choice", "x", "")
 	OverturnLastMistake(db, uid, "крыша")
 
 	s, err := GetStats(db, uid)
@@ -389,6 +391,99 @@ func TestOutcomesAndStats(t *testing.T) {
 	}
 	if len(s.MissedWords) != 1 || s.MissedWords[0].Word != "крыша" || s.MissedWords[0].Count != 2 {
 		t.Errorf("missed words = %+v, want just крыша×2", s.MissedWords)
+	}
+}
+
+func TestTaskTargetLifecycle(t *testing.T) {
+	db := testDB(t)
+	SetState(db, 1, "practice_compose", "крыша", "task", 0)
+	SetTaskTarget(db, 1, "particle")
+	if got := GetState(db, 1).Target; got != "particle" {
+		t.Errorf("Target = %q, want particle", got)
+	}
+	SetState(db, 1, "practice_translate", "крыша", "jp", 0) // new stage clears it
+	if got := GetState(db, 1).Target; got != "" {
+		t.Errorf("a new task must clear the target, got %q", got)
+	}
+}
+
+func TestFirstTryRateWindow(t *testing.T) {
+	db := testDB(t)
+	const uid = 1
+	seq := []struct {
+		kind       string
+		ok, first  bool
+		overturned bool
+	}{
+		{"compose", false, true, false}, // oldest — outside a window of 3
+		{"compose", true, true, false},
+		{"compose", true, false, false}, // a retry: not a first attempt, ignored
+		{"reminder", true, true, false}, // other kind, ignored
+		{"compose", false, true, true},  // mistake later overturned → counts as solved
+		{"compose", false, true, false},
+	}
+	for _, s := range seq {
+		LogOutcome(db, uid, s.kind, "w", s.ok, s.first, "", "", "")
+		if s.overturned {
+			OverturnLastMistake(db, uid, "w")
+		}
+	}
+	ok, total, err := FirstTryRate(db, uid, "compose", 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// window of 3 first tries, newest first: fail, overturned(=ok), ok → 2 of 3
+	if ok != 2 || total != 3 {
+		t.Errorf("FirstTryRate = %d/%d, want 2/3", ok, total)
+	}
+}
+
+func TestWeakestBucketThresholdAndPayDown(t *testing.T) {
+	db := testDB(t)
+	const uid = 1
+	mistake := func(tag, detail string) { LogOutcome(db, uid, "compose", "w", false, true, tag, detail, "") }
+	drilled := func(target string, ok bool) { LogOutcome(db, uid, "compose", "w", ok, true, "", "", target) }
+
+	mistake("particle", "を вместо が")
+	mistake("particle", "снова が")
+	if tag, _, _ := WeakestBucket(db, uid, 3); tag != "" {
+		t.Errorf("2 mistakes must not qualify, got %q", tag)
+	}
+	mistake("particle", "は вместо が")
+	tag, details, err := WeakestBucket(db, uid, 3)
+	if err != nil || tag != "particle" {
+		t.Fatalf("WeakestBucket = %q (err=%v), want particle after 3 mistakes", tag, err)
+	}
+	if len(details) != 3 || details[0] != "は вместо が" {
+		t.Errorf("details = %v, want the last 3 slips newest first", details)
+	}
+
+	// two targeted first-try successes pay two mistakes down: still one outstanding
+	drilled("particle", true)
+	drilled("particle", true)
+	if tag, _, _ := WeakestBucket(db, uid, 3); tag != "particle" {
+		t.Errorf("one mistake still outstanding, got %q", tag)
+	}
+	drilled("particle", false) // a failed drill pays nothing
+	if tag, _, _ := WeakestBucket(db, uid, 3); tag != "particle" {
+		t.Errorf("a failed drill must not pay down, got %q", tag)
+	}
+	drilled("particle", true)
+	if tag, _, _ := WeakestBucket(db, uid, 3); tag != "" {
+		t.Errorf("all mistakes paid down, drilling must stop, got %q", tag)
+	}
+
+	// a bigger outstanding balance wins; 'other' and overturned slips never count
+	for i := 0; i < 4; i++ {
+		mistake("verb-form", "past tense")
+	}
+	for i := 0; i < 5; i++ {
+		mistake("other", "?")
+	}
+	mistake("counter", "x")
+	OverturnLastMistake(db, uid, "w")
+	if tag, _, _ := WeakestBucket(db, uid, 3); tag != "verb-form" {
+		t.Errorf("want verb-form (4 outstanding), got %q", tag)
 	}
 }
 

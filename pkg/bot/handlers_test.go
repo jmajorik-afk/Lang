@@ -1,6 +1,7 @@
 package bot
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -169,6 +170,44 @@ func TestOfftrackAllowed(t *testing.T) {
 			t.Errorf("offtrackAllowed(expectJapanese=%v, %q) = %v, want %v",
 				c.expectJapanese, c.text, got, c.want)
 		}
+	}
+}
+
+// TestLevelFromRate pins the difficulty dial: too little data stays easy,
+// then the recent first-try rate decides.
+func TestLevelFromRate(t *testing.T) {
+	cases := []struct{ ok, total, want int }{
+		{0, 0, 1}, {3, 3, 1}, // fewer than 4 attempts: not enough to judge
+		{4, 4, 3}, {8, 10, 3}, {10, 10, 3},
+		{5, 10, 2}, {7, 10, 2}, {2, 4, 2},
+		{4, 10, 1}, {0, 10, 1}, {1, 4, 1},
+	}
+	for _, c := range cases {
+		if got := levelFromRate(c.ok, c.total); got != c.want {
+			t.Errorf("levelFromRate(%d/%d) = %d, want %d", c.ok, c.total, got, c.want)
+		}
+	}
+}
+
+// TestBucketFocusCoversAllBuckets — every drillable bucket must tell the
+// generator what to exercise, or a targeted task would silently be ordinary.
+func TestBucketFocusCoversAllBuckets(t *testing.T) {
+	for tag := range errorTags {
+		if tag == "other" {
+			continue
+		}
+		if bucketFocus[tag] == "" {
+			t.Errorf("bucketFocus has no instruction for %q", tag)
+		}
+	}
+	p := composeTaskPrompt("яблоко", 3, "particle", []string{"を вместо が"})
+	for _, must := range []string{"яблоко", "REQUIRES", "を вместо が", "subordinate clause"} {
+		if !strings.Contains(p, must) {
+			t.Errorf("targeted level-3 prompt lacks %q", must)
+		}
+	}
+	if strings.Contains(composeTaskPrompt("яблоко", 1, "", nil), "REQUIRES") {
+		t.Error("an untargeted prompt must not carry a drill instruction")
 	}
 }
 

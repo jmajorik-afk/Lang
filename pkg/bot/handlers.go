@@ -410,6 +410,11 @@ func sendStats(bot *tgbotapi.BotAPI, db *sql.DB, chatID int64, userID int) {
 	} else {
 		sb.WriteString("Практика: ещё не было.\n")
 	}
+	if level, ok, total := practiceLevel(db, userID); total >= 4 {
+		fmt.Fprintf(&sb, "Уровень заданий: %d из 3 (с первой попытки %d из последних %d).\n", level, ok, total)
+	} else {
+		sb.WriteString("Уровень заданий: 1 из 3 — вырастет, когда наберётся хотя бы 4 задания.\n")
+	}
 
 	var weak []string
 	for _, t := range s.WeakTags {
@@ -421,6 +426,9 @@ func sendStats(bot *tgbotapi.BotAPI, db *sql.DB, chatID int64, userID int) {
 		sb.WriteString("\nСлабые места: " + strings.Join(weak, ", ") + ".\n")
 	} else {
 		sb.WriteString("\nСлабые места: пока мало данных — нужно больше практики.\n")
+	}
+	if target, _ := weakTarget(db, userID); target != "" {
+		sb.WriteString("Сейчас практика прицельно тренирует: " + errorTags[target] + ".\n")
 	}
 	var missed []string
 	for _, w := range s.MissedWords {
@@ -886,18 +894,21 @@ func startPractice(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, chatID in
 		send(bot, chatID, "Сначала найди слово — просто напиши его.")
 		return
 	}
+	level, _, _ := practiceLevel(db, userID)
+	target, details := weakTarget(db, userID)
+
 	think := sendThinking(bot, chatID)
-	sys := styleRules + " You are a Japanese tutor. Make a SHORT practice task in Russian for the word «" + word + "». " +
-		"Output exactly: line 1 — one simple natural Russian sentence (5-8 words) that uses «" + word + "». " +
-		"Then 2-3 lines, each a helper word the user will need: 'русское слово — японский(чтение, romaji)'. " +
-		"Do NOT translate the whole sentence into Japanese. No extra text."
-	task, err := claudeOne(clients, sys, word)
+	task, err := claudeOne(clients, composeTaskPrompt(word, level, target, details), word)
 	deleteMsg(bot, chatID, think)
 	if err != nil {
 		send(bot, chatID, "Ошибка, попробуй /practice ещё раз.")
 		return
 	}
 	storage.SetState(db, userID, "practice_compose", word, task, 0)
+	if target != "" {
+		storage.SetTaskTarget(db, userID, target)
+		send(bot, chatID, fmt.Sprintf("Потренируем %s — тут у тебя больше всего ошибок.", errorTags[target]))
+	}
 	sendComposeTask(bot, chatID, task)
 }
 
@@ -953,12 +964,22 @@ func checkPracticeCompose(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, me
 	case verdictOffTrack:
 		offerPracticeExit(bot, db, chatID, userID, "paused_compose", st)
 	case verdictRetry:
-		recordOutcome(db, userID, "compose", st.Word, v, tag, fb)
+		before, _, _ := practiceLevel(db, userID)
+		recordOutcome(db, userID, "compose", st.Word, st.Target, v, tag, fb)
 		storage.SetLastAnswer(db, userID, message.Text)
-		sendKb(bot, chatID, fb+"\n\nПопробуй ещё раз.", practiceRetryKeyboard())
+		msg := fb + "\n\nПопробуй ещё раз."
+		if after, _, _ := practiceLevel(db, userID); after < before {
+			msg += "\n\nСледующие задания сделаю попроще."
+		}
+		sendKb(bot, chatID, msg, practiceRetryKeyboard())
 	default:
-		recordOutcome(db, userID, "compose", st.Word, v, tag, fb)
-		advanceToTranslateStage(bot, clients, db, chatID, userID, st, "Правильно!\n"+fb)
+		before, _, _ := practiceLevel(db, userID)
+		recordOutcome(db, userID, "compose", st.Word, st.Target, v, tag, fb)
+		praise := "Правильно!\n" + fb
+		if after, _, _ := practiceLevel(db, userID); after > before {
+			praise += "\n\nТы решаешь почти всё с первой попытки — усложняю задания."
+		}
+		advanceToTranslateStage(bot, clients, db, chatID, userID, st, praise)
 	}
 }
 
@@ -973,8 +994,10 @@ func translateTask(task, answer string) string {
 // advanceToTranslateStage is the shared "compose answer accepted" path: show the
 // praise, then generate the stage-2 Japanese sentence to translate into Russian.
 func advanceToTranslateStage(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, chatID int64, userID int, st storage.State, praise string) {
+	level, _, _ := practiceLevel(db, userID)
 	think := sendThinking(bot, chatID)
-	sys := styleRules + " Generate ONE short simple Japanese sentence that uses «" + st.Word + "» for the user to translate into Russian. " +
+	sys := styleRules + " Generate ONE natural Japanese sentence that uses «" + st.Word + "» for the user to translate into Russian. " +
+		levelSpecJP(level) + " " +
 		"Output ONLY the Japanese sentence (every kanji with its reading in brackets) followed by ' (' + full romaji + ')'. " +
 		"Then optional helper lines 'японский(чтение, romaji) — русский'. Do NOT give the Russian translation of the sentence."
 	jp, err := claudeOne(clients, sys, st.Word)
@@ -1002,11 +1025,11 @@ func checkPracticeTranslate(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, 
 	case verdictOffTrack:
 		offerPracticeExit(bot, db, chatID, userID, "paused_translate", st)
 	case verdictRetry:
-		recordOutcome(db, userID, "translate", st.Word, v, tag, fb)
+		recordOutcome(db, userID, "translate", st.Word, st.Target, v, tag, fb)
 		storage.SetLastAnswer(db, userID, message.Text)
 		sendKb(bot, chatID, fb+"\n\nПопробуй ещё раз.", practiceRetryKeyboard())
 	default:
-		recordOutcome(db, userID, "translate", st.Word, v, tag, fb)
+		recordOutcome(db, userID, "translate", st.Word, st.Target, v, tag, fb)
 		storage.ClearMode(db, userID)
 		sendKb(bot, chatID, "Правильно!\n"+fb+"\n\nЕщё раунд?", roundKeyboard())
 	}
@@ -1143,9 +1166,112 @@ var errorTags = map[string]string{
 	"word-choice":    "выбор слова",
 	"counter":        "счётные слова",
 	"kana-kanji":     "написание (кана/кандзи)",
-	"omission":       "пропущенное слово или частица",
+	"omission":       "пропуски слов и частиц",
 	"meaning":        "смысл перевода",
 	"other":          "другое",
+}
+
+// bucketFocus tells the task generator what a targeted sentence must exercise.
+var bucketFocus = map[string]string{
+	"particle":       "choosing the right particles (は/が/を/に/で/と/へ), including a contrast the user tends to confuse",
+	"verb-form":      "verb conjugation — tense, negation, the te-form, or potential/volitional forms",
+	"adjective-form": "い/な adjective forms — past, negative or adverbial use",
+	"politeness":     "register — plain versus polite (です/ます) forms as the situation demands",
+	"word-order":     "Japanese word order — modifiers before nouns, the verb last, placement of time and place",
+	"word-choice":    "picking the right word among near-synonyms",
+	"counter":        "counters and numerals (本, 枚, 人, つ, ...)",
+	"kana-kanji":     "correct kana spelling and kanji readings",
+	"omission":       "keeping every required particle and word — nothing may be dropped",
+	"meaning":        "conveying the exact meaning with no shift",
+}
+
+// ---------- difficulty (research 8) ----------
+
+// levelWindow is how many recent first attempts the difficulty level is read from.
+const levelWindow = 10
+
+// levelFromRate maps the recent first-try success rate to a difficulty level
+// 1-3. Stateless on purpose: the rate moves as tasks succeed or fail, so the
+// level settles where roughly half to most tasks are solved first time — the
+// productive zone. Fewer than four attempts is not enough to judge: stay easy.
+func levelFromRate(ok, total int) int {
+	if total < 4 {
+		return 1
+	}
+	switch rate := float64(ok) / float64(total); {
+	case rate >= 0.8:
+		return 3
+	case rate >= 0.5:
+		return 2
+	}
+	return 1
+}
+
+// practiceLevel is the current difficulty level plus the figures behind it.
+func practiceLevel(db *sql.DB, userID int) (level, ok, total int) {
+	ok, total, err := storage.FirstTryRate(db, userID, "compose", levelWindow)
+	if err != nil {
+		log.Printf("practice level: %v", err)
+		return 1, 0, 0
+	}
+	return levelFromRate(ok, total), ok, total
+}
+
+// levelSpec turns the level into concrete constraints for the Russian sentence
+// the user will compose in Japanese — the model is unreliable at "make it
+// N4-ish" and reliable at explicit rules.
+func levelSpec(level int) string {
+	switch level {
+	case 3:
+		return "Level: harder — 10-15 words; the sentence must need a subordinate clause (because / when / if / 'I think that'), " +
+			"or a potential or volitional verb form, or a counter word; past or negative forms are welcome."
+	case 2:
+		return "Level: medium — 8-12 words; may use past tense or negation, two actions linked by the te-form, " +
+			"an い/な adjective, and one time or place expression. No subordinate clauses."
+	default:
+		return "Level: simple — 5-8 words, present tense, polite form, basic particles only, a single clause."
+	}
+}
+
+// levelSpecJP is the same dial for the Japanese sentence of the translate stage.
+func levelSpecJP(level int) string {
+	switch level {
+	case 3:
+		return "Length 10-15 words, with a subordinate clause or a potential/volitional form."
+	case 2:
+		return "Length 8-12 words; past or negative forms and a て-form link are fine; no subordinate clauses."
+	default:
+		return "Length 5-8 words, present tense, polite form, a single clause."
+	}
+}
+
+// ---------- targeting (research 7) ----------
+
+// weakTarget is the bucket practice should drill right now, with the user's
+// recent mistakes in it, or "" when no bucket has enough outstanding mistakes.
+func weakTarget(db *sql.DB, userID int) (string, []string) {
+	tag, details, err := storage.WeakestBucket(db, userID, weakTagMin)
+	if err != nil {
+		log.Printf("weak target: %v", err)
+		return "", nil
+	}
+	return tag, details
+}
+
+// composeTaskPrompt builds the generator prompt for a compose task: the vocab
+// word, the difficulty rules, and — when a weak bucket is being drilled — what
+// the sentence must exercise plus the user's own recent slips there.
+func composeTaskPrompt(word string, level int, target string, details []string) string {
+	p := styleRules + " You are a Japanese tutor. Make a SHORT practice task in Russian for the word «" + word + "». " +
+		"Output exactly: line 1 — one natural Russian sentence that uses «" + word + "». " + levelSpec(level) + " "
+	if target != "" {
+		p += "Build the sentence so that translating it correctly REQUIRES " + bucketFocus[target] + ". "
+		if len(details) > 0 {
+			p += "The user's recent mistakes there: " + strings.Join(details, "; ") + ". Exercise exactly that. "
+		}
+	}
+	return p + "Then 2-3 lines, each a helper word the user will need: 'русское слово — японский(чтение, romaji)'. " +
+		"Do NOT translate the whole sentence into Japanese. No extra text."
 }
 
 const errorTagList = "particle, verb-form, adjective-form, politeness, word-order, word-choice, counter, kana-kanji, omission, meaning, other"
@@ -1165,7 +1291,7 @@ func normalizeTag(raw string) string {
 
 // recordOutcome journals a judged attempt. Off-track messages and API errors
 // never get here — they are not attempts.
-func recordOutcome(db *sql.DB, userID int, kind, word string, v verdict, tag, fb string) {
+func recordOutcome(db *sql.DB, userID int, kind, word, target string, v verdict, tag, fb string) {
 	n, err := storage.BumpAttempts(db, userID)
 	if err != nil {
 		log.Printf("attempt counter: %v", err)
@@ -1178,7 +1304,7 @@ func recordOutcome(db *sql.DB, userID int, kind, word string, v verdict, tag, fb
 			detail = string(r[:200])
 		}
 	}
-	if err := storage.LogOutcome(db, userID, kind, word, v == verdictOK, n <= 1, tag, detail); err != nil {
+	if err := storage.LogOutcome(db, userID, kind, word, v == verdictOK, n <= 1, tag, detail, target); err != nil {
 		log.Printf("outcome journal: %v", err)
 	}
 }
@@ -1276,7 +1402,7 @@ func checkReminder(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, message *
 		return
 	}
 	storage.ClearMode(db, userID)
-	recordOutcome(db, userID, "reminder", word, v, tag, fb)
+	recordOutcome(db, userID, "reminder", word, "", v, tag, fb)
 
 	session := st.TaskText == srsSessionFlag
 	if v == verdictOK {

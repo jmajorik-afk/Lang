@@ -38,12 +38,13 @@ type State struct {
 	TaskText   string
 	ReminderID int
 	LastAnswer string // the user's most recent judged answer, kept so it can be contested
+	Target     string // error bucket the current practice task was built to drill, "" if none
 }
 
 func GetState(db *sql.DB, userID int) State {
 	var s State
-	err := db.QueryRow(`SELECT mode, word, task_text, reminder_id, last_answer FROM user_state WHERE user_id=?`, userID).
-		Scan(&s.Mode, &s.Word, &s.TaskText, &s.ReminderID, &s.LastAnswer)
+	err := db.QueryRow(`SELECT mode, word, task_text, reminder_id, last_answer, target FROM user_state WHERE user_id=?`, userID).
+		Scan(&s.Mode, &s.Word, &s.TaskText, &s.ReminderID, &s.LastAnswer, &s.Target)
 	if err != nil {
 		return State{}
 	}
@@ -63,12 +64,22 @@ func upsertState(db *sql.DB, userID int, mode, word, task string, reminderID int
 	// attempt resets here on purpose: SetState marks the start of a new task
 	// or stage, so the next judged answer is a first try again.
 	_, err := db.Exec(`
-		INSERT INTO user_state (user_id, mode, word, task_text, reminder_id, attempt)
-		VALUES (?,?,?,?,?,0)
+		INSERT INTO user_state (user_id, mode, word, task_text, reminder_id, attempt, target)
+		VALUES (?,?,?,?,?,0,'')
 		ON CONFLICT(user_id) DO UPDATE SET
 			mode=excluded.mode, word=excluded.word,
-			task_text=excluded.task_text, reminder_id=excluded.reminder_id, attempt=0
+			task_text=excluded.task_text, reminder_id=excluded.reminder_id, attempt=0, target=''
 	`, userID, mode, word, task, reminderID)
+	return err
+}
+
+// SetTaskTarget records which error bucket the current practice task drills.
+// Call right after SetState, which clears it.
+func SetTaskTarget(db *sql.DB, userID int, target string) error {
+	_, err := db.Exec(`
+		INSERT INTO user_state (user_id, target) VALUES (?, ?)
+		ON CONFLICT(user_id) DO UPDATE SET target=excluded.target
+	`, userID, target)
 	return err
 }
 
@@ -399,12 +410,102 @@ func SetCachedTranslation(db *sql.DB, word, translation string, verified bool) e
 // Every judged answer is recorded. This is the raw material for /stats and,
 // later, for aiming practice at weak grammar points and calibrating difficulty.
 
-func LogOutcome(db *sql.DB, userID int, kind, word string, ok, firstTry bool, tag, detail string) error {
+func LogOutcome(db *sql.DB, userID int, kind, word string, ok, firstTry bool, tag, detail, target string) error {
 	_, err := db.Exec(`
-		INSERT INTO outcomes (user_id, kind, word, ok, first_try, tag, detail)
-		VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		userID, kind, word, b2i(ok), b2i(firstTry), tag, detail)
+		INSERT INTO outcomes (user_id, kind, word, ok, first_try, tag, detail, target)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		userID, kind, word, b2i(ok), b2i(firstTry), tag, detail, target)
 	return err
+}
+
+// FirstTryRate looks at the user's last n first attempts of a kind and returns
+// how many were solved (an overturned mistake counts as solved) out of how many.
+func FirstTryRate(db *sql.DB, userID int, kind string, n int) (ok, total int, err error) {
+	rows, err := db.Query(`
+		SELECT ok, overturned FROM outcomes WHERE user_id=? AND kind=? AND first_try=1
+		ORDER BY id DESC LIMIT ?`, userID, kind, n)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var o, ov int
+		if err := rows.Scan(&o, &ov); err != nil {
+			return 0, 0, err
+		}
+		total++
+		if o == 1 || ov == 1 {
+			ok++
+		}
+	}
+	return ok, total, rows.Err()
+}
+
+// WeakestBucket picks the error bucket practice should aim at. A bucket
+// qualifies when it has at least min unreversed mistakes in the last 30 days
+// that have not yet been paid down: every targeted task on that bucket solved
+// on the first try pays one mistake off, so a weakness that has been drilled
+// away stops being drilled instead of haunting the user for the whole window.
+// Among qualifying buckets the largest outstanding balance wins (ties by
+// name). Returns the bucket and the user's last 3 mistake descriptions in it.
+func WeakestBucket(db *sql.DB, userID, min int) (string, []string, error) {
+	const win = " AND created_at >= datetime('now', '-30 days')"
+	mistakes, paid := map[string]int{}, map[string]int{}
+
+	collect := func(dst map[string]int, query string) error {
+		rows, err := db.Query(query, userID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var t string
+			var n int
+			if err := rows.Scan(&t, &n); err != nil {
+				return err
+			}
+			dst[t] = n
+		}
+		return rows.Err()
+	}
+	if err := collect(mistakes, `SELECT tag, COUNT(*) FROM outcomes WHERE user_id=? AND ok=0 AND overturned=0
+		AND tag<>'' AND tag<>'other'`+win+` GROUP BY tag`); err != nil {
+		return "", nil, err
+	}
+	if err := collect(paid, `SELECT target, COUNT(*) FROM outcomes WHERE user_id=? AND target<>'' AND first_try=1
+		AND (ok=1 OR overturned=1)`+win+` GROUP BY target`); err != nil {
+		return "", nil, err
+	}
+
+	best, bestLeft := "", 0
+	for tag, m := range mistakes {
+		left := m - paid[tag]
+		if m < min || left <= 0 {
+			continue
+		}
+		if left > bestLeft || (left == bestLeft && tag < best) {
+			best, bestLeft = tag, left
+		}
+	}
+	if best == "" {
+		return "", nil, nil
+	}
+
+	rows, err := db.Query(`SELECT detail FROM outcomes WHERE user_id=? AND tag=? AND ok=0 AND overturned=0
+		AND detail<>''`+win+` ORDER BY id DESC LIMIT 3`, userID, best)
+	if err != nil {
+		return "", nil, err
+	}
+	defer rows.Close()
+	var details []string
+	for rows.Next() {
+		var d string
+		if err := rows.Scan(&d); err != nil {
+			return "", nil, err
+		}
+		details = append(details, d)
+	}
+	return best, details, rows.Err()
 }
 
 // OverturnLastMistake marks the user's most recent unreversed mistake on a word

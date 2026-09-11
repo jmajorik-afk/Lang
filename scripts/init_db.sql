@@ -37,7 +37,8 @@ CREATE TABLE IF NOT EXISTS user_state (
     reminder_id INTEGER NOT NULL DEFAULT 0,
     last_reminder_at DATETIME,
     last_answer TEXT NOT NULL DEFAULT '',  -- most recent judged answer, for «Оспорить»
-    attempt INTEGER NOT NULL DEFAULT 0     -- judged attempts at the current task (reset by SetState)
+    attempt INTEGER NOT NULL DEFAULT 0,    -- judged attempts at the current task (reset by SetState)
+    target TEXT NOT NULL DEFAULT ''        -- error bucket the current practice task drills, if any
 );
 
 -- Short conversation history fed back to Claude for word lookups
@@ -77,6 +78,7 @@ CREATE TABLE IF NOT EXISTS outcomes (
     tag TEXT NOT NULL DEFAULT '',           -- coarse error bucket on mistakes (particle, verb-form, ...)
     detail TEXT NOT NULL DEFAULT '',        -- the judge's one-line description of the mistake
     overturned INTEGER NOT NULL DEFAULT 0,  -- 1 if «Оспорить» reversed the mistake
+    target TEXT NOT NULL DEFAULT '',        -- bucket this task was built to drill ('' = ordinary task)
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_outcomes_user ON outcomes (user_id, created_at);
