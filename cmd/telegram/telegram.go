@@ -150,9 +150,11 @@ func scheduleBackups(db *sql.DB) {
 	}()
 }
 
-// scheduleReminders checks once a minute for due reminders and sends at most one
-// per user, throttled to one reminder per 30 minutes, never interrupting an
-// active practice or another pending reminder.
+// scheduleReminders checks once a minute for due reminders and starts at most
+// one round per user, throttled to one per 30 minutes, never interrupting an
+// active practice or another pending reminder. A round either announces the
+// whole batch (several words due) or asks a single word — see
+// bot.StartReminderRound.
 func scheduleReminders(db *sql.DB, tgbot *tgbotapi.BotAPI) {
 	ticker := time.NewTicker(1 * time.Minute)
 	go func() {
@@ -162,9 +164,9 @@ func scheduleReminders(db *sql.DB, tgbot *tgbotapi.BotAPI) {
 				log.Println("Error fetching reminders:", err)
 				continue
 			}
-			sent := map[int]bool{}
+			started := map[int]bool{}
 			for _, r := range due {
-				if sent[r.UserID] {
+				if started[r.UserID] {
 					continue
 				}
 				if last, ok := storage.GetLastReminderAt(db, r.UserID); ok && time.Since(last) < 30*time.Minute {
@@ -173,11 +175,8 @@ func scheduleReminders(db *sql.DB, tgbot *tgbotapi.BotAPI) {
 				if storage.GetState(db, r.UserID).Mode != "" {
 					continue // user is mid-practice or already answering a reminder
 				}
-				bot.SendReminder(tgbot, r.UserID, r.Word)
-				storage.MarkReminderSent(db, r.ID)
-				storage.SetLastReminderAt(db, r.UserID, time.Now())
-				storage.SetState(db, r.UserID, "reminder", r.Word, "", r.ID)
-				sent[r.UserID] = true
+				bot.StartReminderRound(tgbot, db, r.UserID)
+				started[r.UserID] = true
 			}
 		}
 	}()

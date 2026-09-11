@@ -236,6 +236,40 @@ func TestDeletePendingRemindersKeepsSentHistory(t *testing.T) {
 	}
 }
 
+func TestDueReminderQueue(t *testing.T) {
+	db := testDB(t)
+	const uid = 1
+	now := time.Now()
+	ScheduleReminder(db, uid, "крыша", 1, now.Add(-2*time.Hour)) // most overdue
+	ScheduleReminder(db, uid, "дерево", 1, now.Add(-time.Hour))
+	ScheduleReminder(db, uid, "игра", 1, now.Add(time.Hour)) // not due yet
+	ScheduleReminder(db, 2, "чужое", 1, now.Add(-time.Hour)) // another user
+
+	n, err := CountDueReminders(db, uid)
+	if err != nil || n != 2 {
+		t.Fatalf("CountDueReminders = %d (err=%v), want 2 — future and other users excluded", n, err)
+	}
+
+	r, err := NextDueReminder(db, uid)
+	if err != nil || r.Word != "крыша" {
+		t.Fatalf("NextDueReminder = %+v (err=%v), want the most overdue word", r, err)
+	}
+
+	// working through the batch: answered words drop out of the queue
+	MarkReminderSent(db, r.ID)
+	if n, _ := CountDueReminders(db, uid); n != 1 {
+		t.Errorf("after answering one, %d left, want 1", n)
+	}
+	r, err = NextDueReminder(db, uid)
+	if err != nil || r.Word != "дерево" {
+		t.Fatalf("next word = %+v (err=%v), want дерево", r, err)
+	}
+	MarkReminderSent(db, r.ID)
+	if _, err := NextDueReminder(db, uid); err == nil {
+		t.Error("an empty queue must return an error so the session can close")
+	}
+}
+
 func TestFindVocabAndGetVocabEntry(t *testing.T) {
 	db := testDB(t)
 	if err := SaveVocab(db, 1, "крыша", "屋根(やね) (yane)"); err != nil {

@@ -142,15 +142,6 @@ func practiceRetryKeyboard() tgbotapi.InlineKeyboardMarkup {
 	)
 }
 
-// contestKeyboard — a lone «Оспорить» button (reminder answers).
-func contestKeyboard(data string) tgbotapi.InlineKeyboardMarkup {
-	return tgbotapi.NewInlineKeyboardMarkup(
-		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("Оспорить", data),
-		),
-	)
-}
-
 // playKeyboard — a lone 🔊 button that plays one saved vocab entry.
 func playKeyboard(vocabID int) tgbotapi.InlineKeyboardMarkup {
 	return tgbotapi.NewInlineKeyboardMarkup(
@@ -215,6 +206,28 @@ func reminderKeyboard() tgbotapi.InlineKeyboardMarkup {
 		tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData("Закончить", "exit"),
 			tgbotapi.NewInlineKeyboardButtonData("Не помню", "dont_remember"),
+		),
+	)
+}
+
+// reminderContestKeyboard — reminder buttons plus «Оспорить», shown when the
+// answer was rejected or taken for a non-answer and the call may be wrong.
+func reminderContestKeyboard(reminderID int) tgbotapi.InlineKeyboardMarkup {
+	return tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("Закончить", "exit"),
+			tgbotapi.NewInlineKeyboardButtonData("Не помню", "dont_remember"),
+			tgbotapi.NewInlineKeyboardButtonData("Оспорить", fmt.Sprintf("contest#rem#%d", reminderID)),
+		),
+	)
+}
+
+// srsOfferKeyboard — shown with the «сегодня повторяем N слов» announcement.
+func srsOfferKeyboard() tgbotapi.InlineKeyboardMarkup {
+	return tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("Начать", "srs_start"),
+			tgbotapi.NewInlineKeyboardButtonData("Позже", "srs_later"),
 		),
 	)
 }
@@ -410,8 +423,8 @@ func HandleMessage(ctx context.Context, bot *tgbotapi.BotAPI, message *tgbotapi.
 
 	st := storage.GetState(db, userID)
 	switch st.Mode {
-	case "paused_compose", "paused_translate", "reminder":
-		// paused: just a re-prompt, no API; reminder: SRS answers are never capped
+	case "paused_compose", "paused_translate", "reminder", modeSrsOffer:
+		// paused/offer: just a re-prompt, no API; reminder: SRS answers are never capped
 	default:
 		if !capOK(bot, clients, db, chatID, userID) {
 			return
@@ -444,9 +457,13 @@ func HandleMessage(ctx context.Context, bot *tgbotapi.BotAPI, message *tgbotapi.
 	case modeAwaitWord:
 		handleAwaitWord(bot, clients, db, message)
 	default:
-		// modeConfirmSave lands here on purpose: if the user ignores the
-		// confirmation buttons and types something, treat it as a fresh lookup
-		// rather than trapping them in the save flow.
+		// modeConfirmSave and modeSrsOffer land here on purpose: if the user
+		// ignores the buttons and types something, treat it as a fresh lookup
+		// rather than trapping them. flow1Lookup resets the mode itself, so an
+		// ignored announcement is simply re-offered after the usual throttle.
+		if !capOK(bot, clients, db, chatID, userID) {
+			return
+		}
 		flow1Lookup(bot, clients, db, message)
 	}
 }
@@ -870,7 +887,7 @@ func checkPracticeCompose(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, me
 	chatID := message.Chat.ID
 	userID := int(message.From.ID)
 	think := sendThinking(bot, chatID)
-	v, fb := judge(clients, composeTask(st.TaskText, message.Text))
+	v, fb := judgeAnswer(clients, composeTask(st.TaskText, message.Text), message.Text, true)
 	deleteMsg(bot, chatID, think)
 	switch v {
 	case verdictOffTrack:
@@ -915,7 +932,7 @@ func checkPracticeTranslate(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, 
 	userID := int(message.From.ID)
 	think := sendThinking(bot, chatID)
 
-	v, fb := judge(clients, translateTask(st.TaskText, message.Text))
+	v, fb := judgeAnswer(clients, translateTask(st.TaskText, message.Text), message.Text, false)
 	deleteMsg(bot, chatID, think)
 	switch v {
 	case verdictOffTrack:
@@ -977,25 +994,42 @@ func handleContestReminder(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, c
 	storage.DeletePendingReminders(db, userID, word)
 	next := step + 1
 	storage.ScheduleReminder(db, userID, word, next, time.Now().Add(intervalFor(next)))
+	session := st.TaskText == srsSessionFlag
+	storage.ClearMode(db, userID)
 	send(bot, chatID, "Ты прав, засчитываю!\n"+fb+"\n\nНапомню это слово ещё попозже.")
+	continueSrsSession(bot, db, chatID, userID, session)
 }
 
-// judgeSystem grades an answer. It leans toward accepting valid alternatives,
-// must name the exact mistake when it rejects (research 6, with one alternative
-// natural phrasing), and classifies non-answers as 'offtrack' (research 5) so
-// a stray lookup never gets scored as a wrong answer.
-const judgeSystem = styleRules + " You are a friendly Japanese tutor. Reply in Russian. Judge the user's answer to the task. " +
-	"Your VERY FIRST line must be exactly one of: 'VERDICT: ok', 'VERDICT: retry', 'VERDICT: offtrack'. " +
-	"'VERDICT: offtrack' — the message is not an attempt at the task at all: an unrelated word or phrase " +
-	"(probably something to look up), a question, a request, small talk, or gibberish. Output nothing after it. " +
-	"'VERDICT: ok' — the answer is essentially correct: ignore minor typos and romaji-vs-kana, and accept any " +
-	"phrasing a native speaker would consider fine — there is usually more than one correct translation. " +
-	"When you are not confident the answer is actually wrong, prefer ok. " +
+const judgeBase = styleRules + " You are a friendly Japanese tutor. Reply in Russian. Judge the user's answer to the task. "
+
+// judgeGrading is shared by both judge prompts: lean toward accepting valid
+// alternatives, and when rejecting name the exact mistake plus one natural
+// alternative (research 6). Romaji tolerance is spelled out deliberately — a
+// loose romanisation like "buruuberi" for ブルーベリー is a correct answer.
+const judgeGrading = "'VERDICT: ok' — the answer is essentially correct: ignore minor typos, and treat romaji exactly " +
+	"as well as kana or kanji — ANY readable romanisation of the right word counts, including one without macrons, " +
+	"with doubled vowels, or not following Hepburn. Accept any phrasing a native speaker would consider fine — there " +
+	"is usually more than one correct translation. When you are not confident the answer is actually wrong, prefer ok. " +
 	"'VERDICT: retry' — ONLY for a real, identifiable mistake in a genuine attempt. " +
 	"Then a blank line, then short feedback. If ok: confirm and show the natural Japanese with kanji(чтение) and romaji, " +
 	"then, if a common natural alternative exists, ONE more line 'Ещё можно: ...' with kanji(чтение) and romaji. " +
 	"If retry: name the exact mistake (which particle, conjugation or word, and why it is wrong) in 1-2 lines, " +
 	"show the correct version with romaji, then, if a common natural alternative exists, ONE line 'Ещё можно: ...'."
+
+// judgeSystem also classifies non-answers as 'offtrack' (research 5) so a stray
+// lookup is never scored as a wrong answer. Used only where the message could
+// genuinely not be an attempt — see offtrackAllowed.
+const judgeSystem = judgeBase +
+	"Your VERY FIRST line must be exactly one of: 'VERDICT: ok', 'VERDICT: retry', 'VERDICT: offtrack'. " +
+	"'VERDICT: offtrack' — the message is not an attempt at the task at all: an unrelated word or phrase " +
+	"(probably something the user wants looked up), a question, a request, or small talk. " +
+	"A clumsy, misspelled, oddly romanised or plainly wrong attempt is NOT offtrack — judge it as ok or retry. " +
+	"Output nothing after an offtrack verdict. " + judgeGrading
+
+// judgeBinarySystem has no offtrack option: used when the message is certainly
+// an attempt, so a real answer cannot be discarded as "not an answer".
+const judgeBinarySystem = judgeBase +
+	"Your VERY FIRST line must be exactly 'VERDICT: ok' or 'VERDICT: retry'. " + judgeGrading
 
 // contestSystem is the second, independent review used when the user disputes
 // a 'retry' verdict — explicitly generous about acceptable variants.
@@ -1017,9 +1051,26 @@ const (
 	verdictOffTrack                // not an attempt at the task at all — never scored, never lapses SRS
 )
 
-// judge asks Claude to verdict an answer. Returns (verdict, feedback-in-Russian).
-func judge(clients *Clients, task string) (verdict, string) {
-	return judgeWith(clients, judgeSystem, task)
+// offtrackAllowed decides whether the judge may answer "this is not an attempt".
+// When the task expects Japanese and the user wrote Japanese or Latin letters,
+// it IS an attempt: allowing offtrack there made the model discard correct
+// romaji answers ("buruuberi" for ブルーベリー) as gibberish. Where a valid
+// answer and a stray lookup word look alike — Russian during the translate
+// stage — the classification stays available, which is what it was added for.
+func offtrackAllowed(expectJapanese bool, text string) bool {
+	if !expectJapanese {
+		return true
+	}
+	return !containsJapanese(text) && !containsLatin(text)
+}
+
+// judgeAnswer verdicts a user answer, picking the prompt that fits what the
+// task expects.
+func judgeAnswer(clients *Clients, task, answer string, expectJapanese bool) (verdict, string) {
+	if offtrackAllowed(expectJapanese, answer) {
+		return judgeWith(clients, judgeSystem, task)
+	}
+	return judgeWith(clients, judgeBinarySystem, task)
 }
 
 func judgeWith(clients *Clients, system, task string) (verdict, string) {
@@ -1060,27 +1111,34 @@ func checkReminder(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, message *
 	}
 
 	think := sendThinking(bot, chatID)
-	v, fb := judge(clients, "How do you say the word «"+word+"» in Japanese? User's answer: "+message.Text)
+	v, fb := judgeAnswer(clients, "How do you say the word «"+word+"» in Japanese? User's answer: "+message.Text,
+		message.Text, true)
 	deleteMsg(bot, chatID, think)
 
 	if v == verdictOffTrack {
-		// not an answer at all — don't lapse the word, just ask again
+		// not an answer at all — don't lapse the word, just ask again; «Оспорить»
+		// is offered in case the classification itself was wrong
+		storage.SetLastAnswer(db, userID, message.Text)
 		sendKb(bot, chatID, fmt.Sprintf("Это не похоже на ответ. Как будет «%s» по-японски? Или нажми «Закончить».", word),
-			reminderKeyboard())
+			reminderContestKeyboard(st.ReminderID))
 		return
 	}
 	storage.ClearMode(db, userID)
 
+	session := st.TaskText == srsSessionFlag
 	if v == verdictOK {
 		next := step + 1
 		storage.ScheduleReminder(db, userID, word, next, time.Now().Add(intervalFor(next)))
 		send(bot, chatID, "Правильно!\n"+fb+"\n\nНапомню это слово ещё попозже.")
+		continueSrsSession(bot, db, chatID, userID, session)
 	} else {
 		back := lapseStep(step)
 		storage.ScheduleReminder(db, userID, word, back, time.Now().Add(intervalFor(back)))
 		storage.SetLastAnswer(db, userID, message.Text)
+		// stay on this word: «Оспорить» needs the answer, and moving on would
+		// bury a possibly wrong verdict
 		sendKb(bot, chatID, fb+"\n\nНичего страшного — напомню это слово снова скоро.",
-			contestKeyboard(fmt.Sprintf("contest#rem#%d", st.ReminderID)))
+			reminderContestKeyboard(st.ReminderID))
 	}
 }
 
@@ -1113,11 +1171,86 @@ func lapseStep(step int) int {
 	return step - 2
 }
 
-// SendReminder is called by the scheduler to ask the spaced-repetition question.
-func SendReminder(bot *tgbotapi.BotAPI, userID int, word string) {
-	sendKb(bot, int64(userID),
-		fmt.Sprintf("Повторение!\nКак будет «%s» по-японски? Напиши свой вариант.", word),
-		reminderKeyboard())
+// ---------- SRS rounds ----------
+
+const (
+	// srsSessionMin is the number of due words from which the bot announces the
+	// whole batch once instead of trickling words out one at a time.
+	srsSessionMin = 3
+	// srsSessionFlag lives in user_state.task_text (unused during reminders) and
+	// marks "we are working through a batch", so the next word follows straight
+	// after an answer instead of waiting for the scheduler's throttle.
+	srsSessionFlag = "session"
+	modeSrsOffer   = "srs_offer" // announcement sent, waiting for «Начать»
+)
+
+// pluralRu picks the Russian plural form: 1 слово, 2 слова, 5 слов.
+func pluralRu(n int, one, few, many string) string {
+	n %= 100
+	if n >= 11 && n <= 14 {
+		return many
+	}
+	switch n % 10 {
+	case 1:
+		return one
+	case 2, 3, 4:
+		return few
+	}
+	return many
+}
+
+// StartReminderRound is the scheduler's entry point for one user. With several
+// words due it announces the batch and waits for «Начать»; with one or two it
+// just asks the first word, as before.
+func StartReminderRound(bot *tgbotapi.BotAPI, db *sql.DB, userID int) {
+	storage.SetLastReminderAt(db, userID, time.Now())
+	n, err := storage.CountDueReminders(db, userID)
+	if err != nil || n == 0 {
+		return
+	}
+	if n >= srsSessionMin {
+		storage.SetState(db, userID, modeSrsOffer, "", "", 0)
+		sendKb(bot, int64(userID), fmt.Sprintf("Сегодня повторяем %d %s.\nНачнём, как будешь готов.",
+			n, pluralRu(n, "слово", "слова", "слов")), srsOfferKeyboard())
+		return
+	}
+	sendNextDueReminder(bot, db, userID, false)
+}
+
+// sendNextDueReminder asks the next due word, reporting how many are left when
+// working through a batch. Returns false when nothing is due any more.
+func sendNextDueReminder(bot *tgbotapi.BotAPI, db *sql.DB, userID int, session bool) bool {
+	r, err := storage.NextDueReminder(db, userID)
+	if err != nil {
+		return false
+	}
+	storage.MarkReminderSent(db, r.ID)
+	storage.SetLastReminderAt(db, userID, time.Now())
+	flag := ""
+	if session {
+		flag = srsSessionFlag
+	}
+	storage.SetState(db, userID, "reminder", r.Word, flag, r.ID)
+
+	text := fmt.Sprintf("Повторение!\nКак будет «%s» по-японски? Напиши свой вариант.", r.Word)
+	if session {
+		if left, err := storage.CountDueReminders(db, userID); err == nil && left > 0 {
+			text += fmt.Sprintf("\n\nПосле этого останется ещё %d.", left)
+		}
+	}
+	sendKb(bot, int64(userID), text, reminderKeyboard())
+	return true
+}
+
+// continueSrsSession moves on to the next word of a batch, or closes it out.
+func continueSrsSession(bot *tgbotapi.BotAPI, db *sql.DB, chatID int64, userID int, session bool) {
+	if !session {
+		return
+	}
+	if !sendNextDueReminder(bot, db, userID, true) {
+		storage.ClearMode(db, userID)
+		send(bot, chatID, "На сегодня повторения закончились. Молодец!")
+	}
 }
 
 // ---------- callbacks ----------
@@ -1245,7 +1378,7 @@ func HandleCallbackQuery(bot *tgbotapi.BotAPI, clients *Clients, callbackQuery *
 		if w, _, err := storage.GetReminder(db, st.ReminderID); err == nil && w != "" {
 			word = w
 		}
-		storage.ClearMode(db, userID)
+		storage.ClearMode(db, userID) // drops the session flag — st keeps a copy
 		if word == "" {
 			send(bot, chatID, "Окей.")
 			return
@@ -1255,6 +1388,17 @@ func HandleCallbackQuery(bot *tgbotapi.BotAPI, clients *Clients, callbackQuery *
 		deleteMsg(bot, chatID, think)
 		storage.ScheduleReminder(db, userID, word, 1, time.Now().Add(intervalFor(1)))
 		send(bot, chatID, "Ничего страшного, вот как это:\n\n"+ans+"\n\nНапомню это слово снова скоро.")
+		continueSrsSession(bot, db, chatID, userID, st.TaskText == srsSessionFlag)
+
+	case data == "srs_start":
+		if !sendNextDueReminder(bot, db, userID, true) {
+			storage.ClearMode(db, userID)
+			send(bot, chatID, "Повторять пока нечего — напомню, когда придёт время.")
+		}
+
+	case data == "srs_later":
+		storage.ClearMode(db, userID)
+		send(bot, chatID, "Хорошо, напомню попозже.")
 
 	case data == "end_practice":
 		storage.ClearMode(db, userID)

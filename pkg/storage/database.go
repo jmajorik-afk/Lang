@@ -247,6 +247,24 @@ func DeletePendingReminders(db *sql.DB, userID int, word string) error {
 	return err
 }
 
+// CountDueReminders is how many words are waiting for this user right now.
+func CountDueReminders(db *sql.DB, userID int) (int, error) {
+	var n int
+	err := db.QueryRow(`SELECT COUNT(*) FROM reminders WHERE user_id=? AND sent=0 AND send_at<=?`,
+		userID, time.Now()).Scan(&n)
+	return n, err
+}
+
+// NextDueReminder returns the longest-overdue word waiting for this user.
+func NextDueReminder(db *sql.DB, userID int) (DueReminder, error) {
+	var r DueReminder
+	err := db.QueryRow(
+		`SELECT id, user_id, word, step FROM reminders WHERE user_id=? AND sent=0 AND send_at<=?
+		 ORDER BY send_at ASC, id ASC LIMIT 1`, userID, time.Now()).
+		Scan(&r.ID, &r.UserID, &r.Word, &r.Step)
+	return r, err
+}
+
 func GetDueReminders(db *sql.DB) ([]DueReminder, error) {
 	rows, err := db.Query(
 		`SELECT id, user_id, word, step FROM reminders WHERE sent=0 AND send_at<=? ORDER BY send_at ASC`,

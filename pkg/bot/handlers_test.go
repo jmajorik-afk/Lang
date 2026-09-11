@@ -134,6 +134,52 @@ func TestParseVerdict(t *testing.T) {
 	}
 }
 
+// TestOfftrackAllowed guards the regression that threw out a correct romaji
+// answer: when Japanese is expected and the user wrote Japanese or Latin
+// letters, the judge must not be offered the "not an answer" option at all.
+func TestOfftrackAllowed(t *testing.T) {
+	cases := []struct {
+		expectJapanese bool
+		text           string
+		want           bool
+	}{
+		// reminder / compose: a Japanese or romaji answer is always an attempt
+		{true, "buruuberi", false}, // the bug: loose romaji of ブルーベリー
+		{true, "burūberī", false},
+		{true, "ブルーベリー", false},
+		{true, "私は学生です", false},
+		{true, "zzz qqq", false}, // typo-ridden romaji is still an attempt
+		// …but a Russian word there cannot be an answer, so let the judge say so
+		{true, "крыша", true},
+		{true, "а что это значит?", true},
+		{true, "", true},
+		// translate stage: a valid answer and a lookup word are both Russian
+		{false, "я студент", true},
+		{false, "крыша", true},
+		{false, "植物", true},
+	}
+	for _, c := range cases {
+		if got := offtrackAllowed(c.expectJapanese, c.text); got != c.want {
+			t.Errorf("offtrackAllowed(expectJapanese=%v, %q) = %v, want %v",
+				c.expectJapanese, c.text, got, c.want)
+		}
+	}
+}
+
+// TestPluralRu covers the announcement wording for batch sizes.
+func TestPluralRu(t *testing.T) {
+	cases := map[int]string{
+		1: "слово", 2: "слова", 3: "слова", 4: "слова", 5: "слов", 9: "слов",
+		11: "слов", 12: "слов", 14: "слов", 21: "слово", 22: "слова", 25: "слов",
+		101: "слово", 111: "слов", 0: "слов",
+	}
+	for n, want := range cases {
+		if got := pluralRu(n, "слово", "слова", "слов"); got != want {
+			t.Errorf("pluralRu(%d) = %q, want %q", n, got, want)
+		}
+	}
+}
+
 // TestLapseStep — a wrong answer drops two steps (floor 1), not a full reset.
 func TestLapseStep(t *testing.T) {
 	cases := map[int]int{1: 1, 2: 1, 3: 1, 4: 2, 5: 3, 6: 4, 7: 5}

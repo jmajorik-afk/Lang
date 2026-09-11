@@ -30,7 +30,8 @@ CREATE INDEX IF NOT EXISTS idx_reminders_due ON reminders (send_at, sent);
 -- Per-user interaction state machine
 CREATE TABLE IF NOT EXISTS user_state (
     user_id INTEGER PRIMARY KEY,
-    mode TEXT NOT NULL DEFAULT '',          -- '' | practice_compose | practice_translate | paused_compose | paused_translate | reminder | confirm_save | await_word | ask
+    mode TEXT NOT NULL DEFAULT '',          -- '' | practice_compose | practice_translate | paused_compose | paused_translate | reminder | srs_offer | confirm_save | await_word | ask
+    -- during 'reminder' task_text holds 'session' while working through a batch
     word TEXT NOT NULL DEFAULT '',          -- current / active word
     task_text TEXT NOT NULL DEFAULT '',     -- the sentence shown for practice
     reminder_id INTEGER NOT NULL DEFAULT 0,
