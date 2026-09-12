@@ -286,6 +286,29 @@ func TestDueReminderQueue(t *testing.T) {
 	}
 }
 
+// TestDueRemindersSkipJustAnswered — a word answered wrongly lapses to a
+// 3-hour interval, which sits inside the 12-hour batch horizon; it must not be
+// asked again in the same sitting.
+func TestDueRemindersSkipJustAnswered(t *testing.T) {
+	db := testDB(t)
+	const uid = 1
+	now := time.Now()
+	ScheduleReminder(db, uid, "холодно", 1, now.Add(3*time.Hour)) // the lapse
+	ScheduleReminder(db, uid, "дерево", 1, now.Add(2*time.Hour))  // untouched word
+	horizon := now.Add(12 * time.Hour)
+
+	if n, _ := CountDueReminders(db, uid, horizon); n != 2 {
+		t.Fatalf("before any answer both words are in the horizon, got %d", n)
+	}
+	LogOutcome(db, uid, "reminder", "холодно", false, true, "word-choice", "x", "")
+	if n, _ := CountDueReminders(db, uid, horizon); n != 1 {
+		t.Errorf("the just-answered word must drop out, got %d", n)
+	}
+	if r, _ := NextDueReminder(db, uid, horizon); r.Word != "дерево" {
+		t.Errorf("next word = %q, want дерево", r.Word)
+	}
+}
+
 func TestScheduleReminderStoresUTC(t *testing.T) {
 	db := testDB(t)
 	plus5 := time.FixedZone("UTC+5", 5*3600)

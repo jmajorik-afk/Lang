@@ -301,11 +301,19 @@ func DeletePendingReminders(db *sql.DB, userID int, word string) error {
 	return err
 }
 
+// justAnswered excludes words answered in the last half hour. A word answered
+// wrongly lapses to a 3-hour interval, which falls inside the batch horizon —
+// without this it would be asked again in the same sitting, right after the
+// user had just been shown the correct answer.
+const justAnswered = ` AND NOT EXISTS (
+		SELECT 1 FROM outcomes o WHERE o.user_id = r.user_id AND o.word = r.word
+		  AND o.created_at >= datetime('now', '-30 minutes'))`
+
 // CountDueReminders is how many unsent words come due by the given moment —
 // pass time.Now() for "due right now", or a later horizon for "due today".
 func CountDueReminders(db *sql.DB, userID int, by time.Time) (int, error) {
 	var n int
-	err := db.QueryRow(`SELECT COUNT(*) FROM reminders WHERE user_id=? AND sent=0 AND send_at<=?`,
+	err := db.QueryRow(`SELECT COUNT(*) FROM reminders r WHERE r.user_id=? AND r.sent=0 AND r.send_at<=?`+justAnswered,
 		userID, by.UTC()).Scan(&n)
 	return n, err
 }
@@ -314,8 +322,8 @@ func CountDueReminders(db *sql.DB, userID int, by time.Time) (int, error) {
 func NextDueReminder(db *sql.DB, userID int, by time.Time) (DueReminder, error) {
 	var r DueReminder
 	err := db.QueryRow(
-		`SELECT id, user_id, word, step FROM reminders WHERE user_id=? AND sent=0 AND send_at<=?
-		 ORDER BY send_at ASC, id ASC LIMIT 1`, userID, by.UTC()).
+		`SELECT r.id, r.user_id, r.word, r.step FROM reminders r WHERE r.user_id=? AND r.sent=0 AND r.send_at<=?`+
+			justAnswered+` ORDER BY r.send_at ASC, r.id ASC LIMIT 1`, userID, by.UTC()).
 		Scan(&r.ID, &r.UserID, &r.Word, &r.Step)
 	return r, err
 }

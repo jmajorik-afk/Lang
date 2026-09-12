@@ -111,6 +111,56 @@ func TestSplitHeadword(t *testing.T) {
 	}
 }
 
+// TestMatchesStoredEntry guards the false negative that started this: the user
+// answered «さむい» for «холодно», the dictionary held 寒(さむ)い (samui), and the
+// judge still rejected it. An answer matching the stored entry in any script is
+// accepted without asking the model at all.
+func TestMatchesStoredEntry(t *testing.T) {
+	const cold = "寒(さむ)い (samui)"
+	accept := []string{"寒い", "さむい", "samui", " Samui ", "SAMUI", "さむい。", "寒い!"}
+	for _, a := range accept {
+		if !matchesStoredEntry(cold, a) {
+			t.Errorf("matchesStoredEntry(%q) = false, want true", a)
+		}
+	}
+	// «самуи» in Cyrillic is not romaji — it falls through to the judge, which
+	// may still accept it; only an exact script match short-circuits.
+	reject := []string{"", "冷たい", "tsumetai", "寒", "холодно", "atsui", "самуи"}
+	for _, a := range reject {
+		if matchesStoredEntry(cold, a) {
+			t.Errorf("matchesStoredEntry(%q) = true, want false (must fall through to the judge)", a)
+		}
+	}
+	// kana-only entry, and no entry at all
+	if !matchesStoredEntry("ありがとう (arigatou)", "ありがとう") {
+		t.Error("kana-only entry must match its own form")
+	}
+	if matchesStoredEntry("", "さむい") {
+		t.Error("with no stored entry there is nothing to match against")
+	}
+
+	if got := romajiOf(cold); got != "samui" {
+		t.Errorf("romajiOf = %q, want samui", got)
+	}
+	if got := romajiOf("屋根(やね)"); got != "やね" {
+		t.Errorf("romajiOf without a romaji group = %q, want the trailing group やね", got)
+	}
+}
+
+// TestReminderTaskCarriesStoredEntry — the judge must be told what the user's
+// dictionary says, otherwise it grades against its own idea of the best phrasing.
+func TestReminderTaskCarriesStoredEntry(t *testing.T) {
+	task := reminderTask("холодно", "寒(さむ)い (samui)", "さむい")
+	for _, must := range []string{"холодно", "さむい", "寒(さむ)い (samui)", "NEVER reject"} {
+		if !strings.Contains(task, must) {
+			t.Errorf("reminder task lacks %q", must)
+		}
+	}
+	if strings.Contains(reminderTask("холодно", "", "さむい"), "stored entry") {
+		t.Error("with no stored entry the task must not reference one")
+	}
+}
+
 // TestParseVerdict pins the judge protocol: verdict line, optional TAG line on
 // mistakes, then feedback; anything unrecognised is a retry so the user stays
 // in the stage.

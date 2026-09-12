@@ -212,12 +212,29 @@ func reminderKeyboard() tgbotapi.InlineKeyboardMarkup {
 
 // reminderContestKeyboard — reminder buttons plus «Оспорить», shown when the
 // answer was rejected or taken for a non-answer and the call may be wrong.
-func reminderContestKeyboard(reminderID int) tgbotapi.InlineKeyboardMarkup {
-	return tgbotapi.NewInlineKeyboardMarkup(
+// «Дальше» appears while a batch still has words waiting, so one mistake does
+// not dead-end the whole session.
+func reminderContestKeyboard(reminderID int, more bool) tgbotapi.InlineKeyboardMarkup {
+	kb := tgbotapi.NewInlineKeyboardMarkup(
 		tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData("Закончить", "exit"),
 			tgbotapi.NewInlineKeyboardButtonData("Не помню", "dont_remember"),
 			tgbotapi.NewInlineKeyboardButtonData("Оспорить", fmt.Sprintf("contest#rem#%d", reminderID)),
+		),
+	)
+	if more {
+		kb.InlineKeyboard = append(kb.InlineKeyboard, tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("Дальше", "srs_next"),
+		))
+	}
+	return kb
+}
+
+// srsNextKeyboard — a lone «Дальше» to resume a batch.
+func srsNextKeyboard() tgbotapi.InlineKeyboardMarkup {
+	return tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("Дальше", "srs_next"),
 		),
 	)
 }
@@ -1092,10 +1109,13 @@ func handleContestReminder(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, c
 	storage.DeletePendingReminders(db, userID, word)
 	next := step + 1
 	storage.ScheduleReminder(db, userID, word, next, time.Now().Add(intervalFor(next)))
-	session := st.TaskText == srsSessionFlag
 	storage.ClearMode(db, userID)
-	send(bot, chatID, "Ты прав, засчитываю!\n"+fb+"\n\nНапомню это слово ещё попозже.")
-	continueSrsSession(bot, db, chatID, userID, session)
+	msg := "Ты прав, засчитываю!\n" + fb + "\n\nНапомню это слово ещё попозже."
+	if srsWordsLeft(db, userID) > 0 {
+		sendKb(bot, chatID, msg, srsNextKeyboard()) // batch can go on if the user wants
+	} else {
+		send(bot, chatID, msg)
+	}
 }
 
 const judgeBase = styleRules + " You are a friendly Japanese tutor. Reply in Russian. Judge the user's answer to the task. "
@@ -1383,10 +1403,22 @@ func checkReminder(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, message *
 		word, step = w, s
 	}
 
-	think := sendThinking(bot, chatID)
-	v, tag, fb := judgeAnswer(clients, "How do you say the word «"+word+"» in Japanese? User's answer: "+message.Text,
-		message.Text, true)
-	deleteMsg(bot, chatID, think)
+	translation := ""
+	if e, err := storage.FindVocab(db, userID, word); err == nil {
+		translation = e.Translation
+	}
+
+	var v verdict
+	var tag, fb string
+	if matchesStoredEntry(translation, message.Text) {
+		// the user recalled their own dictionary entry verbatim — there is
+		// nothing for the model to second-guess, and nothing to pay for
+		v, fb = verdictOK, translation
+	} else {
+		think := sendThinking(bot, chatID)
+		v, tag, fb = judgeAnswer(clients, reminderTask(word, translation, message.Text), message.Text, true)
+		deleteMsg(bot, chatID, think)
+	}
 
 	if v == verdictError {
 		sendKb(bot, chatID, fb, reminderKeyboard()) // stay on the word, nothing recorded
@@ -1397,7 +1429,7 @@ func checkReminder(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, message *
 		// is offered in case the classification itself was wrong
 		storage.SetLastAnswer(db, userID, message.Text)
 		sendKb(bot, chatID, fmt.Sprintf("Это не похоже на ответ. Как будет «%s» по-японски? Или нажми «Закончить».", word),
-			reminderContestKeyboard(st.ReminderID))
+			reminderContestKeyboard(st.ReminderID, st.TaskText == srsSessionFlag && srsWordsLeft(db, userID) > 0))
 		return
 	}
 	storage.ClearMode(db, userID)
@@ -1413,11 +1445,58 @@ func checkReminder(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, message *
 		back := lapseStep(step)
 		storage.ScheduleReminder(db, userID, word, back, time.Now().Add(intervalFor(back)))
 		storage.SetLastAnswer(db, userID, message.Text)
-		// stay on this word: «Оспорить» needs the answer, and moving on would
-		// bury a possibly wrong verdict
+		// stay on this word rather than auto-advancing: «Оспорить» needs the
+		// answer, and moving on would bury a possibly wrong verdict. «Дальше»
+		// lets the user continue the batch deliberately.
 		sendKb(bot, chatID, fb+"\n\nНичего страшного — напомню это слово снова скоро.",
-			reminderContestKeyboard(st.ReminderID))
+			reminderContestKeyboard(st.ReminderID, session && srsWordsLeft(db, userID) > 0))
 	}
+}
+
+// matchesStoredEntry reports whether the answer is literally the user's stored
+// dictionary entry — its written form, its kana reading, or its romaji.
+func matchesStoredEntry(translation, answer string) bool {
+	a := normalizeAnswer(answer)
+	if a == "" || translation == "" {
+		return false
+	}
+	written, reading := splitHeadword(translation)
+	for _, want := range []string{written, reading, romajiOf(translation)} {
+		if want != "" && normalizeAnswer(want) == a {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeAnswer(s string) string {
+	return strings.Trim(strings.ToLower(strings.TrimSpace(s)), " \t.,!?;:«»\"'()。、")
+}
+
+var trailingParenRe = regexp.MustCompile(`[(（]([^)）]*)[)）]\s*$`)
+
+// romajiOf pulls the trailing romaji group out of "寒(さむ)い (samui)".
+func romajiOf(translation string) string {
+	if m := trailingParenRe.FindStringSubmatch(strings.TrimSpace(translation)); m != nil {
+		return strings.TrimSpace(m[1])
+	}
+	return ""
+}
+
+// reminderTask frames the SRS question for the judge. The stored vocabulary
+// entry is handed over as the expected answer: without it the judge graded
+// against its own notion of the most idiomatic phrasing and rejected «さむい»
+// for «холодно» while admitting in the same breath that it was acceptable.
+func reminderTask(word, translation, answer string) string {
+	t := "How do you say the word «" + word + "» in Japanese? User's answer: " + answer
+	if translation != "" {
+		t += "\n\nThe user's own vocabulary stores this word as: " + translation +
+			"\nTreat that stored entry as the expected answer: accept it in any script (kanji, kana or romaji), " +
+			"in plain or polite form, and also accept any other word a native speaker would use for «" + word + "». " +
+			"NEVER reject an answer over register, politeness or fine nuance when it is the stored entry — the user is " +
+			"recalling their own dictionary, not picking the most idiomatic phrasing."
+	}
+	return t
 }
 
 func intervalFor(step int) time.Duration {
@@ -1535,6 +1614,16 @@ func sendNextDueReminder(bot *tgbotapi.BotAPI, db *sql.DB, userID int, session b
 	}
 	sendKb(bot, int64(userID), text, reminderKeyboard())
 	return true
+}
+
+// srsWordsLeft is how many words the current batch still has waiting.
+func srsWordsLeft(db *sql.DB, userID int) int {
+	n, err := storage.CountDueReminders(db, userID, time.Now().Add(srsSessionWindow))
+	if err != nil {
+		log.Printf("srs words left: %v", err)
+		return 0
+	}
+	return n
 }
 
 // continueSrsSession moves on to the next word of a batch, or closes it out.
@@ -1690,6 +1779,9 @@ func HandleCallbackQuery(bot *tgbotapi.BotAPI, clients *Clients, callbackQuery *
 			storage.ClearMode(db, userID)
 			send(bot, chatID, "Повторять пока нечего — напомню, когда придёт время.")
 		}
+
+	case data == "srs_next":
+		continueSrsSession(bot, db, chatID, userID, true)
 
 	case data == "srs_later":
 		storage.ClearMode(db, userID)
