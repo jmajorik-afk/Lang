@@ -3,587 +3,2060 @@ package bot
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
 	"log"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
+	"unicode/utf8"
 
+	claude_api "language-learning-bot/pkg/claude"
 	"language-learning-bot/pkg/config"
+	"language-learning-bot/pkg/jisho"
 	openai_api "language-learning-bot/pkg/openai"
 	storage "language-learning-bot/pkg/storage"
 
+	"github.com/anthropics/anthropic-sdk-go"
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
-	"github.com/sashabaranov/go-openai"
+	openai "github.com/sashabaranov/go-openai"
 )
 
-func HandleCommand(ctx context.Context, bot *tgbotapi.BotAPI, message *tgbotapi.Message, db *sql.DB, openaiClient *openai.Client) error {
-	// log the command to the console
+const historyTurns = 6
+
+// Interaction modes kept in user_state.mode for the "Запомнить" confirmation.
+const (
+	modeConfirmSave = "confirm_save" // bot asked «Запомнить слово «X»?»
+	modeAwaitWord   = "await_word"   // user rejected the guess and types the right word
+)
+
+// Clients bundles both API clients: Claude for text, OpenAI for TTS.
+type Clients struct {
+	Claude   anthropic.Client
+	OpenAI   *openai.Client
+	DailyCap int // max user-initiated API interactions per user per day; 0 = unlimited
+}
+
+// styleRules is prepended to every model prompt so all answers share one style.
+const styleRules = "Plain text only — no Markdown, no #, no *, no bold, no headers, no --- dividers. " +
+	"Be short and focused: a few lines, answer only what was asked, no sections, no lecture. " +
+	"Japanese style: every kanji is immediately followed by its reading in round brackets, like 育(そだ). " +
+	"Give romaji for a whole word or sentence once, in pure Latin letters only — never use square brackets, " +
+	"never mix Cyrillic into romaji, never leave part of a word without romaji. Example: 育(そだ)っています (sodatte imasu). " +
+	"No emojis."
+
+// uncertaintyRule (research 1a): a wrong explanation reads exactly as fluently
+// as a right one, so the model must flag its own shaky points — but not hedge
+// on textbook basics, which would just be noise.
+const uncertaintyRule = " If you are not fully sure about a point — a rare usage, a dialect or register nuance, " +
+	"something native speakers disagree on, or anything you might be misremembering — say so in one short phrase " +
+	"(например: 'тут не уверен на 100%') instead of stating it as confidently as basic grammar. " +
+	"Never invent a rule to sound complete. Do NOT hedge on standard textbook grammar (particles, basic conjugation, " +
+	"common structures) — hedge only where the uncertainty is real."
+
+const grammarSystem = styleRules + " You are a friendly Japanese tutor. " +
+	"The user asks a grammar question in Russian. Answer in Russian, casually. Do not ask follow-up questions." +
+	uncertaintyRule
+
+// ---------- small send helpers ----------
+
+func send(bot *tgbotapi.BotAPI, chatID int64, text string) {
+	if _, err := bot.Send(tgbotapi.NewMessage(chatID, text)); err != nil {
+		log.Printf("send error: %v", err)
+	}
+}
+
+func sendKb(bot *tgbotapi.BotAPI, chatID int64, text string, kb tgbotapi.InlineKeyboardMarkup) {
+	m := tgbotapi.NewMessage(chatID, text)
+	m.ReplyMarkup = kb
+	if _, err := bot.Send(m); err != nil {
+		log.Printf("send error: %v", err)
+	}
+}
+
+func answerCallback(bot *tgbotapi.BotAPI, cq *tgbotapi.CallbackQuery) {
+	bot.Request(tgbotapi.NewCallback(cq.ID, ""))
+}
+
+func sendThinking(bot *tgbotapi.BotAPI, chatID int64) int {
+	m, err := bot.Send(tgbotapi.NewMessage(chatID, "Думаю..."))
+	if err != nil {
+		return 0
+	}
+	return m.MessageID
+}
+
+func deleteMsg(bot *tgbotapi.BotAPI, chatID int64, msgID int) {
+	if msgID != 0 {
+		bot.Request(tgbotapi.NewDeleteMessage(chatID, msgID))
+	}
+}
+
+func claudeOne(clients *Clients, system, user string) (string, error) {
+	return claude_api.GetClaudeResponse(context.Background(), &clients.Claude, claude_api.ClaudeRequest{
+		SystemPrompt: system,
+		UserMessage:  user,
+	})
+}
+
+// ---------- keyboards ----------
+
+func wordKeyboard() tgbotapi.InlineKeyboardMarkup {
+	return tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("Запомнить", "memorize"),
+			tgbotapi.NewInlineKeyboardButtonData("Знаю", "know"),
+			tgbotapi.NewInlineKeyboardButtonData("🔊", "audio"),
+		),
+	)
+}
+
+func practiceOfferKeyboard() tgbotapi.InlineKeyboardMarkup {
+	return tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("Да", "practice_yes"),
+			tgbotapi.NewInlineKeyboardButtonData("Нет", "practice_no"),
+		),
+	)
+}
+
+// practiceKeyboard — "Закончить" + "Уточнить" (used during practice stages).
+func practiceKeyboard() tgbotapi.InlineKeyboardMarkup {
+	return tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("Закончить", "exit"),
+			tgbotapi.NewInlineKeyboardButtonData("Уточнить", "clarify"),
+		),
+	)
+}
+
+// practiceRetryKeyboard — shown after a 'retry' verdict: the user may dispute it.
+func practiceRetryKeyboard() tgbotapi.InlineKeyboardMarkup {
+	return tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("Закончить", "exit"),
+			tgbotapi.NewInlineKeyboardButtonData("Уточнить", "clarify"),
+			tgbotapi.NewInlineKeyboardButtonData("Оспорить", "contest#practice"),
+		),
+	)
+}
+
+// playKeyboard — a lone 🔊 button that plays one saved vocab entry.
+func playKeyboard(vocabID int) tgbotapi.InlineKeyboardMarkup {
+	return tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("🔊", fmt.Sprintf("vocab_play#%d", vocabID)),
+		),
+	)
+}
+
+func sendComposeTask(bot *tgbotapi.BotAPI, chatID int64, task string) {
+	sendKb(bot, chatID, "Составь это предложение по-японски:\n\n"+task, practiceKeyboard())
+}
+
+func sendTranslateTask(bot *tgbotapi.BotAPI, chatID int64, task string) {
+	sendKb(bot, chatID, "Переведи на русский:\n\n"+task, practiceKeyboard())
+}
+
+func roundKeyboard() tgbotapi.InlineKeyboardMarkup {
+	return tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("Ещё раунд", "round_yes"),
+			tgbotapi.NewInlineKeyboardButtonData("Хватит", "round_no"),
+		),
+	)
+}
+
+// askKeyboard — shown under every answer in /ask mode. Follow-up questions are
+// typed directly (no button needed); «Закончить» leaves the mode.
+func askKeyboard() tgbotapi.InlineKeyboardMarkup {
+	return tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("Закончить", "exit"),
+			tgbotapi.NewInlineKeyboardButtonData("Потренироваться", "ask_practice"),
+		),
+	)
+}
+
+// confirmSaveKeyboard — shown under «Запомнить слово «X»?».
+func confirmSaveKeyboard() tgbotapi.InlineKeyboardMarkup {
+	return tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("Да", "save_yes"),
+			tgbotapi.NewInlineKeyboardButtonData("Нет", "save_no"),
+		),
+	)
+}
+
+// practiceExitKeyboard — shown when the user types something that doesn't look
+// like a practice answer (probably forgot they were mid-practice).
+func practiceExitKeyboard() tgbotapi.InlineKeyboardMarkup {
+	return tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("Да, закончить", "end_practice"),
+			tgbotapi.NewInlineKeyboardButtonData("Нет, продолжить", "resume_practice"),
+		),
+	)
+}
+
+// reminderKeyboard — shown under an SRS reminder.
+func reminderKeyboard() tgbotapi.InlineKeyboardMarkup {
+	return tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("Закончить", "exit"),
+			tgbotapi.NewInlineKeyboardButtonData("Не помню", "dont_remember"),
+		),
+	)
+}
+
+// reminderContestKeyboard — reminder buttons plus «Оспорить», shown when the
+// answer was rejected or taken for a non-answer and the call may be wrong.
+// «Дальше» appears while a batch still has words waiting, so one mistake does
+// not dead-end the whole session.
+func reminderContestKeyboard(reminderID int, more bool) tgbotapi.InlineKeyboardMarkup {
+	kb := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("Закончить", "exit"),
+			tgbotapi.NewInlineKeyboardButtonData("Не помню", "dont_remember"),
+			tgbotapi.NewInlineKeyboardButtonData("Оспорить", fmt.Sprintf("contest#rem#%d", reminderID)),
+		),
+	)
+	if more {
+		kb.InlineKeyboard = append(kb.InlineKeyboard, tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("Дальше", "srs_next"),
+		))
+	}
+	return kb
+}
+
+// srsNextKeyboard — a lone «Дальше» to resume a batch.
+func srsNextKeyboard() tgbotapi.InlineKeyboardMarkup {
+	return tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("Дальше", "srs_next"),
+		),
+	)
+}
+
+// srsOfferKeyboard — shown with the «сегодня повторяем N слов» announcement.
+func srsOfferKeyboard() tgbotapi.InlineKeyboardMarkup {
+	return tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("Начать", "srs_start"),
+			tgbotapi.NewInlineKeyboardButtonData("Позже", "srs_later"),
+		),
+	)
+}
+
+// ---------- command entry ----------
+
+func HandleCommand(bot *tgbotapi.BotAPI, message *tgbotapi.Message, db *sql.DB, clients *Clients) {
 	log.Printf("%d [%s] %s", message.From.ID, message.From.UserName, message.Text)
-	response := ""
+	userID := int(message.From.ID)
+	chatID := message.Chat.ID
+	storage.EnsureUser(db, userID)
+
 	switch message.Command() {
-	case "healthz":
-		response = "OK"
 	case "start":
-		if err := sendLanguageSelection(bot, message.Chat.ID); err != nil {
-			log.Printf("Error sending language selection: %v\n", err)
-			return err
+		send(bot, chatID, "Привет! Напиши любое слово — переведу, дам пример и предложу запомнить.\n\n"+
+			"/practice — тренировка по выученным словам\n"+
+			"/ask — вопрос по грамматике (дальше уточняй просто сообщениями)\n"+
+			"/vocab — твой словарь; /vocab <часть слова> — поиск\n"+
+			"/stats — статистика и слабые места\n"+
+			"/speech_speed — скорость озвучки")
+	case "practice":
+		if capOK(bot, clients, db, chatID, userID) {
+			startPracticeWeakest(bot, clients, db, chatID, userID, "")
 		}
-		response = ""
+	case "ask":
+		// an empty /ask only prints the usage hint — no API call, no budget spent
+		if strings.TrimSpace(message.CommandArguments()) == "" || capOK(bot, clients, db, chatID, userID) {
+			handleAsk(bot, clients, db, message)
+		}
+	case "vocab":
+		if q := strings.TrimSpace(message.CommandArguments()); q != "" {
+			sendVocabSearch(bot, db, chatID, userID, q)
+		} else {
+			sendVocab(bot, clients, db, chatID, userID, 0)
+		}
+	case "stats":
+		sendStats(bot, db, chatID, userID)
 	case "speech_speed":
-		if err := sendSpeechSpeedSelection(bot, message.Chat.ID); err != nil {
-			log.Printf("Error sending speech speed selection: %v\n", err)
-			return err
-		}
-	case "examples":
-		if err := handleExamplesCommand(bot, message, db, openaiClient); err != nil {
-			log.Printf("Error handling examples command: %v\n", err)
-			return err
-		}
-		response = "I will respond with examples of the word or phrase usage."
-
-	case "translation":
-		if err := handleTranslationCommand(bot, message, db, openaiClient); err != nil {
-			log.Printf("Error handling translation command: %v\n", err)
-			return err
-		}
-		response = "I will respond with translations."
-
-	case "pronunciation":
-		if err := handlePronounciationCommand(bot, message, db, openaiClient); err != nil {
-			log.Printf("Error handling pronounciation command: %v\n", err)
-			return err
-		}
-
-	case "inflection":
-		if err := handleInflectionCommand(bot, message, db, openaiClient); err != nil {
-			log.Printf("Error handling inflection command: %v\n", err)
-			return err
-		}
-		response = "I will respond with inflection (if applicable) for the provided word."
-	}
-
-	// send the response to the user
-	if response != "" {
-		msg := tgbotapi.NewMessage(message.Chat.ID, response)
-		_, err := bot.Send(msg)
-		if err != nil {
-			log.Printf("Error sending response: %v\n", err)
-			return err
-		}
-	}
-	return nil
-}
-
-func parseExamplesByNumber(message string) []string {
-	// parse the last response for the strings starting with a number
-	lines := strings.Split(message, "\n")
-	var examples []string
-	numberPrefixRegex := regexp.MustCompile(`[0-9]+\. `)
-	for _, line := range lines {
-		// check if the line matches the pattern "[0-9]+\. "
-		if numberPrefixRegex.MatchString(line) {
-			// strip the number from the line
-			line = strings.Split(line, ". ")[1]
-			// add the line to the examples
-			examples = append(examples, line)
-		}
-	}
-	return examples
-}
-
-func handlePronounciationCommand(bot *tgbotapi.BotAPI, message *tgbotapi.Message, db *sql.DB, openaiClient *openai.Client) error {
-	userId := int(message.From.ID)
-	sendLastRequestAudio(db, userId, 0, message.Text, openaiClient, bot)
-
-	return nil
-}
-
-func handleInflectionCommand(bot *tgbotapi.BotAPI, message *tgbotapi.Message, db *sql.DB, openaiClient *openai.Client) error {
-	err := storage.UpdateUserHelpType(db, int(message.From.ID), "inflection")
-	if err != nil {
-		log.Printf("Error updating user help_type: %v\n", err)
-		return err
-	}
-	return nil
-}
-
-func handleExamplesCommand(bot *tgbotapi.BotAPI, message *tgbotapi.Message, db *sql.DB, openaiClient *openai.Client) error {
-	err := storage.UpdateUserHelpType(db, int(message.From.ID), "examples")
-	if err != nil {
-		log.Printf("Error updating user help_type: %v\n", err)
-		return err
-	}
-	return nil
-}
-
-func handleTranslationCommand(bot *tgbotapi.BotAPI, message *tgbotapi.Message, db *sql.DB, openaiClient *openai.Client) error {
-	err := storage.UpdateUserHelpType(db, int(message.From.ID), "translation")
-	if err != nil {
-		log.Printf("Error updating user help_type: %v\n", err)
-		return err
-	}
-	return nil
-}
-
-func sendAudioMessage(openaiClient *openai.Client, db *sql.DB, firstLine string, userid int, bot *tgbotapi.BotAPI) error {
-	userSpeechSpeed, err := storage.GetUserSpeechSpeed(db, userid)
-
-	if err != nil {
-		log.Println("Failed to get user speech speed: ", err)
-		userSpeechSpeed = 1.0
-	}
-
-	openaiResponse, err := openai_api.GetTTSResponse(context.Background(), openaiClient, userSpeechSpeed, firstLine)
-
-	if err != nil {
-		log.Printf("Error getting TTS response: %v\n", err)
-		return err
-	}
-
-	audio := tgbotapi.FileBytes{Name: fmt.Sprintf("%s.mp3", firstLine), Bytes: openaiResponse}
-	audioMsg := tgbotapi.NewVoice(int64(userid), audio)
-	_, err = bot.Send(audioMsg)
-	if err != nil {
-		log.Printf("Error sending audio message: %v\n", err)
-		return err
-	}
-	return nil
-}
-
-func HandleCallbackQuery(bot *tgbotapi.BotAPI, openaiClient *openai.Client, callbackQuery *tgbotapi.CallbackQuery, db *sql.DB) {
-	data := callbackQuery.Data
-	if strings.HasPrefix(data, "language:") {
-		language := strings.Split(data, ":")[1]
-		updateLanguagePreference(bot, callbackQuery, db, language, 0)
-	}
-
-	if strings.HasPrefix(data, "pronunciation:") {
-		// parse the number from the callback data into an int
-		exampleNumber, err := strconv.Atoi(strings.Split(data, ":")[1])
-		if err != nil {
-			log.Printf("Error parsing example number: %v\n", err)
-			return
-		}
-		log.Println("Pronounciation example: ", exampleNumber)
-
-		msg := tgbotapi.NewEditMessageText(callbackQuery.Message.Chat.ID,
-			callbackQuery.Message.MessageID,
-			fmt.Sprintf("You picked number %d. The pronunciation will be sent to you shortly."+
-				"If it does not pop up in a few seconds, please choose /pronunciation from the menu and try again!", exampleNumber))
-		_, err = bot.Send(msg)
-		if err != nil {
-			log.Printf("Error sending confirmation message: %v\n", err)
-		}
-		userId := int(callbackQuery.From.ID)
-
-		// send the Nth example
-		shouldReturn := sendLastRequestAudio(db, userId, exampleNumber, callbackQuery.Message.Text, openaiClient, bot)
-		if shouldReturn {
-			log.Printf("Error sending last request audio")
-			return
-		}
-	}
-
-	// set speech speed
-	if strings.HasPrefix(data, "speech_speed:") {
-		// parse the number from the callback data into an int
-		speechSpeed, err := strconv.ParseFloat(strings.Split(data, ":")[1], 64)
-		if err != nil {
-			log.Printf("Error parsing speech speed: %v\n", err)
-			return
-		}
-		log.Println("Speech speed: ", speechSpeed)
-
-		speechSpeedValues := getSpeechSpeedValues()
-		if speechSpeedText, ok := speechSpeedValues[speechSpeed]; ok {
-			log.Printf("Setting speech speed to %.1f", speechSpeed)
-			msg := tgbotapi.NewEditMessageText(callbackQuery.Message.Chat.ID,
-				callbackQuery.Message.MessageID,
-				fmt.Sprintf("You picked %s speech speed. The speech speed will be applied to the next pronunciation.", speechSpeedText))
-			_, err = bot.Send(msg)
-			if err != nil {
-				log.Printf("Error sending confirmation message: %v\n", err)
-			}
-			userId := int(callbackQuery.From.ID)
-
-			// send the Nth example
-			err = storage.UpdateUserSpeechSpeed(db, userId, speechSpeed)
-			if err != nil {
-				log.Printf("Error updating user speech speed: %v\n", err)
-				return
-			}
-		}
+		sendKb(bot, chatID, "Выбери скорость озвучки:", speechSpeedInlineKeyboard())
+	case "healthz":
+		send(bot, chatID, "OK")
 	}
 }
 
-func sendLastRequestAudio(db *sql.DB, userId int, exampleNumber int, message string, openaiClient *openai.Client, bot *tgbotapi.BotAPI) bool {
-	lastQuery, err := storage.GetLastUserQuery(db, userId)
-	if err != nil {
-		log.Printf("Error getting last query: %v\n", err)
-		return true
+// vocabPageSize keeps /vocab pages far under Telegram's 4096-char message cap.
+const vocabPageSize = 10
+
+// vocabPageKeyboard — 🔊 to pick a word to hear, plus paging while more remain.
+func vocabPageKeyboard(offset int, more bool) tgbotapi.InlineKeyboardMarkup {
+	kb := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("🔊 Озвучить слово", fmt.Sprintf("vocab_audio#%d", offset)),
+		),
+	)
+	if more {
+		kb.InlineKeyboard = append(kb.InlineKeyboard, tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("Показать ещё 10", fmt.Sprintf("vocab_more#%d", offset+vocabPageSize)),
+		))
 	}
-	log.Println(lastQuery)
-	lastResponse, err := storage.GetCachedResponseByWordLangAndType(db, lastQuery.Language, lastQuery.Type, lastQuery.Word)
+	return kb
+}
 
-	if err != nil {
-		log.Printf("Error getting cached response: %v\n", err)
-		return true
+// vocabAudioKeyboard — one numbered 🔊 per word on the page, keyed by vocab id
+// so the buttons stay valid even if the list shifts underneath.
+func vocabAudioKeyboard(entries []storage.VocabEntry, offset int) tgbotapi.InlineKeyboardMarkup {
+	return numberedAudioKeyboard(len(entries),
+		func(i int) string { return fmt.Sprintf("vocab_play#%d", entries[i-1].ID) },
+		fmt.Sprintf("vocab_back#%d", offset))
+}
+
+// backfillTranslations fills missing Japanese for the rows about to be shown —
+// bounded by the page size, so at most a page worth of API calls.
+func backfillTranslations(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, chatID int64, userID int, entries []storage.VocabEntry) {
+	missing := false
+	for _, e := range entries {
+		if e.Translation == "" {
+			missing = true
+			break
+		}
 	}
-
-	if lastQuery.Type == "examples" {
-		examples := parseExamplesByNumber(lastResponse)
-		log.Printf("Examples: %d\n", len(examples))
-
-		if exampleNumber == 0 && len(examples) > 0 {
-			// draw the inline keyboard with the examples
-			err := sendExamplesSelection(bot, int64(userId), len(examples))
-			if err != nil {
-				log.Printf("Error sending examples selection: %v\n", err)
-				return true
-			}
-		} else if len(examples) >= exampleNumber || len(examples) == 0 {
-			pronunciationString := ""
-			if len(examples) == 0 {
-				pronunciationString = lastResponse
-			} else {
-				pronunciationString = examples[exampleNumber-1]
-			}
-			err := sendAudioMessage(openaiClient, db, pronunciationString, userId, bot)
-			if err != nil {
-				log.Printf("Error sending audio message: %v\n", err)
-				return true
-			}
+	if !missing {
+		return
+	}
+	think := sendThinking(bot, chatID)
+	for i := range entries {
+		if entries[i].Translation != "" {
+			continue
 		}
-	} else if lastQuery.Type == "translation" {
-		lastResponseLines := strings.Split(lastResponse, "\n")
-		if len(lastResponseLines) > 0 {
-			firstLine := lastResponseLines[0]
-			log.Printf("First line: %s\n", firstLine)
-
-			err := sendAudioMessage(openaiClient, db, firstLine, userId, bot)
-			if err != nil {
-				log.Printf("Error sending audio message: %v\n", err)
-				return true
-			}
+		if tr, alts, _ := translateWord(clients, db, entries[i].Word); tr != "" {
+			storage.SetVocabSenses(db, userID, entries[i].Word, tr, alts)
+			entries[i].Translation, entries[i].Alternatives = tr, alts
 		}
+	}
+	deleteMsg(bot, chatID, think)
+}
+
+func vocabLine(sb *strings.Builder, n int, e storage.VocabEntry) {
+	if e.Translation != "" {
+		fmt.Fprintf(sb, "%d. %s — %s\n", n, e.Word, e.Translation)
 	} else {
-		// examples count is 0?
+		fmt.Fprintf(sb, "%d. %s\n", n, e.Word)
+	}
+	// other senses of the same Russian word, indented under it
+	for _, alt := range strings.Split(e.Alternatives, "\n") {
+		if alt = strings.TrimSpace(alt); alt != "" {
+			fmt.Fprintf(sb, "    ещё: %s\n", alt)
+		}
+	}
+}
+
+// sendVocab shows one page of the vocabulary (newest first) with a
+// «Показать ещё 10» button while more pages remain.
+func sendVocab(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, chatID int64, userID, offset int) {
+	total, entries, err := storage.GetVocabPage(db, userID, offset, vocabPageSize)
+	if err != nil || total == 0 {
+		send(bot, chatID, "Словарь пуст. Напиши слово и нажми «Запомнить».")
+		return
+	}
+	if len(entries) == 0 { // stale «ещё» button pointing past the end
+		send(bot, chatID, "Это уже всё — слов больше нет.")
+		return
+	}
+
+	backfillTranslations(bot, clients, db, chatID, userID, entries)
+
+	var sb strings.Builder
+	switch {
+	case offset == 0 && total <= vocabPageSize:
+		fmt.Fprintf(&sb, "Твой словарь (%d):\n\n", total)
+	case offset == 0:
+		fmt.Fprintf(&sb, "Твой словарь (%d), последние %d:\n\n", total, len(entries))
+	default:
+		fmt.Fprintf(&sb, "Твой словарь (%d), слова %d–%d:\n\n", total, offset+1, offset+len(entries))
+	}
+	for i, e := range entries {
+		vocabLine(&sb, offset+i+1, e)
+	}
+
+	sendKb(bot, chatID, sb.String(), vocabPageKeyboard(offset, offset+len(entries) < total))
+}
+
+// playVocabWord voices the Japanese headword of one saved entry.
+func playVocabWord(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, chatID int64, userID, id int) {
+	e, err := storage.GetVocabEntry(db, userID, id)
+	if err != nil {
+		send(bot, chatID, "Не нашёл это слово в словаре.")
+		return
+	}
+	jp := japaneseHeadword(e.Translation)
+	if jp == "" {
+		send(bot, chatID, "У этого слова ещё нет японского перевода — открой /vocab, он подтянется.")
+		return
+	}
+	sendAudioMessage(clients, db, jp, userID, bot)
+}
+
+// sendStats renders /stats from the outcome journal. Weak spots appear only
+// once a bucket has weakTagMin mistakes — before that the honest answer is
+// "not enough data", not a pattern invented from one slip.
+func sendStats(bot *tgbotapi.BotAPI, db *sql.DB, chatID int64, userID int) {
+	s, err := storage.GetStats(db, userID)
+	if err != nil {
+		log.Printf("stats error: %v", err)
+		send(bot, chatID, "Не смог собрать статистику, попробуй позже.")
+		return
+	}
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "Словарь: %d %s, на длинных интервалах (от 30 дней): %d.\n",
+		s.VocabTotal, pluralRu(s.VocabTotal, "слово", "слова", "слов"), s.Learned)
+	if s.Streak > 0 {
+		fmt.Fprintf(&sb, "Серия: %d %s подряд.\n", s.Streak, pluralRu(s.Streak, "день", "дня", "дней"))
+	} else {
+		sb.WriteString("Серия: пока нет — ответь на повторение или задание, и она начнётся.\n")
+	}
+
+	sb.WriteString("\nЗа 30 дней:\n")
+	if s.RemTotal > 0 {
+		fmt.Fprintf(&sb, "Повторения: %d, верно %d%%.\n", s.RemTotal, 100*s.RemOK/s.RemTotal)
+	} else {
+		sb.WriteString("Повторения: ещё не было.\n")
+	}
+	if s.PracTasks > 0 {
+		fmt.Fprintf(&sb, "Практика: %d %s, с первой попытки %d%%.\n",
+			s.PracTasks, pluralRu(s.PracTasks, "задание", "задания", "заданий"), 100*s.PracFirstTry/s.PracTasks)
+	} else {
+		sb.WriteString("Практика: ещё не было.\n")
+	}
+	if level, ok, total := practiceLevel(db, userID); total >= 4 {
+		fmt.Fprintf(&sb, "Уровень заданий: %d из 3 (с первой попытки %d из последних %d).\n", level, ok, total)
+	} else {
+		sb.WriteString("Уровень заданий: 1 из 3 — вырастет, когда наберётся хотя бы 4 задания.\n")
+	}
+
+	var weak []string
+	for _, t := range s.WeakTags {
+		if t.Count >= weakTagMin {
+			weak = append(weak, fmt.Sprintf("%s (%d)", errorTags[t.Tag], t.Count))
+		}
+	}
+	if len(weak) > 0 {
+		sb.WriteString("\nСлабые места: " + strings.Join(weak, ", ") + ".\n")
+	} else {
+		sb.WriteString("\nСлабые места: пока мало данных — нужно больше практики.\n")
+	}
+	if target, _ := weakTarget(db, userID); target != "" {
+		sb.WriteString("Сейчас практика прицельно тренирует: " + errorTags[target] + ".\n")
+	}
+	var missed []string
+	for _, w := range s.MissedWords {
+		if w.Count >= 2 {
+			missed = append(missed, fmt.Sprintf("%s (%d)", w.Word, w.Count))
+		}
+	}
+	if len(missed) > 0 {
+		sb.WriteString("Чаще всего ошибаешься в: " + strings.Join(missed, ", ") + ".\n")
+	}
+	send(bot, chatID, sb.String())
+}
+
+// sendVocabSearch handles «/vocab <часть слова>» — a plain local substring
+// search over saved words, no API calls involved.
+func sendVocabSearch(bot *tgbotapi.BotAPI, db *sql.DB, chatID int64, userID int, q string) {
+	entries, err := storage.SearchVocab(db, userID, strings.ToLower(q), 20)
+	if err != nil || len(entries) == 0 {
+		send(bot, chatID, fmt.Sprintf("По «%s» ничего не нашёл. /vocab — весь список.", q))
+		return
+	}
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "Нашёл (%d):\n\n", len(entries))
+	for i, e := range entries {
+		vocabLine(&sb, i+1, e)
+	}
+	send(bot, chatID, sb.String())
+}
+
+func handleAsk(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, message *tgbotapi.Message) {
+	chatID := message.Chat.ID
+	userID := int(message.From.ID)
+	q := strings.TrimSpace(message.CommandArguments())
+	if q == "" {
+		send(bot, chatID, "Спроси что-нибудь про грамматику, например:\n/ask как работает частица は")
+		return
+	}
+	think := sendThinking(bot, chatID)
+	resp, err := claudeOne(clients, grammarSystem, q)
+	deleteMsg(bot, chatID, think)
+	if err != nil {
+		send(bot, chatID, "Ошибка, попробуй ещё раз.")
+		return
+	}
+	// Enter ask mode: the topic (question) and answer are kept so follow-up
+	// messages and «Потренироваться» build on them. The user stays in this
+	// mode — typing more questions, no buttons — until «Закончить».
+	storage.SetState(db, userID, "ask", q, resp, 0)
+	sendKb(bot, chatID, resp, askKeyboard())
+}
+
+// ---------- message entry (state router) ----------
+
+func HandleMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, clients *Clients, db *sql.DB) {
+	userID := int(message.From.ID)
+	chatID := message.Chat.ID
+	storage.EnsureUser(db, userID)
+
+	st := storage.GetState(db, userID)
+	switch st.Mode {
+	case "paused_compose", "paused_translate", "reminder", modeSrsOffer:
+		// paused/offer: just a re-prompt, no API; reminder: SRS answers are never capped
+	default:
+		if !capOK(bot, clients, db, chatID, userID) {
+			return
+		}
+	}
+
+	switch st.Mode {
+	case "practice_compose":
+		if !looksLikePracticeAnswer(st.Mode, message.Text) {
+			offerPracticeExit(bot, db, chatID, userID, "paused_compose", st)
+			return
+		}
+		checkPracticeCompose(bot, clients, db, message, st)
+	case "practice_translate":
+		if !looksLikePracticeAnswer(st.Mode, message.Text) {
+			offerPracticeExit(bot, db, chatID, userID, "paused_translate", st)
+			return
+		}
+		checkPracticeTranslate(bot, clients, db, message, st)
+	case "paused_compose", "paused_translate":
+		// user typed instead of choosing a button — re-ask the exit question
+		// rather than leaving them stuck.
+		offerPracticeExit(bot, db, chatID, userID, st.Mode, st)
+	case "clarify_compose", "clarify_translate":
+		handleClarify(bot, clients, db, message, st)
+	case "ask", "clarify_ask": // clarify_ask: legacy state left by the old «Уточнить» button
+		handleAskFollowup(bot, clients, db, message, st)
+	case "reminder":
+		checkReminder(bot, clients, db, message, st)
+	case modeAwaitWord:
+		handleAwaitWord(bot, clients, db, message)
+	default:
+		// modeConfirmSave and modeSrsOffer land here on purpose: if the user
+		// ignores the buttons and types something, treat it as a fresh lookup
+		// rather than trapping them. flow1Lookup resets the mode itself, so an
+		// ignored announcement is simply re-offered after the usual throttle.
+		if !capOK(bot, clients, db, chatID, userID) {
+			return
+		}
+		flow1Lookup(bot, clients, db, message)
+	}
+}
+
+// handleAwaitWord takes the word typed after the user rejected the bot's guess
+// and re-asks for confirmation instead of saving it blindly.
+func handleAwaitWord(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, message *tgbotapi.Message) {
+	chatID := message.Chat.ID
+	userID := int(message.From.ID)
+
+	think := sendThinking(bot, chatID)
+	word := resolveHeadword(clients, message.Text)
+	if word == "" {
+		deleteMsg(bot, chatID, think)
+		send(bot, chatID, "Нужно одно слово, без лишнего. Попробуй ещё раз.")
+		return
+	}
+	translation, alternatives, verified := translateWord(clients, db, word)
+	deleteMsg(bot, chatID, think)
+	askSaveConfirmation(bot, db, chatID, userID, word, translation, alternatives, verified)
+}
+
+// handleAskFollowup answers the next question typed in /ask mode and keeps the
+// user in the mode: every message is a follow-up until «Закончить».
+func handleAskFollowup(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, message *tgbotapi.Message, st storage.State) {
+	chatID := message.Chat.ID
+	userID := int(message.From.ID)
+
+	think := sendThinking(bot, chatID)
+	sys := styleRules + " You are a friendly Japanese tutor. Reply in Russian. " +
+		"Earlier you explained this:\n" + st.TaskText + "\n" +
+		"Answer the user's follow-up question about it in 2-4 short lines." + uncertaintyRule
+	resp, err := claudeOne(clients, sys, message.Text)
+	deleteMsg(bot, chatID, think)
+	if err != nil {
+		resp = "Не смог объяснить, попробуй переформулировать."
+	}
+	// keep the topic, remember the latest answer as context for the next question
+	storage.SetState(db, userID, "ask", st.Word, resp, 0)
+	sendKb(bot, chatID, resp, askKeyboard())
+}
+
+// handleClarify answers the user's question about the current practice sentence,
+// then puts them back into the practice stage they came from.
+func handleClarify(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, message *tgbotapi.Message, st storage.State) {
+	chatID := message.Chat.ID
+	userID := int(message.From.ID)
+
+	think := sendThinking(bot, chatID)
+	sys := styleRules + " You are a friendly Japanese tutor. Reply in Russian. " +
+		"The user is practicing with this task/sentence:\n" + st.TaskText + "\n" +
+		"Answer their question about it (grammar, particles, word meaning) in 2-4 short lines." + uncertaintyRule
+	resp, err := claudeOne(clients, sys, message.Text)
+	deleteMsg(bot, chatID, think)
+	if err != nil {
+		resp = "Не смог объяснить, попробуй переформулировать."
+	}
+	send(bot, chatID, resp)
+
+	if st.Mode == "clarify_translate" {
+		storage.SetState(db, userID, "practice_translate", st.Word, st.TaskText, 0)
+		sendTranslateTask(bot, chatID, st.TaskText)
+	} else {
+		storage.SetState(db, userID, "practice_compose", st.Word, st.TaskText, 0)
+		sendComposeTask(bot, chatID, st.TaskText)
+	}
+}
+
+// Flow 1 — learn a word
+func flow1Lookup(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, message *tgbotapi.Message) {
+	chatID := message.Chat.ID
+	userID := int(message.From.ID)
+
+	think := sendThinking(bot, chatID)
+
+	word := normalizeWord(message.Text)
+	if word == "" {
+		word = strings.TrimSpace(message.Text)
+	}
+
+	cfg := config.Load()
+	var msgs []claude_api.ChatMessage
+	for _, m := range cfg.FewShot {
+		msgs = append(msgs, claude_api.ChatMessage{Role: m.Role, Content: m.Content})
+	}
+	msgs = append(msgs, buildHistory(db, userID)...)
+
+	resp, err := claude_api.GetClaudeResponse(context.Background(), &clients.Claude, claude_api.ClaudeRequest{
+		SystemPrompt: cfg.WordSystemPrompt,
+		Messages:     msgs,
+		UserMessage:  message.Text,
+	})
+	deleteMsg(bot, chatID, think)
+	if err != nil {
+		log.Printf("flow1 claude error: %v", err)
+		send(bot, chatID, "Ошибка, попробуй ещё раз.")
+		return
+	}
+
+	storage.SetCurrentWord(db, userID, word)
+	storage.SaveConversationTurn(db, userID, message.Text, resp)
+	sendKb(bot, chatID, resp, wordKeyboard())
+}
+
+func buildHistory(db *sql.DB, userID int) []claude_api.ChatMessage {
+	turns, _ := storage.GetConversationHistory(db, userID, historyTurns)
+	var msgs []claude_api.ChatMessage
+	for _, t := range turns {
+		msgs = append(msgs,
+			claude_api.ChatMessage{Role: "user", Content: t.UserMessage},
+			claude_api.ChatMessage{Role: "assistant", Content: t.BotResponse},
+		)
+	}
+	return msgs
+}
+
+// normalizeWord strips lookup phrases so that "что значит окно" → "окно".
+var lookupPhrases = []string{"что значит", "как переводится", "как будет", "как сказать", "перевод "}
+
+func normalizeWord(message string) string {
+	m := strings.TrimSpace(message)
+	for _, p := range lookupPhrases {
+		if idx := strings.Index(strings.ToLower(m), p); idx >= 0 {
+			m = strings.TrimSpace(m[:idx] + m[idx+len(p):])
+		}
+	}
+	// drop trailing/leading punctuation and collapse inner whitespace
+	m = strings.Trim(m, " \t?!.,;:")
+	return strings.Join(strings.Fields(m), " ")
+}
+
+// ---------- vocabulary word sanitation ----------
+
+// fillerPrefixes are conversational lead-ins typed before the actual word,
+// e.g. "А крыша ?" — without stripping these they end up saved verbatim.
+var fillerPrefixes = []string{"а ", "и ", "ну ", "вот ", "это ", "слово ", "ещё ", "еще "}
+
+// sanitizeWord reduces raw text to one clean lowercase word, or "" if it cannot
+// be reduced to a single word. "" is the signal that the caller must resolve it
+// (via Claude or by asking the user) rather than saving junk.
+func sanitizeWord(raw string) string {
+	w := strings.ToLower(normalizeWord(raw))
+	// peel repeated fillers: "а вот крыша" → "крыша"
+	for {
+		stripped := w
+		for _, p := range fillerPrefixes {
+			stripped = strings.TrimPrefix(stripped, p)
+		}
+		stripped = strings.TrimSpace(stripped)
+		if stripped == w {
+			break
+		}
+		w = stripped
+	}
+	w = strings.Trim(w, " \t?!.,;:«»\"'()")
+	if w == "" || strings.ContainsAny(w, " \t") {
+		return "" // still a phrase, not a single word
+	}
+	if utf8.RuneCountInString(w) > 32 {
+		return ""
+	}
+	return w
+}
+
+// resolveHeadword picks the single dictionary word to store in the vocabulary.
+// Clean single-word input is handled locally; only genuinely messy input costs
+// a Claude call.
+func resolveHeadword(clients *Clients, raw string) string {
+	if w := sanitizeWord(raw); w != "" {
+		return w
+	}
+	sys := "Extract the single Russian word the user asked about. " +
+		"Reply with exactly ONE word in dictionary form (nominative singular; infinitive for verbs), " +
+		"lowercase, no punctuation, no quotes, no explanation. " +
+		"If several words are present, pick the main noun or verb."
+	resp, err := claudeOne(clients, sys, raw)
+	if err != nil {
+		log.Printf("headword extraction error: %v", err)
+		return ""
+	}
+	return sanitizeWord(resp)
+}
+
+// translateWord returns the Japanese for a single Russian word as one compact
+// line "kanji(чтение) (romaji)", or "" on failure, plus whether Jisho confirmed
+// the reading. Results are cached globally (a word's translation doesn't depend
+// on the user); an unverified cached line is re-checked against Jisho on the
+// next hit, so a temporary Jisho outage never sticks.
+func translateWord(clients *Clients, db *sql.DB, word string) (translation, alternatives string, verified bool) {
+	if tr, alts, v, ok := storage.GetCachedTranslation(db, word); ok {
+		if !v {
+			if fixed, okJisho := verifyWithJisho(clients, tr); okJisho {
+				storage.SetCachedTranslation(db, word, fixed, alts, true)
+				return fixed, alts, true
+			}
+		}
+		return tr, alts, v
+	}
+	sys := "Translate the single Russian word «" + word + "» into Japanese.\n" +
+		"Line 1: the main Japanese word — every kanji immediately followed by its hiragana reading in round " +
+		"brackets, then one space, then the full romaji in round brackets. " +
+		"Example for «растение»: 植物(しょくぶつ) (shokubutsu)\n" +
+		"Then, ONLY IF the Russian word really maps to different Japanese words depending on context, add up to 2 " +
+		"more lines in that same format.\n" +
+		"If you add such lines, append ' — ' and a SHORT Russian note to EVERY line INCLUDING line 1, saying when " +
+		"that variant is used, so the variants can be told apart. Example for «холодно»:\n" +
+		"寒(さむ)い (samui) — о погоде, об ощущении холода\n" +
+		"冷(つめ)たい (tsumetai) — о предмете на ощупь\n" +
+		"If one Japanese word covers the ordinary meaning, output line 1 alone with no note. Never invent variants, " +
+		"never repeat the same word twice, no other text."
+	resp, err := claudeOne(clients, sys, word)
+	if err != nil {
+		log.Printf("translateWord error: %v", err)
+		return "", "", false
+	}
+	translation, alternatives = splitSenses(resp)
+	if translation == "" {
+		return "", "", false
+	}
+	translation, verified = verifyWithJisho(clients, translation)
+	storage.SetCachedTranslation(db, word, translation, alternatives, verified)
+	return translation, alternatives, verified
+}
+
+// splitSenses takes the model's reply apart: the first line is the main sense,
+// the rest are the other senses, at most two. When there are several senses the
+// main one keeps its usage note — that note is what makes the reminder question
+// unambiguous («Как будет «холодно» (о погоде)?»). A lone sense needs no note,
+// so one is stripped if the model added it anyway.
+func splitSenses(resp string) (translation, alternatives string) {
+	var lines []string
+	for _, l := range strings.Split(resp, "\n") {
+		if l = strings.TrimSpace(l); l != "" {
+			lines = append(lines, l)
+		}
+	}
+	if len(lines) == 0 {
+		return "", ""
+	}
+	translation, rest := lines[0], lines[1:]
+	if len(rest) > 2 {
+		rest = rest[:2]
+	}
+	if len(rest) == 0 {
+		if i := strings.Index(translation, " — "); i >= 0 {
+			translation = strings.TrimSpace(translation[:i])
+		}
+	}
+	return translation, strings.Join(rest, "\n")
+}
+
+// senseNote is the "when is this used" half of a sense line, or "" if it has none.
+func senseNote(sense string) string {
+	if i := strings.Index(sense, " — "); i >= 0 {
+		return strings.TrimSpace(sense[i+len(" — "):])
+	}
+	return ""
+}
+
+// reminderQuestion asks for ONE specific sense. When a word has several Japanese
+// translations the bare question «как будет холодно?» has more than one right
+// answer, so the saved sense's usage note goes into the question itself — the
+// user learns the distinction instead of guessing which word is wanted.
+func reminderQuestion(db *sql.DB, userID int, word string) string {
+	q := "Как будет «" + word + "»"
+	if e, err := storage.FindVocab(db, userID, word); err == nil {
+		if note := senseNote(e.Translation); note != "" {
+			q += " (" + note + ")"
+		}
+	}
+	return q + " по-японски?"
+}
+
+// kanjiReadingRe matches one kanji run with its bracketed reading: 遊(あそ).
+var kanjiReadingRe = regexp.MustCompile(`[\p{Han}々〆ヶ]+[(（]([^)）]*)[)）]`)
+
+// splitHeadword takes a translation line like "遊(あそ)び (asobi)" and returns
+// the written form "遊び" and its full kana reading "あそび". A kana-only line
+// ("ありがとう (arigatou)") yields the same string for both. Returns "", "" when
+// there is no Japanese to work with.
+func splitHeadword(tr string) (written, reading string) {
+	jp := strings.TrimSpace(tr)
+	if i := strings.LastIndex(jp, " ("); i >= 0 { // drop the trailing romaji group
+		jp = strings.TrimSpace(jp[:i])
+	}
+	written = strings.TrimSpace(parenGroupRe.ReplaceAllString(jp, ""))
+	reading = strings.TrimSpace(kanjiReadingRe.ReplaceAllString(jp, "$1"))
+	if !containsJapanese(written) {
+		return "", ""
+	}
+	return written, reading
+}
+
+// japaneseHeadword is the bare Japanese word from a translation line — what TTS
+// should read aloud ("屋根(やね) (yane)" → "屋根").
+func japaneseHeadword(tr string) string {
+	written, _ := splitHeadword(tr)
+	return written
+}
+
+// verifyWithJisho checks the model's translation against the Jisho dictionary:
+// the written form must exist and its reading must match. On a mismatch the
+// dictionary wins and the line is re-rendered with the correct reading. If
+// Jisho is unreachable or doesn't know the word, the model's line is kept
+// (graceful degradation). Returns the possibly-corrected line and whether the
+// reading was confirmed.
+func verifyWithJisho(clients *Clients, tr string) (string, bool) {
+	written, reading := splitHeadword(tr)
+	if written == "" {
+		return tr, false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	entries, err := jisho.Lookup(ctx, written)
+	if err != nil {
+		log.Printf("jisho lookup %q failed, keeping model reading: %v", written, err)
+		return tr, false
+	}
+	dict := jisho.VerifyReading(entries, written)
+	if dict == "" {
+		log.Printf("jisho: %q not in dictionary, keeping model reading", written)
+		return tr, false
+	}
+	if dict == reading {
+		return tr, true
+	}
+	log.Printf("jisho: reading mismatch for %q — model %q, dictionary %q; using dictionary", written, reading, dict)
+	sys := styleRules + " The dictionary reading of «" + written + "» is «" + dict + "». " +
+		"Output exactly one line and nothing else: «" + written + "» with every kanji immediately followed by its " +
+		"reading in round brackets (the readings together must spell exactly «" + dict + "»), then a space, " +
+		"then the romaji of that reading in round brackets."
+	fixed, err := claudeOne(clients, sys, written)
+	if err != nil || firstLine(fixed) == "" {
+		return written + "(" + dict + ")", true // right reading even without romaji beats a wrong one
+	}
+	return firstLine(fixed), true
+}
+
+func firstLine(s string) string {
+	for _, line := range strings.Split(s, "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			return line
+		}
+	}
+	return ""
+}
+
+// askSaveConfirmation puts the user in the confirm step (with the senses already
+// shown) instead of saving blindly. The senses are stashed in task_text — main
+// sense on the first line — so "Да" can persist them without a second API call.
+func askSaveConfirmation(bot *tgbotapi.BotAPI, db *sql.DB, chatID int64, userID int, word, translation, alternatives string, verified bool) {
+	storage.SetState(db, userID, modeConfirmSave, word, strings.TrimRight(translation+"\n"+alternatives, "\n"), 0)
+	msg := fmt.Sprintf("Запомнить слово «%s»?", word)
+	if translation != "" {
+		msg = fmt.Sprintf("Запомнить слово «%s» — %s?", word, translation)
+		for _, alt := range strings.Split(alternatives, "\n") {
+			if alt = strings.TrimSpace(alt); alt != "" {
+				msg += "\nещё: " + alt
+			}
+		}
+		if verified {
+			msg += "\n(чтение сверено с Jisho)"
+		}
+	}
+	sendKb(bot, chatID, msg, confirmSaveKeyboard())
+}
+
+// capOK counts one user-initiated API interaction against the daily budget and
+// tells the user when it is exhausted. A DB hiccup never locks anyone out.
+func capOK(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, chatID int64, userID int) bool {
+	if clients.DailyCap <= 0 {
+		return true
+	}
+	n, err := storage.BumpDailyUsage(db, userID, time.Now().Format("2006-01-02"))
+	if err != nil {
+		log.Printf("usage counter error: %v", err)
+		return true
+	}
+	if n > clients.DailyCap {
+		send(bot, chatID, fmt.Sprintf("На сегодня лимит запросов исчерпан (%d в день). "+
+			"Напоминания продолжат приходить, а новые слова и практика — завтра.", clients.DailyCap))
+		return false
+	}
+	return true
+}
+
+// ---------- Flow 2 — practice ----------
+
+// startPracticeWeakest drills the word the user knows least well (lowest SRS
+// step; never-practiced words first) instead of a random one, so practice time
+// goes where it helps most.
+func startPracticeWeakest(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, chatID int64, userID int, exclude string) {
+	word, err := storage.GetWeakVocabWord(db, userID, exclude)
+	if err != nil || word == "" {
+		send(bot, chatID, "Сначала выучи пару слов — напиши слово и нажми «Запомнить».")
+		return
+	}
+	startPractice(bot, clients, db, chatID, userID, word)
+}
+
+// startPracticeFromTopic builds a practice task around a grammar topic/question
+// (used by the /ask "Потренироваться" button) instead of a random vocab word.
+func startPracticeFromTopic(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, chatID int64, userID int, topic string) {
+	if strings.TrimSpace(topic) == "" {
+		startPracticeWeakest(bot, clients, db, chatID, userID, "")
+		return
+	}
+	think := sendThinking(bot, chatID)
+	sys := styleRules + " You are a Japanese tutor. The user wants to practice this topic/question: «" + topic + "». " +
+		"Make a SHORT practice task in Russian: line 1 — one simple natural Russian sentence (5-8 words) that requires this grammar point or word. " +
+		"Then 2-3 helper words 'русское — японский(чтение, romaji)'. Do NOT translate the whole sentence into Japanese."
+	task, err := claudeOne(clients, sys, topic)
+	deleteMsg(bot, chatID, think)
+	if err != nil {
+		send(bot, chatID, "Ошибка, попробуй ещё раз.")
+		return
+	}
+	storage.SetState(db, userID, "practice_compose", topic, task, 0)
+	sendComposeTask(bot, chatID, task)
+}
+
+func startPractice(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, chatID int64, userID int, word string) {
+	if word == "" {
+		send(bot, chatID, "Сначала найди слово — просто напиши его.")
+		return
+	}
+	level, _, _ := practiceLevel(db, userID)
+	target, details := weakTarget(db, userID)
+
+	think := sendThinking(bot, chatID)
+	task, err := claudeOne(clients, composeTaskPrompt(word, level, target, details), word)
+	deleteMsg(bot, chatID, think)
+	if err != nil {
+		send(bot, chatID, "Ошибка, попробуй /practice ещё раз.")
+		return
+	}
+	storage.SetState(db, userID, "practice_compose", word, task, 0)
+	if target != "" {
+		storage.SetTaskTarget(db, userID, target)
+		send(bot, chatID, fmt.Sprintf("Потренируем %s — тут у тебя больше всего ошибок.", errorTags[target]))
+	}
+	sendComposeTask(bot, chatID, task)
+}
+
+// looksLikePracticeAnswer is the free, zero-false-positive pre-filter for "this
+// cannot be an answer": pure Russian where Japanese/romaji is expected, or
+// Japanese where a Russian translation is expected. False → offer to exit
+// without spending an API call. Everything that passes is still classified by
+// the judge, whose 'offtrack' verdict catches the ambiguous cases — e.g. a
+// stray Russian word typed during the translate stage.
+func looksLikePracticeAnswer(mode, text string) bool {
+	t := strings.TrimSpace(text)
+	if t == "" {
+		return false
+	}
+	switch mode {
+	case "practice_compose":
+		// a compose answer is Japanese (kana/kanji) or romaji (Latin letters);
+		// pure Russian is never a valid answer to "compose this in Japanese".
+		return containsJapanese(t) || containsLatin(t)
+	case "practice_translate":
+		// a translate answer is a Russian phrase, so Cyrillic is expected here —
+		// only flag Japanese input, which clearly isn't a Russian translation.
+		return !containsJapanese(t)
+	}
+	return true
+}
+
+func containsLatin(s string) bool {
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') {
+			return true
+		}
 	}
 	return false
 }
 
-func sendLanguageSelection(bot *tgbotapi.BotAPI, chatID int64) error {
-	msg := tgbotapi.NewMessage(chatID, "Please choose a language you want help learning:")
-	msg.ReplyMarkup = languageInlineKeyboard()
-	_, err := bot.Send(msg)
-	if err != nil {
-		log.Printf("Error sending language selection: %v\n", err)
-		return err
-	}
-	return nil
+// offerPracticeExit pauses practice and asks whether to finish it. The task is
+// preserved so "Нет, продолжить" can resume exactly where the user was.
+func offerPracticeExit(bot *tgbotapi.BotAPI, db *sql.DB, chatID int64, userID int, pausedMode string, st storage.State) {
+	storage.SetState(db, userID, pausedMode, st.Word, st.TaskText, 0)
+	sendKb(bot, chatID, "Ты сейчас на практике. Закончить её?", practiceExitKeyboard())
 }
 
-func sendSpeechSpeedSelection(bot *tgbotapi.BotAPI, chatID int64) error {
-	msg := tgbotapi.NewMessage(chatID, "Please choose a speech speed:")
-	msg.ReplyMarkup = speechSpeedInlineKeyboard()
-	_, err := bot.Send(msg)
-	if err != nil {
-		log.Printf("Error sending speech speed selection: %v\n", err)
-		return err
+func checkPracticeCompose(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, message *tgbotapi.Message, st storage.State) {
+	chatID := message.Chat.ID
+	userID := int(message.From.ID)
+	think := sendThinking(bot, chatID)
+	v, tag, fb := judgeAnswer(clients, composeTask(st.TaskText, message.Text), message.Text, true)
+	deleteMsg(bot, chatID, think)
+	switch v {
+	case verdictError:
+		sendKb(bot, chatID, fb, practiceKeyboard())
+	case verdictOffTrack:
+		offerPracticeExit(bot, db, chatID, userID, "paused_compose", st)
+	case verdictRetry:
+		before, _, _ := practiceLevel(db, userID)
+		recordOutcome(db, userID, "compose", st.Word, st.Target, v, tag, fb)
+		storage.SetLastAnswer(db, userID, message.Text)
+		msg := fb + "\n\nПопробуй ещё раз."
+		if after, _, _ := practiceLevel(db, userID); after < before {
+			msg += "\n\nСледующие задания сделаю попроще."
+		}
+		sendKb(bot, chatID, msg, practiceRetryKeyboard())
+	default:
+		before, _, _ := practiceLevel(db, userID)
+		recordOutcome(db, userID, "compose", st.Word, st.Target, v, tag, fb)
+		praise := "Правильно!\n" + fb
+		if after, _, _ := practiceLevel(db, userID); after > before {
+			praise += "\n\nТы решаешь почти всё с первой попытки — усложняю задания."
+		}
+		advanceToTranslateStage(bot, clients, db, chatID, userID, st, praise)
 	}
-	return nil
 }
 
-func sendExamplesSelection(bot *tgbotapi.BotAPI, chatID int64, total int) error {
-	msg := tgbotapi.NewMessage(chatID, "Please choose an example:")
-	msg.ReplyMarkup = examplesInlineKeyboard(total)
-	_, err := bot.Send(msg)
-	if err != nil {
-		log.Printf("Error sending examples selection: %v\n", err)
-		return err
-	}
-	return nil
+func composeTask(task, answer string) string {
+	return "Translate the Russian sentence into Japanese.\nRussian task:\n" + task + "\n\nUser's Japanese attempt: " + answer
 }
+
+func translateTask(task, answer string) string {
+	return "Translate the Japanese sentence into Russian.\nJapanese:\n" + task + "\n\nUser's Russian attempt: " + answer
+}
+
+// advanceToTranslateStage is the shared "compose answer accepted" path: show the
+// praise, then generate the stage-2 Japanese sentence to translate into Russian.
+func advanceToTranslateStage(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, chatID int64, userID int, st storage.State, praise string) {
+	level, _, _ := practiceLevel(db, userID)
+	think := sendThinking(bot, chatID)
+	sys := styleRules + " Generate ONE natural Japanese sentence that uses «" + st.Word + "» for the user to translate into Russian. " +
+		levelSpecJP(level) + " " +
+		"Output ONLY the Japanese sentence (every kanji with its reading in brackets) followed by ' (' + full romaji + ')'. " +
+		"Then optional helper lines 'японский(чтение, romaji) — русский'. Do NOT give the Russian translation of the sentence."
+	jp, err := claudeOne(clients, sys, st.Word)
+	deleteMsg(bot, chatID, think)
+	if err != nil {
+		storage.ClearMode(db, userID)
+		send(bot, chatID, "Ошибка. Напиши /practice.")
+		return
+	}
+	storage.SetState(db, userID, "practice_translate", st.Word, jp, 0)
+	send(bot, chatID, praise)
+	sendTranslateTask(bot, chatID, jp)
+}
+
+func checkPracticeTranslate(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, message *tgbotapi.Message, st storage.State) {
+	chatID := message.Chat.ID
+	userID := int(message.From.ID)
+	think := sendThinking(bot, chatID)
+
+	v, tag, fb := judgeAnswer(clients, translateTask(st.TaskText, message.Text), message.Text, false)
+	deleteMsg(bot, chatID, think)
+	switch v {
+	case verdictError:
+		sendKb(bot, chatID, fb, practiceKeyboard())
+	case verdictOffTrack:
+		offerPracticeExit(bot, db, chatID, userID, "paused_translate", st)
+	case verdictRetry:
+		recordOutcome(db, userID, "translate", st.Word, st.Target, v, tag, fb)
+		storage.SetLastAnswer(db, userID, message.Text)
+		sendKb(bot, chatID, fb+"\n\nПопробуй ещё раз.", practiceRetryKeyboard())
+	default:
+		recordOutcome(db, userID, "translate", st.Word, st.Target, v, tag, fb)
+		storage.ClearMode(db, userID)
+		sendKb(bot, chatID, "Правильно!\n"+fb+"\n\nЕщё раунд?", roundKeyboard())
+	}
+}
+
+// handleContestPractice is «Оспорить» on a practice verdict: a second,
+// independent and deliberately more permissive review of the same answer.
+func handleContestPractice(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, chatID int64, userID int) {
+	st := storage.GetState(db, userID)
+	if st.LastAnswer == "" || (st.Mode != "practice_compose" && st.Mode != "practice_translate") {
+		send(bot, chatID, "Оспаривать уже нечего — это задание закрыто.")
+		return
+	}
+	task := composeTask(st.TaskText, st.LastAnswer)
+	if st.Mode == "practice_translate" {
+		task = translateTask(st.TaskText, st.LastAnswer)
+	}
+	think := sendThinking(bot, chatID)
+	v, _, fb := judgeWith(clients, contestSystem, task)
+	deleteMsg(bot, chatID, think)
+	if v == verdictError {
+		sendKb(bot, chatID, fb, practiceRetryKeyboard()) // appeal still open
+		return
+	}
+	storage.SetLastAnswer(db, userID, "") // one appeal per answer
+	if v != verdictOK {
+		sendKb(bot, chatID, "Перепроверил внимательно — всё же ошибка.\n"+fb+"\n\nПопробуй ещё раз.", practiceKeyboard())
+		return
+	}
+	storage.OverturnLastMistake(db, userID, st.Word)
+	if st.Mode == "practice_translate" {
+		storage.ClearMode(db, userID)
+		sendKb(bot, chatID, "Ты прав, засчитываю!\n"+fb+"\n\nЕщё раунд?", roundKeyboard())
+		return
+	}
+	advanceToTranslateStage(bot, clients, db, chatID, userID, st, "Ты прав, засчитываю!\n"+fb)
+}
+
+// handleContestReminder is «Оспорить» on a reminder verdict. If overturned, the
+// lapse that was scheduled is dropped and the word advances as if correct.
+func handleContestReminder(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, chatID int64, userID, reminderID int) {
+	st := storage.GetState(db, userID)
+	word, step, err := storage.GetReminder(db, reminderID)
+	if err != nil || word == "" || st.LastAnswer == "" {
+		send(bot, chatID, "Оспаривать уже нечего.")
+		return
+	}
+	think := sendThinking(bot, chatID)
+	v, _, fb := judgeWith(clients, contestSystem, "How do you say the word «"+word+"» in Japanese? User's answer: "+st.LastAnswer)
+	deleteMsg(bot, chatID, think)
+	if v == verdictError {
+		send(bot, chatID, fb) // appeal still open
+		return
+	}
+	storage.SetLastAnswer(db, userID, "")
+	if v != verdictOK {
+		send(bot, chatID, "Перепроверил внимательно — всё же не то.\n"+fb)
+		return
+	}
+	storage.OverturnLastMistake(db, userID, word)
+	storage.DeletePendingReminders(db, userID, word)
+	next := step + 1
+	storage.ScheduleReminder(db, userID, word, next, time.Now().Add(intervalFor(next)))
+	storage.ClearMode(db, userID)
+	msg := "Ты прав, засчитываю!\n" + fb + "\n\nНапомню это слово ещё попозже."
+	if srsWordsLeft(db, userID) > 0 {
+		sendKb(bot, chatID, msg, srsNextKeyboard()) // batch can go on if the user wants
+	} else {
+		send(bot, chatID, msg)
+	}
+}
+
+const judgeBase = styleRules + " You are a friendly Japanese tutor. Reply in Russian. Judge the user's answer to the task. "
+
+// judgeGrading is shared by both judge prompts: lean toward accepting valid
+// alternatives, and when rejecting name the exact mistake plus one natural
+// alternative (research 6). Romaji tolerance is spelled out deliberately — a
+// loose romanisation like "buruuberi" for ブルーベリー is a correct answer.
+const judgeGrading = "'VERDICT: ok' — the answer is essentially correct: ignore minor typos, and treat romaji exactly " +
+	"as well as kana or kanji — ANY readable romanisation of the right word counts, including one without macrons, " +
+	"with doubled vowels, or not following Hepburn. Accept any phrasing a native speaker would consider fine — there " +
+	"is usually more than one correct translation. When you are not confident the answer is actually wrong, prefer ok. " +
+	"'VERDICT: retry' — ONLY for a real, identifiable mistake in a genuine attempt. " +
+	"After a retry verdict the SECOND line must be 'TAG: <bucket>' where <bucket> is exactly one of: " + errorTagList +
+	" — the single best bucket for the main mistake. No TAG line after ok. " +
+	"Then a blank line, then short feedback. If ok: confirm and show the natural Japanese with kanji(чтение) and romaji, " +
+	"then, if a common natural alternative exists, ONE more line 'Ещё можно: ...' with kanji(чтение) and romaji. " +
+	"If retry: name the exact mistake (which particle, conjugation or word, and why it is wrong) in 1-2 lines, " +
+	"show the correct version with romaji, then, if a common natural alternative exists, ONE line 'Ещё можно: ...'."
+
+// judgeSystem also classifies non-answers as 'offtrack' (research 5) so a stray
+// lookup is never scored as a wrong answer. Used only where the message could
+// genuinely not be an attempt — see offtrackAllowed.
+const judgeSystem = judgeBase +
+	"Your VERY FIRST line must be exactly one of: 'VERDICT: ok', 'VERDICT: retry', 'VERDICT: offtrack'. " +
+	"'VERDICT: offtrack' — the message is not an attempt at the task at all: an unrelated word or phrase " +
+	"(probably something the user wants looked up), a question, a request, or small talk. " +
+	"A clumsy, misspelled, oddly romanised or plainly wrong attempt is NOT offtrack — judge it as ok or retry. " +
+	"Output nothing after an offtrack verdict. " + judgeGrading
+
+// judgeBinarySystem has no offtrack option: used when the message is certainly
+// an attempt, so a real answer cannot be discarded as "not an answer".
+const judgeBinarySystem = judgeBase +
+	"Your VERY FIRST line must be exactly 'VERDICT: ok' or 'VERDICT: retry'. " + judgeGrading
+
+// contestSystem is the second, independent review used when the user disputes
+// a 'retry' verdict — explicitly generous about acceptable variants.
+const contestSystem = styleRules + " You are a careful Japanese tutor doing a SECOND, independent review. Reply in Russian. " +
+	"The user disputes an earlier 'incorrect' verdict on their answer. Re-examine it from scratch. " +
+	"Accept the answer if ANY reasonable native speaker would consider it correct: casual or polite forms, " +
+	"a different but natural word order, an omitted subject, an alternative particle where both are natural, " +
+	"minor typos, romaji-vs-kana. " +
+	"Your VERY FIRST line must be exactly 'VERDICT: ok' or 'VERDICT: retry'. Keep 'retry' ONLY for a definite " +
+	"grammatical or meaning error. Then a blank line, then 1-3 lines: if ok — say the answer is fine and show its " +
+	"natural form with kanji(чтение) and romaji; if retry — name the exact error and show the correct version with romaji."
+
+// verdict is the judge's classification of a user message.
+type verdict int
+
+const (
+	verdictRetry    verdict = iota // a genuine attempt with a real mistake (also the fallback for unparseable replies)
+	verdictOK                      // essentially correct
+	verdictOffTrack                // not an attempt at the task at all — never scored, never lapses SRS
+	verdictError                   // the judge itself failed (API error): shown as a hiccup, never journaled
+)
+
+// errorTags are the coarse buckets the judge sorts a mistake into. Deliberately
+// few: with a handful of practice rounds a week, fine-grained categories would
+// never accumulate enough hits to mean anything. The specific mistake travels
+// as free text (the judge's first feedback line) alongside the bucket.
+var errorTags = map[string]string{
+	"particle":       "частицы",
+	"verb-form":      "формы глаголов",
+	"adjective-form": "формы прилагательных",
+	"politeness":     "вежливость и стиль",
+	"word-order":     "порядок слов",
+	"word-choice":    "выбор слова",
+	"counter":        "счётные слова",
+	"kana-kanji":     "написание (кана/кандзи)",
+	"omission":       "пропуски слов и частиц",
+	"meaning":        "смысл перевода",
+	"other":          "другое",
+}
+
+// bucketFocus tells the task generator what a targeted sentence must exercise.
+var bucketFocus = map[string]string{
+	"particle":       "choosing the right particles (は/が/を/に/で/と/へ), including a contrast the user tends to confuse",
+	"verb-form":      "verb conjugation — tense, negation, the te-form, or potential/volitional forms",
+	"adjective-form": "い/な adjective forms — past, negative or adverbial use",
+	"politeness":     "register — plain versus polite (です/ます) forms as the situation demands",
+	"word-order":     "Japanese word order — modifiers before nouns, the verb last, placement of time and place",
+	"word-choice":    "picking the right word among near-synonyms",
+	"counter":        "counters and numerals (本, 枚, 人, つ, ...)",
+	"kana-kanji":     "correct kana spelling and kanji readings",
+	"omission":       "keeping every required particle and word — nothing may be dropped",
+	"meaning":        "conveying the exact meaning with no shift",
+}
+
+// ---------- difficulty (research 8) ----------
+
+// levelWindow is how many recent first attempts the difficulty level is read from.
+const levelWindow = 10
+
+// levelFromRate maps the recent first-try success rate to a difficulty level
+// 1-3. Stateless on purpose: the rate moves as tasks succeed or fail, so the
+// level settles where roughly half to most tasks are solved first time — the
+// productive zone. Fewer than four attempts is not enough to judge: stay easy.
+func levelFromRate(ok, total int) int {
+	if total < 4 {
+		return 1
+	}
+	switch rate := float64(ok) / float64(total); {
+	case rate >= 0.8:
+		return 3
+	case rate >= 0.5:
+		return 2
+	}
+	return 1
+}
+
+// practiceLevel is the current difficulty level plus the figures behind it.
+func practiceLevel(db *sql.DB, userID int) (level, ok, total int) {
+	ok, total, err := storage.FirstTryRate(db, userID, "compose", levelWindow)
+	if err != nil {
+		log.Printf("practice level: %v", err)
+		return 1, 0, 0
+	}
+	return levelFromRate(ok, total), ok, total
+}
+
+// levelSpec turns the level into concrete constraints for the Russian sentence
+// the user will compose in Japanese — the model is unreliable at "make it
+// N4-ish" and reliable at explicit rules.
+func levelSpec(level int) string {
+	switch level {
+	case 3:
+		return "Level: harder — 10-15 words; the sentence must need a subordinate clause (because / when / if / 'I think that'), " +
+			"or a potential or volitional verb form, or a counter word; past or negative forms are welcome."
+	case 2:
+		return "Level: medium — 8-12 words; may use past tense or negation, two actions linked by the te-form, " +
+			"an い/な adjective, and one time or place expression. No subordinate clauses."
+	default:
+		return "Level: simple — 5-8 words, present tense, polite form, basic particles only, a single clause."
+	}
+}
+
+// levelSpecJP is the same dial for the Japanese sentence of the translate stage.
+func levelSpecJP(level int) string {
+	switch level {
+	case 3:
+		return "Length 10-15 words, with a subordinate clause or a potential/volitional form."
+	case 2:
+		return "Length 8-12 words; past or negative forms and a て-form link are fine; no subordinate clauses."
+	default:
+		return "Length 5-8 words, present tense, polite form, a single clause."
+	}
+}
+
+// ---------- targeting (research 7) ----------
+
+// weakTarget is the bucket practice should drill right now, with the user's
+// recent mistakes in it, or "" when no bucket has enough outstanding mistakes.
+func weakTarget(db *sql.DB, userID int) (string, []string) {
+	tag, details, err := storage.WeakestBucket(db, userID, weakTagMin)
+	if err != nil {
+		log.Printf("weak target: %v", err)
+		return "", nil
+	}
+	return tag, details
+}
+
+// composeTaskPrompt builds the generator prompt for a compose task: the vocab
+// word, the difficulty rules, and — when a weak bucket is being drilled — what
+// the sentence must exercise plus the user's own recent slips there.
+func composeTaskPrompt(word string, level int, target string, details []string) string {
+	p := styleRules + " You are a Japanese tutor. Make a SHORT practice task in Russian for the word «" + word + "». " +
+		"Output exactly: line 1 — one natural Russian sentence that uses «" + word + "». " + levelSpec(level) + " "
+	if target != "" {
+		p += "Build the sentence so that translating it correctly REQUIRES " + bucketFocus[target] + ". "
+		if len(details) > 0 {
+			p += "The user's recent mistakes there: " + strings.Join(details, "; ") + ". Exercise exactly that. "
+		}
+	}
+	return p + "Then 2-3 lines, each a helper word the user will need: 'русское слово — японский(чтение, romaji)'. " +
+		"Do NOT translate the whole sentence into Japanese. No extra text."
+}
+
+const errorTagList = "particle, verb-form, adjective-form, politeness, word-order, word-choice, counter, kana-kanji, omission, meaning, other"
+
+// weakTagMin is how many mistakes in one bucket make it a pattern worth
+// showing — a single slip is not a weak spot.
+const weakTagMin = 3
+
+// normalizeTag maps whatever the model wrote to a known bucket ("other" if unknown).
+func normalizeTag(raw string) string {
+	t := strings.Trim(strings.ToLower(strings.TrimSpace(raw)), "'\"`. ")
+	if _, ok := errorTags[t]; ok {
+		return t
+	}
+	return "other"
+}
+
+// recordOutcome journals a judged attempt. Off-track messages and API errors
+// never get here — they are not attempts.
+func recordOutcome(db *sql.DB, userID int, kind, word, target string, v verdict, tag, fb string) {
+	n, err := storage.BumpAttempts(db, userID)
+	if err != nil {
+		log.Printf("attempt counter: %v", err)
+		n = 1
+	}
+	detail := ""
+	if v == verdictRetry {
+		detail = firstLine(fb)
+		if r := []rune(detail); len(r) > 200 {
+			detail = string(r[:200])
+		}
+	}
+	if err := storage.LogOutcome(db, userID, kind, word, v == verdictOK, n <= 1, tag, detail, target); err != nil {
+		log.Printf("outcome journal: %v", err)
+	}
+}
+
+// offtrackAllowed decides whether the judge may answer "this is not an attempt".
+// When the task expects Japanese and the user wrote Japanese or Latin letters,
+// it IS an attempt: allowing offtrack there made the model discard correct
+// romaji answers ("buruuberi" for ブルーベリー) as gibberish. Where a valid
+// answer and a stray lookup word look alike — Russian during the translate
+// stage — the classification stays available, which is what it was added for.
+func offtrackAllowed(expectJapanese bool, text string) bool {
+	if !expectJapanese {
+		return true
+	}
+	return !containsJapanese(text) && !containsLatin(text)
+}
+
+// judgeAnswer verdicts a user answer, picking the prompt that fits what the
+// task expects.
+func judgeAnswer(clients *Clients, task, answer string, expectJapanese bool) (verdict, string, string) {
+	if offtrackAllowed(expectJapanese, answer) {
+		return judgeWith(clients, judgeSystem, task)
+	}
+	return judgeWith(clients, judgeBinarySystem, task)
+}
+
+// judgeWith returns (verdict, error bucket, feedback). The bucket is only set
+// on a retry verdict.
+func judgeWith(clients *Clients, system, task string) (verdict, string, string) {
+	resp, err := claudeOne(clients, system, task)
+	if err != nil {
+		log.Printf("judge error: %v", err)
+		return verdictError, "", "Ошибка проверки, попробуй ещё раз."
+	}
+	return parseVerdict(resp)
+}
+
+// parseVerdict splits the model reply into its first-line verdict, an optional
+// 'TAG: bucket' line (mistakes only), and the feedback below. Anything
+// unrecognised counts as retry — the safe default that keeps the user in the
+// current stage.
+func parseVerdict(resp string) (verdict, string, string) {
+	first, rest := resp, ""
+	if i := strings.IndexByte(resp, '\n'); i >= 0 {
+		first, rest = resp[:i], resp[i+1:]
+	}
+	v := verdictRetry
+	switch strings.ToLower(strings.TrimSpace(first)) {
+	case "verdict: ok":
+		v = verdictOK
+	case "verdict: offtrack":
+		v = verdictOffTrack
+	}
+	tag := ""
+	if r := strings.TrimLeft(rest, " \t\n"); strings.HasPrefix(strings.ToUpper(r), "TAG:") {
+		line, after := r, ""
+		if i := strings.IndexByte(r, '\n'); i >= 0 {
+			line, after = r[:i], r[i+1:]
+		}
+		tag, rest = normalizeTag(line[4:]), after
+	}
+	if v != verdictRetry {
+		tag = "" // a bucket only means something on a mistake
+	}
+	return v, tag, strings.TrimSpace(rest)
+}
+
+// ---------- Flow 3 — SRS reminder answer ----------
+
+func checkReminder(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, message *tgbotapi.Message, st storage.State) {
+	chatID := message.Chat.ID
+	userID := int(message.From.ID)
+
+	word := st.Word
+	step := 1
+	if w, s, err := storage.GetReminder(db, st.ReminderID); err == nil && w != "" {
+		word, step = w, s
+	}
+
+	entry, _ := storage.FindVocab(db, userID, word)
+
+	var v verdict
+	var tag, fb string
+	if matchesStoredEntry(entry, message.Text) {
+		// the user recalled one of their own saved senses verbatim — there is
+		// nothing for the model to second-guess, and nothing to pay for
+		v, fb = verdictOK, strings.Join(entry.SenseLines(), "\n")
+	} else {
+		think := sendThinking(bot, chatID)
+		v, tag, fb = judgeAnswer(clients, reminderTask(word, entry, message.Text), message.Text, true)
+		deleteMsg(bot, chatID, think)
+	}
+
+	if v == verdictError {
+		sendKb(bot, chatID, fb, reminderKeyboard()) // stay on the word, nothing recorded
+		return
+	}
+	if v == verdictOffTrack {
+		// not an answer at all — don't lapse the word, just ask again; «Оспорить»
+		// is offered in case the classification itself was wrong
+		storage.SetLastAnswer(db, userID, message.Text)
+		sendKb(bot, chatID, "Это не похоже на ответ. "+reminderQuestion(db, userID, word)+" Или нажми «Закончить».",
+			reminderContestKeyboard(st.ReminderID, st.TaskText == srsSessionFlag && srsWordsLeft(db, userID) > 0))
+		return
+	}
+	storage.ClearMode(db, userID)
+	recordOutcome(db, userID, "reminder", word, "", v, tag, fb)
+
+	session := st.TaskText == srsSessionFlag
+	if v == verdictOK {
+		next := step + 1
+		storage.ScheduleReminder(db, userID, word, next, time.Now().Add(intervalFor(next)))
+		send(bot, chatID, "Правильно!\n"+fb+"\n\nНапомню это слово ещё попозже.")
+		continueSrsSession(bot, db, chatID, userID, session)
+	} else {
+		back := lapseStep(step)
+		storage.ScheduleReminder(db, userID, word, back, time.Now().Add(intervalFor(back)))
+		storage.SetLastAnswer(db, userID, message.Text)
+		// stay on this word rather than auto-advancing: «Оспорить» needs the
+		// answer, and moving on would bury a possibly wrong verdict. «Дальше»
+		// lets the user continue the batch deliberately.
+		sendKb(bot, chatID, fb+"\n\nНичего страшного — напомню это слово снова скоро.",
+			reminderContestKeyboard(st.ReminderID, session && srsWordsLeft(db, userID) > 0))
+	}
+}
+
+// matchesStoredEntry reports whether the answer is literally one of the senses
+// saved for this word — any of them, written in kanji, kana or romaji. A word
+// with several senses («холодно» → 寒い for weather, 冷たい to the touch) accepts
+// every sense the user saved: the reminder asks them to recall their own entry.
+func matchesStoredEntry(entry storage.VocabEntry, answer string) bool {
+	a := normalizeAnswer(answer)
+	if a == "" {
+		return false
+	}
+	for _, sense := range entry.SenseLines() {
+		for _, form := range entryForms(sense) {
+			if form != "" && normalizeAnswer(form) == a {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// entryForms lists every way one dictionary line could be written: the written
+// form, the kana reading, and the romaji. The trailing usage note is dropped.
+func entryForms(sense string) []string {
+	if i := strings.Index(sense, " — "); i >= 0 {
+		sense = strings.TrimSpace(sense[:i])
+	}
+	written, reading := splitHeadword(sense)
+	return []string{written, reading, romajiOf(sense)}
+}
+
+func normalizeAnswer(s string) string {
+	return strings.Trim(strings.ToLower(strings.TrimSpace(s)), " \t.,!?;:«»\"'()。、")
+}
+
+var trailingParenRe = regexp.MustCompile(`[(（]([^)）]*)[)）]\s*$`)
+
+// romajiOf pulls the trailing romaji group out of "寒(さむ)い (samui)".
+func romajiOf(translation string) string {
+	if m := trailingParenRe.FindStringSubmatch(strings.TrimSpace(translation)); m != nil {
+		return strings.TrimSpace(m[1])
+	}
+	return ""
+}
+
+// reminderTask frames the SRS question for the judge. The stored vocabulary
+// senses are handed over as the expected answers: without them the judge graded
+// against its own notion of the most idiomatic phrasing and rejected «さむい»
+// for «холодно» while admitting in the same breath that it was acceptable.
+func reminderTask(word string, entry storage.VocabEntry, answer string) string {
+	t := "How do you say the word «" + word + "» in Japanese? User's answer: " + answer
+	if senses := entry.SenseLines(); len(senses) > 0 {
+		t += "\n\nThe user's own vocabulary stores this word as:\n- " + strings.Join(senses, "\n- ") +
+			"\nEVERY one of those senses is an expected answer — accept any of them, in any script (kanji, kana or " +
+			"romaji) and in plain or polite form, and also accept any other word a native speaker would use for «" +
+			word + "». NEVER reject an answer over register, politeness or fine nuance when it is one of the stored " +
+			"senses — the user is recalling their own dictionary, not picking the most idiomatic phrasing."
+	}
+	return t
+}
+
+func intervalFor(step int) time.Duration {
+	switch {
+	case step <= 1:
+		return 3 * time.Hour
+	case step == 2:
+		return 24 * time.Hour
+	case step == 3:
+		return 7 * 24 * time.Hour
+	case step == 4:
+		return 30 * 24 * time.Hour
+	case step == 5:
+		return 60 * 24 * time.Hour
+	case step == 6:
+		return 120 * 24 * time.Hour
+	default:
+		return 180 * 24 * time.Hour
+	}
+}
+
+// lapseStep is the SRS step after a wrong answer: drop two steps instead of a
+// full reset, so one bad day doesn't erase months of progress (Anki-style lapse).
+// An explicit «Не помню» still resets to step 1 — the user said they forgot.
+func lapseStep(step int) int {
+	if step <= 3 {
+		return 1
+	}
+	return step - 2
+}
+
+// ---------- SRS rounds ----------
+
+const (
+	// srsSessionMin is the number of due words from which the bot announces the
+	// whole batch once instead of trickling words out one at a time.
+	srsSessionMin = 3
+	// srsSessionFlag lives in user_state.task_text (unused during reminders) and
+	// marks "we are working through a batch", so the next word follows straight
+	// after an answer instead of waiting for the scheduler's throttle.
+	srsSessionFlag = "session"
+	modeSrsOffer   = "srs_offer" // announcement sent, waiting for «Начать»
+)
+
+const (
+	// ReminderThrottle is the minimum gap between reminder rounds the scheduler
+	// starts for one user.
+	ReminderThrottle = 30 * time.Minute
+	// srsSessionWindow: a batch covers everything coming due within this span,
+	// not just the words due this very minute — with 3-hour steps words ripen
+	// one at a time, and "3 due at once" almost never happened for an active
+	// user. Asking a word a few hours early is the usual day-granularity of SRS.
+	srsSessionWindow = 12 * time.Hour
+	// srsSnooze is how long «Позже» postpones the announcement.
+	srsSnooze = 2 * time.Hour
+)
+
+// pluralRu picks the Russian plural form: 1 слово, 2 слова, 5 слов.
+func pluralRu(n int, one, few, many string) string {
+	n %= 100
+	if n >= 11 && n <= 14 {
+		return many
+	}
+	switch n % 10 {
+	case 1:
+		return one
+	case 2, 3, 4:
+		return few
+	}
+	return many
+}
+
+// StartReminderRound is the scheduler's entry point for one user. With several
+// words due it announces the batch and waits for «Начать»; with one or two it
+// just asks the first word, as before.
+func StartReminderRound(bot *tgbotapi.BotAPI, db *sql.DB, userID int) {
+	storage.SetLastReminderAt(db, userID, time.Now())
+	now := time.Now()
+	n, err := storage.CountDueReminders(db, userID, now, now.Add(srsSessionWindow))
+	if err != nil || n == 0 {
+		return
+	}
+	if n >= srsSessionMin {
+		storage.SetState(db, userID, modeSrsOffer, "", "", 0)
+		sendKb(bot, int64(userID), fmt.Sprintf("Сегодня повторяем %d %s.\nНачнём, как будешь готов.",
+			n, pluralRu(n, "слово", "слова", "слов")), srsOfferKeyboard())
+		return
+	}
+	sendNextDueReminder(bot, db, userID, false)
+}
+
+// sendNextDueReminder asks the next due word, reporting how many are left when
+// working through a batch. Returns false when nothing is due any more.
+func sendNextDueReminder(bot *tgbotapi.BotAPI, db *sql.DB, userID int, session bool) bool {
+	now := time.Now()
+	horizon := now // a lone reminder waits for its exact time…
+	if session {
+		horizon = now.Add(srsSessionWindow) // …a batch gathers the day's long-interval words
+	}
+	r, err := storage.NextDueReminder(db, userID, now, horizon)
+	if err != nil {
+		return false
+	}
+	storage.MarkReminderSent(db, r.ID)
+	storage.SetLastReminderAt(db, userID, time.Now())
+	flag := ""
+	if session {
+		flag = srsSessionFlag
+	}
+	storage.SetState(db, userID, "reminder", r.Word, flag, r.ID)
+
+	text := "Повторение!\n" + reminderQuestion(db, userID, r.Word) + " Напиши свой вариант."
+	if session {
+		if left, err := storage.CountDueReminders(db, userID, now, horizon); err == nil && left > 0 {
+			text += fmt.Sprintf("\n\nПосле этого останется ещё %d.", left)
+		}
+	}
+	sendKb(bot, int64(userID), text, reminderKeyboard())
+	return true
+}
+
+// srsWordsLeft is how many words the current batch still has waiting.
+func srsWordsLeft(db *sql.DB, userID int) int {
+	now := time.Now()
+	n, err := storage.CountDueReminders(db, userID, now, now.Add(srsSessionWindow))
+	if err != nil {
+		log.Printf("srs words left: %v", err)
+		return 0
+	}
+	return n
+}
+
+// continueSrsSession moves on to the next word of a batch, or closes it out.
+func continueSrsSession(bot *tgbotapi.BotAPI, db *sql.DB, chatID int64, userID int, session bool) {
+	if !session {
+		return
+	}
+	if !sendNextDueReminder(bot, db, userID, true) {
+		storage.ClearMode(db, userID)
+		send(bot, chatID, "На сегодня повторения закончились. Молодец!")
+	}
+}
+
+// ---------- callbacks ----------
+
+func HandleCallbackQuery(bot *tgbotapi.BotAPI, clients *Clients, callbackQuery *tgbotapi.CallbackQuery, db *sql.DB) {
+	data := callbackQuery.Data
+	userID := int(callbackQuery.From.ID)
+	chatID := callbackQuery.Message.Chat.ID
+	answerCallback(bot, callbackQuery)
+	storage.EnsureUser(db, userID)
+
+	// Buttons that lead to a model or TTS call count against the daily budget.
+	apiCall := data == "memorize" || data == "ask_practice" || data == "practice_yes" || data == "round_yes" ||
+		data == "dont_remember" || data == "audio" || strings.HasPrefix(data, "audplay#") ||
+		strings.HasPrefix(data, "contest#") || strings.HasPrefix(data, "vocab_play#")
+	if apiCall && !capOK(bot, clients, db, chatID, userID) {
+		return
+	}
+
+	switch {
+	case data == "memorize":
+		st := storage.GetState(db, userID)
+		if st.Word == "" {
+			send(bot, chatID, "Не понял, какое слово сохранить. Напиши слово ещё раз.")
+			return
+		}
+		think := sendThinking(bot, chatID)
+		word := resolveHeadword(clients, st.Word)
+		if word == "" {
+			deleteMsg(bot, chatID, think)
+			storage.SetState(db, userID, modeAwaitWord, "", "", 0)
+			send(bot, chatID, "Не понял, какое слово запомнить. Напиши его одним словом.")
+			return
+		}
+		translation, alternatives, verified := translateWord(clients, db, word)
+		deleteMsg(bot, chatID, think)
+		askSaveConfirmation(bot, db, chatID, userID, word, translation, alternatives, verified)
+
+	case data == "save_yes":
+		st := storage.GetState(db, userID)
+		if st.Mode != modeConfirmSave {
+			send(bot, chatID, "Это подтверждение устарело. Нажми «Запомнить» ещё раз.")
+			return
+		}
+		word := sanitizeWord(st.Word)
+		if word == "" {
+			send(bot, chatID, "Не понял, какое слово сохранить. Напиши слово ещё раз.")
+			return
+		}
+		translation, alternatives := splitSenses(st.TaskText) // stashed by askSaveConfirmation
+		storage.SaveVocab(db, userID, word, translation, alternatives)
+		if !storage.HasPendingReminder(db, userID, word) {
+			storage.ScheduleReminder(db, userID, word, 1, time.Now().Add(intervalFor(1)))
+		}
+		storage.SetCurrentWord(db, userID, word) // also clears the confirm mode
+		msg := fmt.Sprintf("Добавил «%s» в словарь. Напомню по расписанию.", word)
+		if translation != "" {
+			msg = fmt.Sprintf("Добавил «%s» — %s в словарь. Напомню по расписанию.", word, translation)
+			for _, alt := range strings.Split(alternatives, "\n") {
+				if alt = strings.TrimSpace(alt); alt != "" {
+					msg += "\nещё: " + alt
+				}
+			}
+		}
+		if e, err := storage.FindVocab(db, userID, word); err == nil && japaneseHeadword(e.Translation) != "" {
+			sendKb(bot, chatID, msg, playKeyboard(e.ID))
+		} else {
+			send(bot, chatID, msg)
+		}
+
+	case data == "save_no":
+		storage.SetState(db, userID, modeAwaitWord, "", "", 0)
+		send(bot, chatID, "Ок, не добавляю. Напиши одним словом, что запомнить.")
+
+	case data == "know":
+		sendKb(bot, chatID, "Хочешь попрактиковаться?", practiceOfferKeyboard())
+
+	case data == "practice_yes":
+		st := storage.GetState(db, userID)
+		startPractice(bot, clients, db, chatID, userID, st.Word)
+
+	case data == "practice_no":
+		send(bot, chatID, "Хорошо. Пиши, когда увидишь что-то интересное.")
+
+	case data == "ask_practice":
+		startPracticeFromTopic(bot, clients, db, chatID, userID, storage.GetState(db, userID).Word)
+
+	case data == "ask_clarify": // legacy «Уточнить» buttons on old messages
+		st := storage.GetState(db, userID)
+		prev := st.TaskText // the answer the follow-up question will refer to
+		if prev == "" {
+			prev = callbackQuery.Message.Text
+		}
+		storage.SetState(db, userID, "ask", st.Word, prev, 0)
+		send(bot, chatID, "Просто напиши свой вопрос сообщением.")
+
+	case strings.HasPrefix(data, "vocab_more#"):
+		if off, err := strconv.Atoi(strings.TrimPrefix(data, "vocab_more#")); err == nil && off > 0 {
+			sendVocab(bot, clients, db, chatID, userID, off)
+		}
+
+	case strings.HasPrefix(data, "vocab_audio#"): // expand into one 🔊 per word on this page
+		off, _ := strconv.Atoi(strings.TrimPrefix(data, "vocab_audio#"))
+		if _, entries, err := storage.GetVocabPage(db, userID, off, vocabPageSize); err == nil && len(entries) > 0 {
+			bot.Send(tgbotapi.NewEditMessageReplyMarkup(chatID, callbackQuery.Message.MessageID, vocabAudioKeyboard(entries, off)))
+		}
+
+	case strings.HasPrefix(data, "vocab_back#"): // collapse back to the page keyboard
+		off, _ := strconv.Atoi(strings.TrimPrefix(data, "vocab_back#"))
+		if total, entries, err := storage.GetVocabPage(db, userID, off, vocabPageSize); err == nil {
+			bot.Send(tgbotapi.NewEditMessageReplyMarkup(chatID, callbackQuery.Message.MessageID, vocabPageKeyboard(off, off+len(entries) < total)))
+		}
+
+	case strings.HasPrefix(data, "vocab_play#"):
+		if id, err := strconv.Atoi(strings.TrimPrefix(data, "vocab_play#")); err == nil {
+			playVocabWord(bot, clients, db, chatID, userID, id)
+		}
+
+	case data == "contest#practice":
+		handleContestPractice(bot, clients, db, chatID, userID)
+
+	case strings.HasPrefix(data, "contest#rem#"):
+		if id, err := strconv.Atoi(strings.TrimPrefix(data, "contest#rem#")); err == nil {
+			handleContestReminder(bot, clients, db, chatID, userID, id)
+		}
+
+	case data == "dont_remember":
+		st := storage.GetState(db, userID)
+		word := st.Word
+		if w, _, err := storage.GetReminder(db, st.ReminderID); err == nil && w != "" {
+			word = w
+		}
+		storage.ClearMode(db, userID) // drops the session flag — st keeps a copy
+		if word == "" {
+			send(bot, chatID, "Окей.")
+			return
+		}
+		think := sendThinking(bot, chatID)
+		ans, _ := claudeOne(clients, styleRules+" Reply in Russian. Show how the word «"+word+"» is in Japanese: kanji(чтение) (romaji) — перевод, plus one short example.", word)
+		deleteMsg(bot, chatID, think)
+		storage.ScheduleReminder(db, userID, word, 1, time.Now().Add(intervalFor(1)))
+		send(bot, chatID, "Ничего страшного, вот как это:\n\n"+ans+"\n\nНапомню это слово снова скоро.")
+		continueSrsSession(bot, db, chatID, userID, st.TaskText == srsSessionFlag)
+
+	case data == "srs_start":
+		if !sendNextDueReminder(bot, db, userID, true) {
+			storage.ClearMode(db, userID)
+			send(bot, chatID, "Повторять пока нечего — напомню, когда придёт время.")
+		}
+
+	case data == "srs_next":
+		continueSrsSession(bot, db, chatID, userID, true)
+
+	case data == "srs_later":
+		storage.ClearMode(db, userID)
+		// push last_reminder_at into the future so the throttle holds the
+		// announcement back for srsSnooze instead of re-offering in 30 minutes
+		storage.SetLastReminderAt(db, userID, time.Now().Add(srsSnooze-ReminderThrottle))
+		send(bot, chatID, "Хорошо, напомню через пару часов.")
+
+	case data == "end_practice":
+		storage.ClearMode(db, userID)
+		send(bot, chatID, "Практика завершена. Напиши слово — переведу и предложу запомнить.")
+
+	case data == "resume_practice":
+		st := storage.GetState(db, userID)
+		switch st.Mode {
+		case "paused_translate":
+			storage.SetState(db, userID, "practice_translate", st.Word, st.TaskText, 0)
+			send(bot, chatID, "Продолжаем практику.")
+			sendTranslateTask(bot, chatID, st.TaskText)
+		case "paused_compose":
+			storage.SetState(db, userID, "practice_compose", st.Word, st.TaskText, 0)
+			send(bot, chatID, "Продолжаем практику.")
+			sendComposeTask(bot, chatID, st.TaskText)
+		default:
+			send(bot, chatID, "Ок.")
+		}
+
+	case data == "exit":
+		storage.ClearMode(db, userID)
+		send(bot, chatID, "Окей, закончили. Пиши слово, когда захочешь.")
+
+	case data == "clarify":
+		st := storage.GetState(db, userID)
+		switch st.Mode {
+		case "practice_compose":
+			storage.SetState(db, userID, "clarify_compose", st.Word, st.TaskText, 0)
+			send(bot, chatID, "Что именно непонятно в этом предложении? Напиши вопрос.")
+		case "practice_translate":
+			storage.SetState(db, userID, "clarify_translate", st.Word, st.TaskText, 0)
+			send(bot, chatID, "Что именно непонятно в этом предложении? Напиши вопрос.")
+		}
+
+	case data == "round_yes":
+		st := storage.GetState(db, userID)
+		startPracticeWeakest(bot, clients, db, chatID, userID, st.Word)
+
+	case data == "round_no":
+		storage.ClearMode(db, userID)
+		send(bot, chatID, "Хорошо, на сегодня хватит. Молодец!")
+
+	case data == "audio" || strings.HasPrefix(data, "audplay#") || data == "audback":
+		handleAudio(bot, clients, db, callbackQuery, data)
+
+	case strings.HasPrefix(data, "speech_speed:"):
+		handleSpeechSpeed(bot, db, callbackQuery, data)
+	}
+}
+
+// ---------- audio ----------
+
+func handleAudio(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, cq *tgbotapi.CallbackQuery, data string) {
+	chatID := cq.Message.Chat.ID
+	userID := int(cq.From.ID)
+
+	if data == "audback" {
+		bot.Send(tgbotapi.NewEditMessageReplyMarkup(chatID, cq.Message.MessageID, wordKeyboard()))
+		return
+	}
+
+	sentences := extractJapaneseSentences(cq.Message.Text)
+	if len(sentences) == 0 {
+		return
+	}
+
+	if data == "audio" {
+		if len(sentences) == 1 {
+			sendAudioMessage(clients, db, sentences[0], userID, bot)
+			return
+		}
+		bot.Send(tgbotapi.NewEditMessageReplyMarkup(chatID, cq.Message.MessageID, audioNumberKeyboard(len(sentences))))
+		return
+	}
+
+	// audplay#N
+	if n, err := strconv.Atoi(strings.TrimPrefix(data, "audplay#")); err == nil && n >= 1 && n <= len(sentences) {
+		sendAudioMessage(clients, db, sentences[n-1], userID, bot)
+	}
+}
+
+// audioNumberKeyboard — numbered 🔊 buttons for the sentences in a lookup message.
+func audioNumberKeyboard(n int) tgbotapi.InlineKeyboardMarkup {
+	return numberedAudioKeyboard(n, func(i int) string { return fmt.Sprintf("audplay#%d", i) }, "audback")
+}
+
+// numberedAudioKeyboard lays out n "🔊 i" buttons four per row plus a back button.
+func numberedAudioKeyboard(n int, playData func(i int) string, backData string) tgbotapi.InlineKeyboardMarkup {
+	keyboard := tgbotapi.NewInlineKeyboardMarkup()
+	row := tgbotapi.NewInlineKeyboardRow()
+	for i := 1; i <= n; i++ {
+		row = append(row, tgbotapi.NewInlineKeyboardButtonData(fmt.Sprintf("🔊 %d", i), playData(i)))
+		if i%4 == 0 || i == n {
+			keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, row)
+			row = tgbotapi.NewInlineKeyboardRow()
+		}
+	}
+	keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, tgbotapi.NewInlineKeyboardRow(
+		tgbotapi.NewInlineKeyboardButtonData("← Назад", backData),
+	))
+	return keyboard
+}
+
+var parenGroupRe = regexp.MustCompile(`[(（][^)）]*[)）]`)
+
+// extractJapaneseSentences pulls clean Japanese (no readings, no romaji, no Russian)
+// out of a bot message, one entry per line that contains Japanese.
+func extractJapaneseSentences(text string) []string {
+	var out []string
+	for _, line := range strings.Split(text, "\n") {
+		if idx := strings.Index(line, "—"); idx >= 0 {
+			line = line[:idx]
+		}
+		line = parenGroupRe.ReplaceAllString(line, "")
+		line = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "Пример:"))
+		if containsJapanese(line) {
+			out = append(out, line)
+		}
+	}
+	return out
+}
+
+func containsJapanese(s string) bool {
+	for _, r := range s {
+		if (r >= 0x3040 && r <= 0x30FF) || (r >= 0x4E00 && r <= 0x9FFF) {
+			return true
+		}
+	}
+	return false
+}
+
+func sendAudioMessage(clients *Clients, db *sql.DB, text string, userID int, bot *tgbotapi.BotAPI) {
+	speed := storage.GetUserSpeechSpeed(db, userID)
+	audio, err := openai_api.GetTTSResponse(context.Background(), clients.OpenAI, speed, text)
+	if err != nil {
+		// graceful degradation: say so instead of silently sending nothing
+		log.Printf("TTS error: %v", err)
+		send(bot, int64(userID), "Озвучка сейчас недоступна, попробуй чуть позже.")
+		return
+	}
+	voice := tgbotapi.NewVoice(int64(userID), tgbotapi.FileBytes{Name: "audio.mp3", Bytes: audio})
+	if _, err := bot.Send(voice); err != nil {
+		log.Printf("send audio error: %v", err)
+	}
+}
+
+// ---------- speech speed ----------
 
 func getSpeechSpeedValues() map[float64]string {
-	speedValues := map[float64]string{
-		0.5: "Slow",
-		0.7: "Normal",
-		1.0: "Fast",
-	}
-
-	keys := make([]float64, 0, len(speedValues))
-	for k := range speedValues {
-		keys = append(keys, k)
-	}
-
-	sort.Float64s(keys)
-
-	sortedMap := make(map[float64]string)
-	for _, k := range keys {
-		sortedMap[k] = speedValues[k]
-	}
-
-	return sortedMap
+	return map[float64]string{0.5: "Медленно", 0.75: "Нормально", 1.0: "Быстро"}
 }
 
-// speechSpeedInlineKeyboard returns an inline keyboard with speech speed options
-// The following options are available:
-// - Slow - 0.5
-// - Normal - 0.7
-// - Fast - 1.0
-// User is presented the text options
 func speechSpeedInlineKeyboard() tgbotapi.InlineKeyboardMarkup {
 	keyboard := tgbotapi.NewInlineKeyboardMarkup()
-	currentInlineRow := tgbotapi.NewInlineKeyboardRow()
-
-	speechSpeedValues := getSpeechSpeedValues()
-	for speechSpeed, speechSpeedText := range speechSpeedValues {
-		currentInlineRow = append(currentInlineRow, tgbotapi.NewInlineKeyboardButtonData(speechSpeedText, fmt.Sprintf("speech_speed:%.1f", speechSpeed)))
+	row := tgbotapi.NewInlineKeyboardRow()
+	keys := []float64{0.5, 0.75, 1.0}
+	sort.Float64s(keys)
+	values := getSpeechSpeedValues()
+	for _, k := range keys {
+		row = append(row, tgbotapi.NewInlineKeyboardButtonData(values[k], fmt.Sprintf("speech_speed:%.2f", k)))
 	}
-	keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, currentInlineRow)
+	keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, row)
 	return keyboard
 }
 
-func languageInlineKeyboard() tgbotapi.InlineKeyboardMarkup {
-	keyboard := tgbotapi.NewInlineKeyboardMarkup(
-		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("Dutch", "language:Dutch"),
-			tgbotapi.NewInlineKeyboardButtonData("French", "language:French"),
-			tgbotapi.NewInlineKeyboardButtonData("German", "language:German"),
-		),
-		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("Estonian", "language:Estonian"),
-			tgbotapi.NewInlineKeyboardButtonData("Spanish", "language:Spanish"),
-			tgbotapi.NewInlineKeyboardButtonData("Russian", "language:Russian"),
-		),
-	)
-	return keyboard
-}
-
-func examplesInlineKeyboard(total int) tgbotapi.InlineKeyboardMarkup {
-	keyboard := tgbotapi.NewInlineKeyboardMarkup()
-	currentInlineRow := tgbotapi.NewInlineKeyboardRow()
-
-	for i := 1; i <= total; i++ {
-		if i%3 == 0 {
-			// add the current row to the keyboard
-			keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, currentInlineRow)
-			currentInlineRow = tgbotapi.NewInlineKeyboardRow()
-		}
-		currentInlineRow = append(currentInlineRow, tgbotapi.NewInlineKeyboardButtonData(fmt.Sprintf("%d", i), fmt.Sprintf("pronunciation:%d", i)))
-		if i == total {
-			// add the current row to the keyboard
-			keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, currentInlineRow)
-		}
-
-	}
-	return keyboard
-}
-
-func updateLanguagePreference(bot *tgbotapi.BotAPI, callbackQuery *tgbotapi.CallbackQuery, db *sql.DB, language string, speech_speed float64) {
-	userID := int(callbackQuery.From.ID)
-	err := storage.UpdateUserLanguage(db, userID, language)
-	if err != nil {
-		// Handle error
-		log.Printf("Error updating language preference: %v\n", err)
-		return
-	}
-
-	responseMsg := "Great, you picked %s. If you start typing words or phrases, I will send you a few examples with that word or a phrase. " +
-		"If you type a whole sentence, then that sentence will be translated to %s. " +
-		"You can also pick translation, where I will translate supplied phrase either from English to the language you picked, or the other way around. " +
-		"Enjoy!"
-
-	processedResponseMsg := fmt.Sprintf(responseMsg, language, language)
-	// Send a confirmation message and remove the inline keyboard
-	msg := tgbotapi.NewEditMessageText(callbackQuery.Message.Chat.ID, callbackQuery.Message.MessageID, processedResponseMsg)
-	// msg.ReplyMarkup = &emptyKeyboard
-	_, err = bot.Send(msg)
-	if err != nil {
-		log.Printf("Error sending confirmation message: %v\n", err)
-	}
-}
-
-type GptTemplateData struct {
-	Language    string
-	MessageText string
-}
-
-func HandleMessage(ctx context.Context, bot *tgbotapi.BotAPI, message *tgbotapi.Message, openaiClient *openai.Client, db *sql.DB) {
-	userID := int(message.From.ID)
-	language, err := storage.GetUserLanguage(db, userID)
-	if err != nil {
-		// Handle error
-		log.Printf("Error getting user language: %v\n", err)
-		return
-	}
-
-	helpType, err := GetUserHelpType(db, userID)
+func handleSpeechSpeed(bot *tgbotapi.BotAPI, db *sql.DB, cq *tgbotapi.CallbackQuery, data string) {
+	speed, err := strconv.ParseFloat(strings.TrimPrefix(data, "speech_speed:"), 64)
 	if err != nil {
 		return
 	}
-	// send thinking message while the api is processing the request
-	thinkMsgResponse, shouldReturn := sendThinkingMessage(message, bot)
-	if shouldReturn {
+	if err := storage.UpdateUserSpeechSpeed(db, int(cq.From.ID), speed); err != nil {
+		log.Printf("update speed error: %v", err)
 		return
 	}
-	defer deleteThinkingMessage(message, thinkMsgResponse, bot)
-
-	gptresponse, err := ProcessQuery(helpType, language, message.Text, db, userID, openaiClient)
-	if err != nil {
-		log.Printf("Error processing query: %v\n", err)
-		return
-	}
-
-	msg := tgbotapi.NewMessage(message.Chat.ID, gptresponse)
-	_, err = bot.Send(msg)
-	if err != nil {
-		log.Printf("Error sending GPT response: %v\n", err)
-	}
+	label := getSpeechSpeedValues()[speed]
+	bot.Send(tgbotapi.NewEditMessageText(cq.Message.Chat.ID, cq.Message.MessageID,
+		fmt.Sprintf("Скорость озвучки: %s.", label)))
 }
 
-func deleteThinkingMessage(message *tgbotapi.Message, thinkMsgResponse tgbotapi.Message, bot *tgbotapi.BotAPI) {
-	deleteMsg := tgbotapi.NewDeleteMessage(message.Chat.ID, thinkMsgResponse.MessageID)
-	response, err := bot.Request(deleteMsg)
-	if err != nil {
-		log.Printf("Error deleting thinking message: %v\n", err)
-	}
-	if string(response.Result) != "true" {
-		log.Printf("response is not true from deleteThinkingMessage")
-	}
-}
+// ---------- access control ----------
 
-func sendThinkingMessage(message *tgbotapi.Message, bot *tgbotapi.BotAPI) (tgbotapi.Message, bool) {
-	thinkMsg := tgbotapi.NewMessage(message.Chat.ID, "Thinking...")
-	thinkMsgResponse, err := bot.Send(thinkMsg)
-	if err != nil {
-		log.Printf("Error sending thinking message: %v\n", err)
-		return tgbotapi.Message{}, true
-	}
-	return thinkMsgResponse, false
-}
-
-// ProcessQuery processes a query based on the given parameters.
-// It checks if a cached response exists for the query and returns it if found.
-// If no cached response is found, it generates a response using the GPT model.
-// The generated response is then cached for future use.
-//
-// Parameters:
-// - helpType: The type of help requested (e.g., "examples", "translation").
-// - language: The language of the query.
-// - message: The query message.
-// - db: The database connection.
-// - userID: The ID of the user making the query.
-// - openaiClient: The OpenAI client for generating GPT responses.
-//
-// Returns:
-// - string: The generated response or the cached response.
-// - error: An error if any occurred during the process.
-func ProcessQuery(helpType string, language string, message string, db *sql.DB, userID int, openaiClient *openai.Client) (string, error) {
-	gptConfig := config.NewConfig()
-	if message == "" {
-		return "", errors.New("message is empty")
-	}
-	// check if we can find cached response
-	log.Printf("Checking cache for response: language=%s, type=%s, word=%s\n", language, helpType, message)
-
-	cachedResponse, err := storage.GetCachedResponseByWordLangAndType(db, language, helpType, message)
-	if err != nil {
-		log.Printf("Error getting cached response: %v\n", err)
-		return "", err
-	}
-
-	if cachedResponse != "" {
-		log.Printf("Found cached response")
-		// store query
-		log.Printf("Storing query: userID=%d, message=%s\n", userID, message)
-		_, err := storage.StoreQuery(db, userID, helpType, language, message)
-		if err != nil {
-			log.Printf("Error storing query: %v\n", err)
-		}
-		return cachedResponse, nil
-	}
-
-	var gpt *config.GptRequestType
-	switch helpType {
-	case "examples":
-		gpt = gptConfig.GptTemplateWordUsageExamples
-	case "translation":
-		gpt = gptConfig.GptTemplateWordTranslation
-	case "inflection":
-		gpt = gptConfig.GptTemplateInflection
-	default:
-		log.Printf("invalid help type: %s\n", helpType)
-		return "", errors.New("invalid help type")
-	}
-
-	data := GptTemplateData{
-		Language:    language,
-		MessageText: message,
-	}
-
-	var gptPrompt strings.Builder
-	err = gpt.PromptTemplate.Execute(&gptPrompt, data)
-	if err != nil {
-		log.Printf("Error executing GPT template: %v\n", err)
-		return "", err
-	}
-
-	// log storing query: userID, message
-	log.Printf("Storing query: %d, %s\n", userID, message)
-	query_id, err := storage.StoreQuery(db, userID, helpType, language, message)
-	if err != nil {
-		log.Printf("Error storing query: %v\n", err)
-	}
-
-	gptRequest := openai_api.GPTRequest{
-		Prompt:                 gptPrompt.String(),
-		WordOrPhrase:           message,
-		ChatCompletionMessages: gptConfig.GptPromptTunings[language][helpType].Messages,
-	}
-
-	ctx := context.Background()
-
-	gptresponse, err := openai_api.GetGPTResponse(ctx, openaiClient, gptRequest)
-	if err != nil {
-		log.Printf("Error getting GPT response: %v\n", err)
-		return "", err
-	}
-
-	// cache response
-	log.Printf("Caching response: language=%s, type=%s, word=%s\n", language, helpType, message)
-	err = storage.CacheResponse(db, query_id, gptresponse)
-	if err != nil {
-		log.Printf("Error caching response: %v\n", err)
-		return "", err
-	}
-	return gptresponse, nil
-}
-
-func GetUserHelpType(db *sql.DB, userID int) (string, error) {
-	helpType, err := storage.GetUserHelpType(db, userID)
-	if err != nil {
-
-		log.Printf("Error getting user help_type: %v\n", err)
-		return "", err
-	}
-	if helpType == "" {
-		helpType = "translation"
-		err = storage.UpdateUserHelpType(db, userID, helpType)
-		if err != nil {
-
-			log.Printf("Error updating user help_type: %v\n", err)
-			return "", err
-		}
-	}
-	return helpType, nil
-}
-
-// IsAllowedUser checks if user is allowed to use bot
 func IsAllowedUser(update tgbotapi.Update, allowedUsers []int64) bool {
 	var userID int64
 	if update.Message != nil {
@@ -593,8 +2066,8 @@ func IsAllowedUser(update tgbotapi.Update, allowedUsers []int64) bool {
 	} else {
 		return false
 	}
-	for _, allowedUser := range allowedUsers {
-		if userID == allowedUser {
+	for _, id := range allowedUsers {
+		if userID == id {
 			return true
 		}
 	}

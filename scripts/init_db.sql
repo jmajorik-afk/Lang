@@ -1,44 +1,86 @@
--- Initialize SQL Schema (init_db.sql)
+-- Schema for the Japanese learning bot (3 flows + /ask)
 
--- Users Table
 CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY,
-    language TEXT NOT NULL,
-    help_type TEXT NOT NULL,
-    speech_speed REAL NOT NULL DEFAULT 0.0 -- Set a default value for the speech_speed column
+    speech_speed REAL NOT NULL DEFAULT 1.0
 );
 
--- Queries Table
-CREATE TABLE IF NOT EXISTS queries (
+-- Saved vocabulary (only words the user explicitly pressed "Запомнить" on)
+CREATE TABLE IF NOT EXISTS vocab (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL,
     word TEXT NOT NULL,
-    language TEXT NOT NULL,
-    help_type TEXT NOT NULL,
-    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (user_id) REFERENCES users(id)
+    translation TEXT NOT NULL DEFAULT '', -- main sense, "kanji(чтение) (romaji)"
+    alternatives TEXT NOT NULL DEFAULT '', -- other senses, one per line, each with a usage note
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(user_id, word)
 );
 
--- Add column speech_speed to users table if it doesn't exist
-CREATE TABLE IF NOT EXISTS temp_users AS SELECT * FROM users; -- Create a temporary table
-DROP TABLE IF EXISTS users; -- Drop the original users table
-CREATE TABLE users (
-    id INTEGER PRIMARY KEY,
-    language TEXT NOT NULL,
-    help_type TEXT NOT NULL,
-    speech_speed REAL NOT NULL DEFAULT 0.0 -- Recreate the users table with the new column
+-- Spaced-repetition reminders (one pending row per word at a time)
+CREATE TABLE IF NOT EXISTS reminders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    word TEXT NOT NULL,
+    step INTEGER NOT NULL DEFAULT 1,
+    send_at DATETIME NOT NULL,
+    sent INTEGER NOT NULL DEFAULT 0,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
-INSERT INTO users (id, language, help_type) SELECT id, language, help_type FROM temp_users;
+CREATE INDEX IF NOT EXISTS idx_reminders_due ON reminders (send_at, sent);
 
-DROP TABLE IF EXISTS temp_users; -- Drop the temporary table
-
--- Add indexes to queries table
-CREATE INDEX IF NOT EXISTS idx_queries_language ON queries (language, help_type, word);
-
--- Cached Responses Table
-CREATE TABLE IF NOT EXISTS cached_responses (
-    query_id INTEGER NOT NULL,
-    response TEXT NOT NULL,
-    FOREIGN KEY (query_id) REFERENCES queries(id)
+-- Per-user interaction state machine
+CREATE TABLE IF NOT EXISTS user_state (
+    user_id INTEGER PRIMARY KEY,
+    mode TEXT NOT NULL DEFAULT '',          -- '' | practice_compose | practice_translate | paused_compose | paused_translate | reminder | srs_offer | confirm_save | await_word | ask
+    -- during 'reminder' task_text holds 'session' while working through a batch
+    word TEXT NOT NULL DEFAULT '',          -- current / active word
+    task_text TEXT NOT NULL DEFAULT '',     -- the sentence shown for practice
+    reminder_id INTEGER NOT NULL DEFAULT 0,
+    last_reminder_at DATETIME,
+    last_answer TEXT NOT NULL DEFAULT '',  -- most recent judged answer, for «Оспорить»
+    attempt INTEGER NOT NULL DEFAULT 0,    -- judged attempts at the current task (reset by SetState)
+    target TEXT NOT NULL DEFAULT ''        -- error bucket the current practice task drills, if any
 );
 
+-- Short conversation history fed back to Claude for word lookups
+CREATE TABLE IF NOT EXISTS conversations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    user_message TEXT NOT NULL,
+    bot_response TEXT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_conversations_user ON conversations (user_id, created_at);
+
+-- Per-user daily count of user-initiated API interactions (cost control)
+CREATE TABLE IF NOT EXISTS api_usage (
+    user_id INTEGER NOT NULL,
+    day TEXT NOT NULL,                      -- YYYY-MM-DD
+    calls INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (user_id, day)
+);
+
+-- Global cache of word → Japanese translation, with Jisho verification flag
+CREATE TABLE IF NOT EXISTS translation_cache (
+    word TEXT PRIMARY KEY,
+    translation TEXT NOT NULL,
+    alternatives TEXT NOT NULL DEFAULT '',
+    verified INTEGER NOT NULL DEFAULT 0,    -- 1 = reading confirmed by Jisho
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Journal of every judged answer: feeds /stats, weak-point targeting, difficulty
+CREATE TABLE IF NOT EXISTS outcomes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    kind TEXT NOT NULL,                     -- compose | translate | reminder
+    word TEXT NOT NULL,                     -- vocab word or /ask topic the task was about
+    ok INTEGER NOT NULL,                    -- 1 correct, 0 mistake
+    first_try INTEGER NOT NULL DEFAULT 1,
+    tag TEXT NOT NULL DEFAULT '',           -- coarse error bucket on mistakes (particle, verb-form, ...)
+    detail TEXT NOT NULL DEFAULT '',        -- the judge's one-line description of the mistake
+    overturned INTEGER NOT NULL DEFAULT 0,  -- 1 if «Оспорить» reversed the mistake
+    target TEXT NOT NULL DEFAULT '',        -- bucket this task was built to drill ('' = ordinary task)
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_outcomes_user ON outcomes (user_id, created_at);

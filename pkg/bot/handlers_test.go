@@ -1,0 +1,341 @@
+package bot
+
+import (
+	"strings"
+	"testing"
+	"time"
+
+	"language-learning-bot/pkg/storage"
+)
+
+// TestSanitizeWord covers the junk that actually made it into the vocabulary
+// before the "Запомнить" flow normalized what it saved.
+func TestSanitizeWord(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		// real rows recovered from languagebot.db
+		{"растение", "растение"},
+		{"Дерево ?", "дерево"},
+		{"А крыша ?", "крыша"},
+		{"ребенок", "ребенок"},
+
+		// lookup phrasings
+		{"что значит окно", "окно"},
+		{"как будет стул?", "стул"},
+		{"а вот крыша", "крыша"},
+		{"  СТОЛ  ", "стол"},
+
+		// unresolvable locally → "" means "ask Claude / ask the user"
+		{"А игра компьютерная", ""},
+		{"это очень длинное предложение про всё сразу", ""},
+		{"", ""},
+		{"?!.", ""},
+	}
+
+	for _, c := range cases {
+		if got := sanitizeWord(c.in); got != c.want {
+			t.Errorf("sanitizeWord(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+// TestLooksLikePracticeAnswer covers the "did the user forget they're in
+// practice?" heuristic that decides whether to offer to end practice.
+func TestLooksLikePracticeAnswer(t *testing.T) {
+	cases := []struct {
+		mode string
+		text string
+		want bool
+	}{
+		// compose expects Japanese or romaji; a Russian word is a distraction
+		{"practice_compose", "растение", false},
+		{"practice_compose", "私は学生です", true},
+		{"practice_compose", "watashi wa gakusei desu", true},
+		{"practice_compose", "犬", true},
+		{"practice_compose", "", false},
+
+		// translate expects a Russian phrase; Japanese input is a distraction
+		{"practice_translate", "я студент", true},
+		{"practice_translate", "собака", true},
+		{"practice_translate", "植物", false},
+		{"practice_translate", "", false},
+	}
+	for _, c := range cases {
+		if got := looksLikePracticeAnswer(c.mode, c.text); got != c.want {
+			t.Errorf("looksLikePracticeAnswer(%q, %q) = %v, want %v", c.mode, c.text, got, c.want)
+		}
+	}
+}
+
+// TestIntervalFor pins the SRS schedule: growing intervals past the old 30-day
+// ceiling, capped at 180 days, and never shrinking as the step rises.
+func TestIntervalFor(t *testing.T) {
+	day := 24 * time.Hour
+	fixed := map[int]time.Duration{
+		0: 3 * time.Hour, 1: 3 * time.Hour, 2: day, 3: 7 * day,
+		4: 30 * day, 5: 60 * day, 6: 120 * day, 7: 180 * day, 42: 180 * day,
+	}
+	for step, want := range fixed {
+		if got := intervalFor(step); got != want {
+			t.Errorf("intervalFor(%d) = %v, want %v", step, got, want)
+		}
+	}
+	for step := 1; step < 12; step++ {
+		if intervalFor(step+1) < intervalFor(step) {
+			t.Errorf("intervalFor must not shrink: step %d→%d went %v→%v",
+				step, step+1, intervalFor(step), intervalFor(step+1))
+		}
+	}
+}
+
+// TestSplitHeadword pins how a translation line is taken apart — the written
+// form goes to Jisho and to TTS, the reading is compared with the dictionary.
+func TestSplitHeadword(t *testing.T) {
+	cases := []struct{ in, written, reading string }{
+		{"屋根(やね) (yane)", "屋根", "やね"},
+		{"遊(あそ)び (asobi)", "遊び", "あそび"}, // okurigana stays in the written form
+		{"植物(しょくぶつ) (shokubutsu)", "植物", "しょくぶつ"},
+		{"食(た)べ物(もの) (tabemono)", "食べ物", "たべもの"}, // two kanji runs
+		{"ありがとう (arigatou)", "ありがとう", "ありがとう"},   // kana-only word
+		{"", "", ""},
+		{"just latin", "", ""},
+	}
+	for _, c := range cases {
+		w, r := splitHeadword(c.in)
+		if w != c.written || r != c.reading {
+			t.Errorf("splitHeadword(%q) = (%q, %q), want (%q, %q)", c.in, w, r, c.written, c.reading)
+		}
+	}
+	if got := japaneseHeadword("屋根(やね) (yane)"); got != "屋根" {
+		t.Errorf("japaneseHeadword = %q, want 屋根", got)
+	}
+}
+
+// TestMatchesStoredEntry guards the false negative that started this: the user
+// answered «さむい» for «холодно», the dictionary held 寒(さむ)い (samui), and the
+// judge still rejected it. An answer matching the stored entry in any script is
+// accepted without asking the model at all.
+func TestMatchesStoredEntry(t *testing.T) {
+	cold := storage.VocabEntry{
+		Word:         "холодно",
+		Translation:  "寒(さむ)い (samui)",
+		Alternatives: "冷(つめ)たい (tsumetai) — о предмете на ощупь",
+	}
+	// every sense counts, in every script — including the alternative one
+	accept := []string{"寒い", "さむい", "samui", " Samui ", "SAMUI", "さむい。", "寒い!",
+		"冷たい", "つめたい", "tsumetai"}
+	for _, a := range accept {
+		if !matchesStoredEntry(cold, a) {
+			t.Errorf("matchesStoredEntry(%q) = false, want true", a)
+		}
+	}
+	// «самуи» in Cyrillic is not romaji — it falls through to the judge, which
+	// may still accept it; only an exact script match short-circuits.
+	reject := []string{"", "寒", "холодно", "atsui", "самуи", "あつい"}
+	for _, a := range reject {
+		if matchesStoredEntry(cold, a) {
+			t.Errorf("matchesStoredEntry(%q) = true, want false (must fall through to the judge)", a)
+		}
+	}
+	if !matchesStoredEntry(storage.VocabEntry{Translation: "ありがとう (arigatou)"}, "ありがとう") {
+		t.Error("kana-only entry must match its own form")
+	}
+	if matchesStoredEntry(storage.VocabEntry{}, "さむい") {
+		t.Error("with no stored entry there is nothing to match against")
+	}
+
+	if got := romajiOf("寒(さむ)い (samui)"); got != "samui" {
+		t.Errorf("romajiOf = %q, want samui", got)
+	}
+	if got := romajiOf("屋根(やね)"); got != "やね" {
+		t.Errorf("romajiOf without a romaji group = %q, want the trailing group やね", got)
+	}
+	// a usage note must not leak into the matchable forms
+	forms := entryForms("冷(つめ)たい (tsumetai) — о предмете на ощупь")
+	want := map[string]bool{"冷たい": true, "つめたい": true, "tsumetai": true}
+	for _, f := range forms {
+		if f != "" && !want[f] {
+			t.Errorf("entryForms produced %q — the usage note leaked in", f)
+		}
+	}
+}
+
+// TestSplitSenses pins how the model's reply becomes a main sense plus extras.
+// With several senses the main one KEEPS its note — that note is what makes the
+// reminder question unambiguous; a lone sense needs none.
+func TestSplitSenses(t *testing.T) {
+	cases := []struct {
+		resp     string
+		tr, alts string
+	}{
+		{"寒(さむ)い (samui)", "寒(さむ)い (samui)", ""},
+		{"寒(さむ)い (samui) — о погоде\n冷(つめ)たい (tsumetai) — о предмете",
+			"寒(さむ)い (samui) — о погоде", "冷(つめ)たい (tsumetai) — о предмете"},
+		// a lone sense has nothing to disambiguate against — drop a stray note
+		{"寒(さむ)い (samui) — о погоде", "寒(さむ)い (samui)", ""},
+		// blank lines ignored, at most two alternatives kept
+		{"a — x\n\nb\nc\nd", "a — x", "b\nc"},
+		{"", "", ""},
+	}
+	for _, c := range cases {
+		tr, alts := splitSenses(c.resp)
+		if tr != c.tr || alts != c.alts {
+			t.Errorf("splitSenses(%q) = (%q, %q), want (%q, %q)", c.resp, tr, alts, c.tr, c.alts)
+		}
+	}
+
+	if got := senseNote("寒(さむ)い (samui) — о погоде"); got != "о погоде" {
+		t.Errorf("senseNote = %q, want «о погоде»", got)
+	}
+	if got := senseNote("屋根(やね) (yane)"); got != "" {
+		t.Errorf("senseNote without a note = %q, want empty", got)
+	}
+	// a note must never leak into the forms an answer is matched against, nor
+	// into what TTS reads aloud
+	if !matchesStoredEntry(storage.VocabEntry{Translation: "寒(さむ)い (samui) — о погоде"}, "さむい") {
+		t.Error("a noted sense must still match its kana reading")
+	}
+	if got := japaneseHeadword("寒(さむ)い (samui) — о погоде"); got != "寒い" {
+		t.Errorf("japaneseHeadword with a note = %q, want 寒い", got)
+	}
+}
+
+// TestReminderTaskCarriesStoredEntry — the judge must be told what the user's
+// dictionary says, otherwise it grades against its own idea of the best phrasing.
+func TestReminderTaskCarriesStoredEntry(t *testing.T) {
+	task := reminderTask("холодно", storage.VocabEntry{Translation: "寒(さむ)い (samui)"}, "さむい")
+	for _, must := range []string{"холодно", "さむい", "寒(さむ)い (samui)", "NEVER reject"} {
+		if !strings.Contains(task, must) {
+			t.Errorf("reminder task lacks %q", must)
+		}
+	}
+	if strings.Contains(reminderTask("холодно", storage.VocabEntry{}, "さむい"), "stored entry") {
+		t.Error("with no stored entry the task must not reference one")
+	}
+}
+
+// TestParseVerdict pins the judge protocol: verdict line, optional TAG line on
+// mistakes, then feedback; anything unrecognised is a retry so the user stays
+// in the stage.
+func TestParseVerdict(t *testing.T) {
+	cases := []struct {
+		resp string
+		want verdict
+		tag  string
+		fb   string
+	}{
+		{"VERDICT: ok\n\nОтлично, 屋根(やね) (yane)", verdictOK, "", "Отлично, 屋根(やね) (yane)"},
+		{"VERDICT: retry\nTAG: particle\n\nЧастица は вместо が.", verdictRetry, "particle", "Частица は вместо が."},
+		{"VERDICT: retry\n\nTag: Verb-Form\nне та форма", verdictRetry, "verb-form", "не та форма"}, // blank line + odd case tolerated
+		{"VERDICT: retry\nTAG: something-new\n\nx", verdictRetry, "other", "x"},                     // unknown bucket → other
+		{"VERDICT: retry\n\nЧастица は вместо が.", verdictRetry, "", "Частица は вместо が."},          // no TAG line at all
+		{"VERDICT: ok\nTAG: particle\nfine", verdictOK, "", "fine"},                                 // a bucket on ok is ignored
+		{"VERDICT: offtrack", verdictOffTrack, "", ""},
+		{"verdict: OK\nfine", verdictOK, "", "fine"},         // case-insensitive
+		{"  VERDICT: offtrack  \n", verdictOffTrack, "", ""}, // stray whitespace
+		{"Хм, сложно сказать", verdictRetry, "", ""},         // no verdict line → safe default
+		{"", verdictRetry, "", ""},
+	}
+	for _, c := range cases {
+		v, tag, fb := parseVerdict(c.resp)
+		if v != c.want || tag != c.tag || fb != c.fb {
+			t.Errorf("parseVerdict(%q) = (%v, %q, %q), want (%v, %q, %q)", c.resp, v, tag, fb, c.want, c.tag, c.fb)
+		}
+	}
+}
+
+// TestOfftrackAllowed guards the regression that threw out a correct romaji
+// answer: when Japanese is expected and the user wrote Japanese or Latin
+// letters, the judge must not be offered the "not an answer" option at all.
+func TestOfftrackAllowed(t *testing.T) {
+	cases := []struct {
+		expectJapanese bool
+		text           string
+		want           bool
+	}{
+		// reminder / compose: a Japanese or romaji answer is always an attempt
+		{true, "buruuberi", false}, // the bug: loose romaji of ブルーベリー
+		{true, "burūberī", false},
+		{true, "ブルーベリー", false},
+		{true, "私は学生です", false},
+		{true, "zzz qqq", false}, // typo-ridden romaji is still an attempt
+		// …but a Russian word there cannot be an answer, so let the judge say so
+		{true, "крыша", true},
+		{true, "а что это значит?", true},
+		{true, "", true},
+		// translate stage: a valid answer and a lookup word are both Russian
+		{false, "я студент", true},
+		{false, "крыша", true},
+		{false, "植物", true},
+	}
+	for _, c := range cases {
+		if got := offtrackAllowed(c.expectJapanese, c.text); got != c.want {
+			t.Errorf("offtrackAllowed(expectJapanese=%v, %q) = %v, want %v",
+				c.expectJapanese, c.text, got, c.want)
+		}
+	}
+}
+
+// TestLevelFromRate pins the difficulty dial: too little data stays easy,
+// then the recent first-try rate decides.
+func TestLevelFromRate(t *testing.T) {
+	cases := []struct{ ok, total, want int }{
+		{0, 0, 1}, {3, 3, 1}, // fewer than 4 attempts: not enough to judge
+		{4, 4, 3}, {8, 10, 3}, {10, 10, 3},
+		{5, 10, 2}, {7, 10, 2}, {2, 4, 2},
+		{4, 10, 1}, {0, 10, 1}, {1, 4, 1},
+	}
+	for _, c := range cases {
+		if got := levelFromRate(c.ok, c.total); got != c.want {
+			t.Errorf("levelFromRate(%d/%d) = %d, want %d", c.ok, c.total, got, c.want)
+		}
+	}
+}
+
+// TestBucketFocusCoversAllBuckets — every drillable bucket must tell the
+// generator what to exercise, or a targeted task would silently be ordinary.
+func TestBucketFocusCoversAllBuckets(t *testing.T) {
+	for tag := range errorTags {
+		if tag == "other" {
+			continue
+		}
+		if bucketFocus[tag] == "" {
+			t.Errorf("bucketFocus has no instruction for %q", tag)
+		}
+	}
+	p := composeTaskPrompt("яблоко", 3, "particle", []string{"を вместо が"})
+	for _, must := range []string{"яблоко", "REQUIRES", "を вместо が", "subordinate clause"} {
+		if !strings.Contains(p, must) {
+			t.Errorf("targeted level-3 prompt lacks %q", must)
+		}
+	}
+	if strings.Contains(composeTaskPrompt("яблоко", 1, "", nil), "REQUIRES") {
+		t.Error("an untargeted prompt must not carry a drill instruction")
+	}
+}
+
+// TestPluralRu covers the announcement wording for batch sizes.
+func TestPluralRu(t *testing.T) {
+	cases := map[int]string{
+		1: "слово", 2: "слова", 3: "слова", 4: "слова", 5: "слов", 9: "слов",
+		11: "слов", 12: "слов", 14: "слов", 21: "слово", 22: "слова", 25: "слов",
+		101: "слово", 111: "слов", 0: "слов",
+	}
+	for n, want := range cases {
+		if got := pluralRu(n, "слово", "слова", "слов"); got != want {
+			t.Errorf("pluralRu(%d) = %q, want %q", n, got, want)
+		}
+	}
+}
+
+// TestLapseStep — a wrong answer drops two steps (floor 1), not a full reset.
+func TestLapseStep(t *testing.T) {
+	cases := map[int]int{1: 1, 2: 1, 3: 1, 4: 2, 5: 3, 6: 4, 7: 5}
+	for step, want := range cases {
+		if got := lapseStep(step); got != want {
+			t.Errorf("lapseStep(%d) = %d, want %d", step, got, want)
+		}
+	}
+}
