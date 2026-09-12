@@ -23,6 +23,7 @@ func testDB(t *testing.T) *sql.DB {
 			user_id INTEGER NOT NULL,
 			word TEXT NOT NULL,
 			translation TEXT NOT NULL DEFAULT '',
+			alternatives TEXT NOT NULL DEFAULT '',
 			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 			UNIQUE(user_id, word)
 		)`,
@@ -68,6 +69,7 @@ func testDB(t *testing.T) *sql.DB {
 		`CREATE TABLE translation_cache (
 			word TEXT PRIMARY KEY,
 			translation TEXT NOT NULL,
+			alternatives TEXT NOT NULL DEFAULT '',
 			verified INTEGER NOT NULL DEFAULT 0,
 			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 		)`,
@@ -83,7 +85,7 @@ func TestGetWeakVocabWordPrefersLowestStep(t *testing.T) {
 	db := testDB(t)
 	const uid = 1
 	for _, w := range []string{"крыша", "дерево", "игра"} {
-		if err := SaveVocab(db, uid, w, ""); err != nil {
+		if err := SaveVocab(db, uid, w, "", ""); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -114,7 +116,7 @@ func TestGetWeakVocabWordPrefersLowestStep(t *testing.T) {
 func TestGetWeakVocabWordFallsBackToExcluded(t *testing.T) {
 	db := testDB(t)
 	const uid = 1
-	if err := SaveVocab(db, uid, "крыша", ""); err != nil {
+	if err := SaveVocab(db, uid, "крыша", "", ""); err != nil {
 		t.Fatal(err)
 	}
 	got, err := GetWeakVocabWord(db, uid, "крыша")
@@ -131,7 +133,7 @@ func TestGetVocabPage(t *testing.T) {
 	const uid = 1
 	// 12 words; same created_at second, so id must break the tie (newest first)
 	for i := 1; i <= 12; i++ {
-		if err := SaveVocab(db, uid, fmt.Sprintf("слово%02d", i), ""); err != nil {
+		if err := SaveVocab(db, uid, fmt.Sprintf("слово%02d", i), "", ""); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -165,7 +167,7 @@ func TestSearchVocab(t *testing.T) {
 	db := testDB(t)
 	const uid = 1
 	for _, w := range []string{"крыша", "дерево", "игра"} {
-		if err := SaveVocab(db, uid, w, ""); err != nil {
+		if err := SaveVocab(db, uid, w, "", ""); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -214,16 +216,16 @@ func TestBumpDailyUsage(t *testing.T) {
 
 func TestTranslationCache(t *testing.T) {
 	db := testDB(t)
-	if _, _, ok := GetCachedTranslation(db, "крыша"); ok {
+	if _, _, _, ok := GetCachedTranslation(db, "крыша"); ok {
 		t.Fatal("empty cache must miss")
 	}
-	SetCachedTranslation(db, "крыша", "屋根(やね) (yane)", false)
-	tr, verified, ok := GetCachedTranslation(db, "крыша")
+	SetCachedTranslation(db, "крыша", "屋根(やね) (yane)", "", false)
+	tr, _, verified, ok := GetCachedTranslation(db, "крыша")
 	if !ok || tr != "屋根(やね) (yane)" || verified {
 		t.Errorf("got (%q, verified=%v, ok=%v)", tr, verified, ok)
 	}
-	SetCachedTranslation(db, "крыша", "屋根(やね) (yane)", true) // later verified by Jisho
-	if _, verified, _ := GetCachedTranslation(db, "крыша"); !verified {
+	SetCachedTranslation(db, "крыша", "屋根(やね) (yane)", "", true) // later verified by Jisho
+	if _, _, verified, _ := GetCachedTranslation(db, "крыша"); !verified {
 		t.Error("cache must upgrade to verified")
 	}
 }
@@ -261,50 +263,79 @@ func TestDueReminderQueue(t *testing.T) {
 	ScheduleReminder(db, uid, "игра", 1, now.Add(time.Hour)) // not due yet
 	ScheduleReminder(db, 2, "чужое", 1, now.Add(-time.Hour)) // another user
 
-	n, err := CountDueReminders(db, uid, now)
+	n, err := CountDueReminders(db, uid, now, now)
 	if err != nil || n != 2 {
 		t.Fatalf("CountDueReminders = %d (err=%v), want 2 — future and other users excluded", n, err)
 	}
 
-	r, err := NextDueReminder(db, uid, now)
+	r, err := NextDueReminder(db, uid, now, now)
 	if err != nil || r.Word != "крыша" {
 		t.Fatalf("NextDueReminder = %+v (err=%v), want the most overdue word", r, err)
 	}
 
 	// working through the batch: answered words drop out of the queue
 	MarkReminderSent(db, r.ID)
-	if n, _ := CountDueReminders(db, uid, now); n != 1 {
+	if n, _ := CountDueReminders(db, uid, now, now); n != 1 {
 		t.Errorf("after answering one, %d left, want 1", n)
 	}
-	r, err = NextDueReminder(db, uid, now)
+	r, err = NextDueReminder(db, uid, now, now)
 	if err != nil || r.Word != "дерево" {
 		t.Fatalf("next word = %+v (err=%v), want дерево", r, err)
 	}
 	MarkReminderSent(db, r.ID)
-	if _, err := NextDueReminder(db, uid, now); err == nil {
+	if _, err := NextDueReminder(db, uid, now, now); err == nil {
 		t.Error("an empty queue must return an error so the session can close")
 	}
 }
 
-// TestDueRemindersSkipJustAnswered — a word answered wrongly lapses to a
-// 3-hour interval, which sits inside the 12-hour batch horizon; it must not be
-// asked again in the same sitting.
+// TestBatchNeverSkipsTheShortStep — a batch may gather long-interval words a
+// few hours early, but a freshly lapsed word on the 3-hour step must wait for
+// its exact time: that short step is the whole point of getting it wrong.
+func TestBatchNeverSkipsTheShortStep(t *testing.T) {
+	db := testDB(t)
+	const uid = 1
+	now := time.Now()
+	ScheduleReminder(db, uid, "холодно", 1, now.Add(3*time.Hour)) // the lapse — must NOT be pulled forward
+	ScheduleReminder(db, uid, "дерево", 2, now.Add(2*time.Hour))  // a day-interval word ripening today
+	ScheduleReminder(db, uid, "крыша", 4, now.Add(20*time.Hour))  // beyond the horizon
+	ScheduleReminder(db, uid, "окно", 1, now.Add(-time.Hour))     // genuinely overdue
+	horizon := now.Add(12 * time.Hour)
+
+	n, err := CountDueReminders(db, uid, now, horizon)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Errorf("batch size = %d, want 2 (overdue «окно» + day-interval «дерево»); "+
+			"the 3-hour lapse and the 20-hour word must stay out", n)
+	}
+	if r, _ := NextDueReminder(db, uid, now, horizon); r.Word != "окно" {
+		t.Errorf("next word = %q, want the overdue «окно»", r.Word)
+	}
+	// the lapsed word becomes available once its three hours are really up
+	if n, _ := CountDueReminders(db, uid, now, now.Add(4*time.Hour)); n != 2 {
+		t.Errorf("a step-1 word still must not be pulled early even with a wider horizon, got %d", n)
+	}
+}
+
+// TestDueRemindersSkipJustAnswered — nothing the user answered minutes ago
+// comes back in the same sitting, whatever its interval.
 func TestDueRemindersSkipJustAnswered(t *testing.T) {
 	db := testDB(t)
 	const uid = 1
 	now := time.Now()
-	ScheduleReminder(db, uid, "холодно", 1, now.Add(3*time.Hour)) // the lapse
-	ScheduleReminder(db, uid, "дерево", 1, now.Add(2*time.Hour))  // untouched word
+	ScheduleReminder(db, uid, "холодно", 2, now.Add(-time.Hour)) // overdue
+	ScheduleReminder(db, uid, "дерево", 2, now.Add(-time.Hour))
 	horizon := now.Add(12 * time.Hour)
 
-	if n, _ := CountDueReminders(db, uid, horizon); n != 2 {
-		t.Fatalf("before any answer both words are in the horizon, got %d", n)
+	if n, _ := CountDueReminders(db, uid, now, horizon); n != 2 {
+		t.Fatalf("both words start out due, got %d", n)
 	}
 	LogOutcome(db, uid, "reminder", "холодно", false, true, "word-choice", "x", "")
-	if n, _ := CountDueReminders(db, uid, horizon); n != 1 {
+	if n, _ := CountDueReminders(db, uid, now, horizon); n != 1 {
 		t.Errorf("the just-answered word must drop out, got %d", n)
 	}
-	if r, _ := NextDueReminder(db, uid, horizon); r.Word != "дерево" {
+	if r, _ := NextDueReminder(db, uid, now, horizon); r.Word != "дерево" {
 		t.Errorf("next word = %q, want дерево", r.Word)
 	}
 }
@@ -333,29 +364,30 @@ func TestMixedOffsetsAndHorizon(t *testing.T) {
 	         VALUES (?, 'мак', 1, '2026-09-11 10:00:00.000+05:00', 0)`, uid)
 	at0600 := time.Date(2026, 9, 11, 6, 0, 0, 0, time.UTC)
 
-	if n, _ := CountDueReminders(db, uid, at0600); n != 0 {
+	if n, _ := CountDueReminders(db, uid, at0600, at0600); n != 0 {
 		t.Fatalf("the bug: before normalization the +05:00 row must NOT compare as due, got %d", n)
 	}
 	fixed, err := NormalizeReminderTimes(db)
 	if err != nil || fixed != 1 {
 		t.Fatalf("NormalizeReminderTimes = %d, %v; want 1 row fixed", fixed, err)
 	}
-	if n, _ := CountDueReminders(db, uid, at0600); n != 1 {
+	if n, _ := CountDueReminders(db, uid, at0600, at0600); n != 1 {
 		t.Errorf("after normalization the 05:00 UTC row must be due at 06:00 UTC, got %d", n)
 	}
 	if again, _ := NormalizeReminderTimes(db); again != 0 {
 		t.Errorf("normalization must be idempotent, touched %d rows on second run", again)
 	}
 
-	// horizon: a word due in 2h is part of today's batch but not "due now"
-	ScheduleReminder(db, uid, "скоро", 1, at0600.Add(2*time.Hour))
-	if n, _ := CountDueReminders(db, uid, at0600); n != 1 {
+	// horizon: a day-interval word ripening in 2h joins today's batch but is
+	// not "due now"
+	ScheduleReminder(db, uid, "скоро", 2, at0600.Add(2*time.Hour))
+	if n, _ := CountDueReminders(db, uid, at0600, at0600); n != 1 {
 		t.Errorf("due-now count = %d, want 1", n)
 	}
-	if n, _ := CountDueReminders(db, uid, at0600.Add(12*time.Hour)); n != 2 {
+	if n, _ := CountDueReminders(db, uid, at0600, at0600.Add(12*time.Hour)); n != 2 {
 		t.Errorf("12h-window count = %d, want 2", n)
 	}
-	if r, _ := NextDueReminder(db, uid, at0600.Add(12*time.Hour)); r.Word != "мак" {
+	if r, _ := NextDueReminder(db, uid, at0600, at0600.Add(12*time.Hour)); r.Word != "мак" {
 		t.Errorf("batch must start with the earliest word, got %q", r.Word)
 	}
 }
@@ -377,8 +409,8 @@ func TestAttemptsResetPerTask(t *testing.T) {
 func TestOutcomesAndStats(t *testing.T) {
 	db := testDB(t)
 	const uid = 1
-	SaveVocab(db, uid, "крыша", "")
-	SaveVocab(db, uid, "дерево", "")
+	SaveVocab(db, uid, "крыша", "", "")
+	SaveVocab(db, uid, "дерево", "", "")
 	now := time.Now()
 	ScheduleReminder(db, uid, "крыша", 4, now.Add(30*24*time.Hour)) // long interval → "learned"
 	ScheduleReminder(db, uid, "дерево", 2, now.Add(24*time.Hour))
@@ -512,7 +544,7 @@ func TestWeakestBucketThresholdAndPayDown(t *testing.T) {
 
 func TestFindVocabAndGetVocabEntry(t *testing.T) {
 	db := testDB(t)
-	if err := SaveVocab(db, 1, "крыша", "屋根(やね) (yane)"); err != nil {
+	if err := SaveVocab(db, 1, "крыша", "屋根(やね) (yane)", ""); err != nil {
 		t.Fatal(err)
 	}
 	e, err := FindVocab(db, 1, "крыша")
@@ -530,7 +562,7 @@ func TestFindVocabAndGetVocabEntry(t *testing.T) {
 
 func TestBackupDBWritesReadableSnapshot(t *testing.T) {
 	db := testDB(t)
-	if err := SaveVocab(db, 1, "крыша", "屋根(やね) (yane)"); err != nil {
+	if err := SaveVocab(db, 1, "крыша", "屋根(やね) (yane)", ""); err != nil {
 		t.Fatal(err)
 	}
 	dir := t.TempDir()

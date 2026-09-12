@@ -130,26 +130,43 @@ func SetLastReminderAt(db *sql.DB, userID int, at time.Time) error {
 
 // --- Vocabulary ---
 
-// VocabEntry is one saved word together with its Japanese translation/reading.
+// VocabEntry is one saved word with its Japanese translation and, when the
+// Russian word splits by context, the other senses.
 type VocabEntry struct {
 	ID          int
 	Word        string
-	Translation string // e.g. "植物(しょくぶつ) (shokubutsu)"; may be "" for legacy rows
+	Translation string // main sense, e.g. "寒(さむ)い (samui)"; may be "" for legacy rows
+	// Alternatives holds the other senses, one per line, each
+	// "japanese(reading) (romaji) — когда так говорят". Empty for most words.
+	Alternatives string
 }
 
-// SaveVocab stores the word with its translation. If the word already exists,
-// its translation is refreshed.
-func SaveVocab(db *sql.DB, userID int, word, translation string) error {
+// SenseLines is the translation plus every alternative sense, as separate lines.
+func (e VocabEntry) SenseLines() []string {
+	var out []string
+	for _, l := range append([]string{e.Translation}, strings.Split(e.Alternatives, "\n")...) {
+		if l = strings.TrimSpace(l); l != "" {
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
+// SaveVocab stores the word with its senses. If the word already exists, they
+// are refreshed.
+func SaveVocab(db *sql.DB, userID int, word, translation, alternatives string) error {
 	_, err := db.Exec(`
-		INSERT INTO vocab (user_id, word, translation) VALUES (?, ?, ?)
-		ON CONFLICT(user_id, word) DO UPDATE SET translation=excluded.translation
-	`, userID, word, translation)
+		INSERT INTO vocab (user_id, word, translation, alternatives) VALUES (?, ?, ?, ?)
+		ON CONFLICT(user_id, word) DO UPDATE SET
+			translation=excluded.translation, alternatives=excluded.alternatives
+	`, userID, word, translation, alternatives)
 	return err
 }
 
-// SetVocabTranslation backfills the translation for an already-saved word.
-func SetVocabTranslation(db *sql.DB, userID int, word, translation string) error {
-	_, err := db.Exec(`UPDATE vocab SET translation=? WHERE user_id=? AND word=?`, translation, userID, word)
+// SetVocabSenses backfills the senses of an already-saved word.
+func SetVocabSenses(db *sql.DB, userID int, word, translation, alternatives string) error {
+	_, err := db.Exec(`UPDATE vocab SET translation=?, alternatives=? WHERE user_id=? AND word=?`,
+		translation, alternatives, userID, word)
 	return err
 }
 
@@ -161,7 +178,7 @@ func GetVocabPage(db *sql.DB, userID, offset, limit int) (int, []VocabEntry, err
 		return 0, nil, err
 	}
 	rows, err := db.Query(
-		`SELECT id, word, translation FROM vocab WHERE user_id=?
+		`SELECT id, word, translation, alternatives FROM vocab WHERE user_id=?
 		 ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?`,
 		userID, limit, offset,
 	)
@@ -177,7 +194,7 @@ func GetVocabPage(db *sql.DB, userID, offset, limit int) (int, []VocabEntry, err
 // lowercase, so pass q lowercased), newest first, capped at limit.
 func SearchVocab(db *sql.DB, userID int, q string, limit int) ([]VocabEntry, error) {
 	rows, err := db.Query(
-		`SELECT id, word, translation FROM vocab WHERE user_id=? AND instr(word, ?) > 0
+		`SELECT id, word, translation, alternatives FROM vocab WHERE user_id=? AND instr(word, ?) > 0
 		 ORDER BY created_at DESC, id DESC LIMIT ?`,
 		userID, q, limit,
 	)
@@ -192,7 +209,7 @@ func scanVocab(rows *sql.Rows) ([]VocabEntry, error) {
 	var entries []VocabEntry
 	for rows.Next() {
 		var e VocabEntry
-		if err := rows.Scan(&e.ID, &e.Word, &e.Translation); err != nil {
+		if err := rows.Scan(&e.ID, &e.Word, &e.Translation, &e.Alternatives); err != nil {
 			return nil, err
 		}
 		entries = append(entries, e)
@@ -203,16 +220,16 @@ func scanVocab(rows *sql.Rows) ([]VocabEntry, error) {
 // FindVocab returns the user's saved entry for a word.
 func FindVocab(db *sql.DB, userID int, word string) (VocabEntry, error) {
 	var e VocabEntry
-	err := db.QueryRow(`SELECT id, word, translation FROM vocab WHERE user_id=? AND word=?`, userID, word).
-		Scan(&e.ID, &e.Word, &e.Translation)
+	err := db.QueryRow(`SELECT id, word, translation, alternatives FROM vocab WHERE user_id=? AND word=?`, userID, word).
+		Scan(&e.ID, &e.Word, &e.Translation, &e.Alternatives)
 	return e, err
 }
 
 // GetVocabEntry returns one saved entry by id, scoped to the user.
 func GetVocabEntry(db *sql.DB, userID, id int) (VocabEntry, error) {
 	var e VocabEntry
-	err := db.QueryRow(`SELECT id, word, translation FROM vocab WHERE user_id=? AND id=?`, userID, id).
-		Scan(&e.ID, &e.Word, &e.Translation)
+	err := db.QueryRow(`SELECT id, word, translation, alternatives FROM vocab WHERE user_id=? AND id=?`, userID, id).
+		Scan(&e.ID, &e.Word, &e.Translation, &e.Alternatives)
 	return e, err
 }
 
@@ -309,21 +326,31 @@ const justAnswered = ` AND NOT EXISTS (
 		SELECT 1 FROM outcomes o WHERE o.user_id = r.user_id AND o.word = r.word
 		  AND o.created_at >= datetime('now', '-30 minutes'))`
 
-// CountDueReminders is how many unsent words come due by the given moment —
-// pass time.Now() for "due right now", or a later horizon for "due today".
-func CountDueReminders(db *sql.DB, userID int, by time.Time) (int, error) {
+// dueWindow decides which words a batch may pull forward. A word is in scope if
+// it is genuinely due now, or — only on a long interval (step 2+, a day or
+// more) — if it ripens before the horizon, so a day's worth can be gathered into
+// one sitting. A freshly lapsed word sits on the short 3-hour step precisely so
+// the user meets it again soon but not immediately; pulling that forward would
+// erase the step, so short intervals always wait for their exact time.
+const dueWindow = ` AND (r.send_at <= ? OR (r.step >= 2 AND r.send_at <= ?))`
+
+// CountDueReminders is how many words are waiting for this user as of now: those
+// already due, plus long-interval words ripening before horizon that a batch may
+// gather early. Pass horizon == now for "strictly due now".
+func CountDueReminders(db *sql.DB, userID int, now, horizon time.Time) (int, error) {
 	var n int
-	err := db.QueryRow(`SELECT COUNT(*) FROM reminders r WHERE r.user_id=? AND r.sent=0 AND r.send_at<=?`+justAnswered,
-		userID, by.UTC()).Scan(&n)
+	err := db.QueryRow(`SELECT COUNT(*) FROM reminders r WHERE r.user_id=? AND r.sent=0`+dueWindow+justAnswered,
+		userID, now.UTC(), horizon.UTC()).Scan(&n)
 	return n, err
 }
 
-// NextDueReminder returns the earliest unsent word due by the given moment.
-func NextDueReminder(db *sql.DB, userID int, by time.Time) (DueReminder, error) {
+// NextDueReminder returns the longest-overdue word in that same scope.
+func NextDueReminder(db *sql.DB, userID int, now, horizon time.Time) (DueReminder, error) {
 	var r DueReminder
 	err := db.QueryRow(
-		`SELECT r.id, r.user_id, r.word, r.step FROM reminders r WHERE r.user_id=? AND r.sent=0 AND r.send_at<=?`+
-			justAnswered+` ORDER BY r.send_at ASC, r.id ASC LIMIT 1`, userID, by.UTC()).
+		`SELECT r.id, r.user_id, r.word, r.step FROM reminders r WHERE r.user_id=? AND r.sent=0`+
+			dueWindow+justAnswered+` ORDER BY r.send_at ASC, r.id ASC LIMIT 1`,
+		userID, now.UTC(), horizon.UTC()).
 		Scan(&r.ID, &r.UserID, &r.Word, &r.Step)
 	return r, err
 }
@@ -393,24 +420,25 @@ func BumpDailyUsage(db *sql.DB, userID int, day string) (int, error) {
 // A word's Japanese translation doesn't depend on the user, so it is cached
 // globally: saving or backfilling the same word twice never pays for Claude twice.
 
-func GetCachedTranslation(db *sql.DB, word string) (translation string, verified, ok bool) {
+func GetCachedTranslation(db *sql.DB, word string) (translation, alternatives string, verified, ok bool) {
 	var v int
-	if err := db.QueryRow(`SELECT translation, verified FROM translation_cache WHERE word=?`, word).
-		Scan(&translation, &v); err != nil {
-		return "", false, false
+	if err := db.QueryRow(`SELECT translation, alternatives, verified FROM translation_cache WHERE word=?`, word).
+		Scan(&translation, &alternatives, &v); err != nil {
+		return "", "", false, false
 	}
-	return translation, v == 1, true
+	return translation, alternatives, v == 1, true
 }
 
-func SetCachedTranslation(db *sql.DB, word, translation string, verified bool) error {
+func SetCachedTranslation(db *sql.DB, word, translation, alternatives string, verified bool) error {
 	v := 0
 	if verified {
 		v = 1
 	}
 	_, err := db.Exec(`
-		INSERT INTO translation_cache (word, translation, verified) VALUES (?, ?, ?)
-		ON CONFLICT(word) DO UPDATE SET translation=excluded.translation, verified=excluded.verified
-	`, word, translation, v)
+		INSERT INTO translation_cache (word, translation, alternatives, verified) VALUES (?, ?, ?, ?)
+		ON CONFLICT(word) DO UPDATE SET translation=excluded.translation,
+			alternatives=excluded.alternatives, verified=excluded.verified
+	`, word, translation, alternatives, v)
 	return err
 }
 

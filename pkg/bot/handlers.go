@@ -333,9 +333,9 @@ func backfillTranslations(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, ch
 		if entries[i].Translation != "" {
 			continue
 		}
-		if tr, _ := translateWord(clients, db, entries[i].Word); tr != "" {
-			storage.SetVocabTranslation(db, userID, entries[i].Word, tr)
-			entries[i].Translation = tr
+		if tr, alts, _ := translateWord(clients, db, entries[i].Word); tr != "" {
+			storage.SetVocabSenses(db, userID, entries[i].Word, tr, alts)
+			entries[i].Translation, entries[i].Alternatives = tr, alts
 		}
 	}
 	deleteMsg(bot, chatID, think)
@@ -346,6 +346,12 @@ func vocabLine(sb *strings.Builder, n int, e storage.VocabEntry) {
 		fmt.Fprintf(sb, "%d. %s — %s\n", n, e.Word, e.Translation)
 	} else {
 		fmt.Fprintf(sb, "%d. %s\n", n, e.Word)
+	}
+	// other senses of the same Russian word, indented under it
+	for _, alt := range strings.Split(e.Alternatives, "\n") {
+		if alt = strings.TrimSpace(alt); alt != "" {
+			fmt.Fprintf(sb, "    ещё: %s\n", alt)
+		}
 	}
 }
 
@@ -563,9 +569,9 @@ func handleAwaitWord(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, message
 		send(bot, chatID, "Нужно одно слово, без лишнего. Попробуй ещё раз.")
 		return
 	}
-	translation, verified := translateWord(clients, db, word)
+	translation, alternatives, verified := translateWord(clients, db, word)
 	deleteMsg(bot, chatID, think)
-	askSaveConfirmation(bot, db, chatID, userID, word, translation, verified)
+	askSaveConfirmation(bot, db, chatID, userID, word, translation, alternatives, verified)
 }
 
 // handleAskFollowup answers the next question typed in /ask mode and keeps the
@@ -734,32 +740,61 @@ func resolveHeadword(clients *Clients, raw string) string {
 // the reading. Results are cached globally (a word's translation doesn't depend
 // on the user); an unverified cached line is re-checked against Jisho on the
 // next hit, so a temporary Jisho outage never sticks.
-func translateWord(clients *Clients, db *sql.DB, word string) (string, bool) {
-	if tr, verified, ok := storage.GetCachedTranslation(db, word); ok {
-		if !verified {
-			if fixed, v := verifyWithJisho(clients, tr); v {
-				storage.SetCachedTranslation(db, word, fixed, true)
-				return fixed, true
+func translateWord(clients *Clients, db *sql.DB, word string) (translation, alternatives string, verified bool) {
+	if tr, alts, v, ok := storage.GetCachedTranslation(db, word); ok {
+		if !v {
+			if fixed, okJisho := verifyWithJisho(clients, tr); okJisho {
+				storage.SetCachedTranslation(db, word, fixed, alts, true)
+				return fixed, alts, true
 			}
 		}
-		return tr, verified
+		return tr, alts, v
 	}
-	sys := "Translate the single Russian word «" + word + "» into Japanese. " +
-		"Reply with EXACTLY one line and nothing else: the Japanese word with every kanji immediately " +
-		"followed by its hiragana reading in round brackets, then one space, then the full romaji in round brackets. " +
-		"No Russian, no explanation, no example. Example for «растение»: 植物(しょくぶつ) (shokubutsu)"
+	sys := "Translate the single Russian word «" + word + "» into Japanese.\n" +
+		"Line 1: the main Japanese word — every kanji immediately followed by its hiragana reading in round " +
+		"brackets, then one space, then the full romaji in round brackets. Nothing else on line 1. " +
+		"Example for «растение»: 植物(しょくぶつ) (shokubutsu)\n" +
+		"Then, ONLY IF the Russian word really maps to different Japanese words depending on context, add up to 2 " +
+		"more lines in that same format, each followed by ' — ' and a SHORT Russian note saying when that one is " +
+		"used. Example for «холодно»: 冷(つめ)たい (tsumetai) — о предмете на ощупь\n" +
+		"If one Japanese word covers the ordinary meaning, output line 1 only. Never invent variants, never repeat " +
+		"the same word twice, no other text."
 	resp, err := claudeOne(clients, sys, word)
 	if err != nil {
 		log.Printf("translateWord error: %v", err)
-		return "", false
+		return "", "", false
 	}
-	tr := firstLine(resp)
-	if tr == "" {
-		return "", false
+	translation, alternatives = splitSenses(resp)
+	if translation == "" {
+		return "", "", false
 	}
-	tr, verified := verifyWithJisho(clients, tr)
-	storage.SetCachedTranslation(db, word, tr, verified)
-	return tr, verified
+	translation, verified = verifyWithJisho(clients, translation)
+	storage.SetCachedTranslation(db, word, translation, alternatives, verified)
+	return translation, alternatives, verified
+}
+
+// splitSenses takes the model's reply apart: the first line is the main sense
+// (any usage note stripped — that belongs to alternatives only), the remaining
+// lines are the other senses, at most two.
+func splitSenses(resp string) (translation, alternatives string) {
+	var lines []string
+	for _, l := range strings.Split(resp, "\n") {
+		if l = strings.TrimSpace(l); l != "" {
+			lines = append(lines, l)
+		}
+	}
+	if len(lines) == 0 {
+		return "", ""
+	}
+	translation = lines[0]
+	if i := strings.Index(translation, " — "); i >= 0 {
+		translation = strings.TrimSpace(translation[:i])
+	}
+	rest := lines[1:]
+	if len(rest) > 2 {
+		rest = rest[:2]
+	}
+	return translation, strings.Join(rest, "\n")
 }
 
 // kanjiReadingRe matches one kanji run with its bracketed reading: 遊(あそ).
@@ -836,14 +871,19 @@ func firstLine(s string) string {
 	return ""
 }
 
-// askSaveConfirmation puts the user in the confirm step (with the translation
-// already shown) instead of saving blindly. The translation is stashed in
-// task_text so "Да" can persist it without a second API call.
-func askSaveConfirmation(bot *tgbotapi.BotAPI, db *sql.DB, chatID int64, userID int, word, translation string, verified bool) {
-	storage.SetState(db, userID, modeConfirmSave, word, translation, 0)
+// askSaveConfirmation puts the user in the confirm step (with the senses already
+// shown) instead of saving blindly. The senses are stashed in task_text — main
+// sense on the first line — so "Да" can persist them without a second API call.
+func askSaveConfirmation(bot *tgbotapi.BotAPI, db *sql.DB, chatID int64, userID int, word, translation, alternatives string, verified bool) {
+	storage.SetState(db, userID, modeConfirmSave, word, strings.TrimRight(translation+"\n"+alternatives, "\n"), 0)
 	msg := fmt.Sprintf("Запомнить слово «%s»?", word)
 	if translation != "" {
 		msg = fmt.Sprintf("Запомнить слово «%s» — %s?", word, translation)
+		for _, alt := range strings.Split(alternatives, "\n") {
+			if alt = strings.TrimSpace(alt); alt != "" {
+				msg += "\nещё: " + alt
+			}
+		}
 		if verified {
 			msg += "\n(чтение сверено с Jisho)"
 		}
@@ -1403,20 +1443,17 @@ func checkReminder(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, message *
 		word, step = w, s
 	}
 
-	translation := ""
-	if e, err := storage.FindVocab(db, userID, word); err == nil {
-		translation = e.Translation
-	}
+	entry, _ := storage.FindVocab(db, userID, word)
 
 	var v verdict
 	var tag, fb string
-	if matchesStoredEntry(translation, message.Text) {
-		// the user recalled their own dictionary entry verbatim — there is
+	if matchesStoredEntry(entry, message.Text) {
+		// the user recalled one of their own saved senses verbatim — there is
 		// nothing for the model to second-guess, and nothing to pay for
-		v, fb = verdictOK, translation
+		v, fb = verdictOK, strings.Join(entry.SenseLines(), "\n")
 	} else {
 		think := sendThinking(bot, chatID)
-		v, tag, fb = judgeAnswer(clients, reminderTask(word, translation, message.Text), message.Text, true)
+		v, tag, fb = judgeAnswer(clients, reminderTask(word, entry, message.Text), message.Text, true)
 		deleteMsg(bot, chatID, think)
 	}
 
@@ -1453,20 +1490,33 @@ func checkReminder(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, message *
 	}
 }
 
-// matchesStoredEntry reports whether the answer is literally the user's stored
-// dictionary entry — its written form, its kana reading, or its romaji.
-func matchesStoredEntry(translation, answer string) bool {
+// matchesStoredEntry reports whether the answer is literally one of the senses
+// saved for this word — any of them, written in kanji, kana or romaji. A word
+// with several senses («холодно» → 寒い for weather, 冷たい to the touch) accepts
+// every sense the user saved: the reminder asks them to recall their own entry.
+func matchesStoredEntry(entry storage.VocabEntry, answer string) bool {
 	a := normalizeAnswer(answer)
-	if a == "" || translation == "" {
+	if a == "" {
 		return false
 	}
-	written, reading := splitHeadword(translation)
-	for _, want := range []string{written, reading, romajiOf(translation)} {
-		if want != "" && normalizeAnswer(want) == a {
-			return true
+	for _, sense := range entry.SenseLines() {
+		for _, form := range entryForms(sense) {
+			if form != "" && normalizeAnswer(form) == a {
+				return true
+			}
 		}
 	}
 	return false
+}
+
+// entryForms lists every way one dictionary line could be written: the written
+// form, the kana reading, and the romaji. The trailing usage note is dropped.
+func entryForms(sense string) []string {
+	if i := strings.Index(sense, " — "); i >= 0 {
+		sense = strings.TrimSpace(sense[:i])
+	}
+	written, reading := splitHeadword(sense)
+	return []string{written, reading, romajiOf(sense)}
 }
 
 func normalizeAnswer(s string) string {
@@ -1484,17 +1534,17 @@ func romajiOf(translation string) string {
 }
 
 // reminderTask frames the SRS question for the judge. The stored vocabulary
-// entry is handed over as the expected answer: without it the judge graded
+// senses are handed over as the expected answers: without them the judge graded
 // against its own notion of the most idiomatic phrasing and rejected «さむい»
 // for «холодно» while admitting in the same breath that it was acceptable.
-func reminderTask(word, translation, answer string) string {
+func reminderTask(word string, entry storage.VocabEntry, answer string) string {
 	t := "How do you say the word «" + word + "» in Japanese? User's answer: " + answer
-	if translation != "" {
-		t += "\n\nThe user's own vocabulary stores this word as: " + translation +
-			"\nTreat that stored entry as the expected answer: accept it in any script (kanji, kana or romaji), " +
-			"in plain or polite form, and also accept any other word a native speaker would use for «" + word + "». " +
-			"NEVER reject an answer over register, politeness or fine nuance when it is the stored entry — the user is " +
-			"recalling their own dictionary, not picking the most idiomatic phrasing."
+	if senses := entry.SenseLines(); len(senses) > 0 {
+		t += "\n\nThe user's own vocabulary stores this word as:\n- " + strings.Join(senses, "\n- ") +
+			"\nEVERY one of those senses is an expected answer — accept any of them, in any script (kanji, kana or " +
+			"romaji) and in plain or polite form, and also accept any other word a native speaker would use for «" +
+			word + "». NEVER reject an answer over register, politeness or fine nuance when it is one of the stored " +
+			"senses — the user is recalling their own dictionary, not picking the most idiomatic phrasing."
 	}
 	return t
 }
@@ -1574,7 +1624,8 @@ func pluralRu(n int, one, few, many string) string {
 // just asks the first word, as before.
 func StartReminderRound(bot *tgbotapi.BotAPI, db *sql.DB, userID int) {
 	storage.SetLastReminderAt(db, userID, time.Now())
-	n, err := storage.CountDueReminders(db, userID, time.Now().Add(srsSessionWindow))
+	now := time.Now()
+	n, err := storage.CountDueReminders(db, userID, now, now.Add(srsSessionWindow))
 	if err != nil || n == 0 {
 		return
 	}
@@ -1590,11 +1641,12 @@ func StartReminderRound(bot *tgbotapi.BotAPI, db *sql.DB, userID int) {
 // sendNextDueReminder asks the next due word, reporting how many are left when
 // working through a batch. Returns false when nothing is due any more.
 func sendNextDueReminder(bot *tgbotapi.BotAPI, db *sql.DB, userID int, session bool) bool {
-	horizon := time.Now() // a lone reminder waits for its exact time…
+	now := time.Now()
+	horizon := now // a lone reminder waits for its exact time…
 	if session {
-		horizon = horizon.Add(srsSessionWindow) // …a batch takes the whole day's worth
+		horizon = now.Add(srsSessionWindow) // …a batch gathers the day's long-interval words
 	}
-	r, err := storage.NextDueReminder(db, userID, horizon)
+	r, err := storage.NextDueReminder(db, userID, now, horizon)
 	if err != nil {
 		return false
 	}
@@ -1608,7 +1660,7 @@ func sendNextDueReminder(bot *tgbotapi.BotAPI, db *sql.DB, userID int, session b
 
 	text := fmt.Sprintf("Повторение!\nКак будет «%s» по-японски? Напиши свой вариант.", r.Word)
 	if session {
-		if left, err := storage.CountDueReminders(db, userID, horizon); err == nil && left > 0 {
+		if left, err := storage.CountDueReminders(db, userID, now, horizon); err == nil && left > 0 {
 			text += fmt.Sprintf("\n\nПосле этого останется ещё %d.", left)
 		}
 	}
@@ -1618,7 +1670,8 @@ func sendNextDueReminder(bot *tgbotapi.BotAPI, db *sql.DB, userID int, session b
 
 // srsWordsLeft is how many words the current batch still has waiting.
 func srsWordsLeft(db *sql.DB, userID int) int {
-	n, err := storage.CountDueReminders(db, userID, time.Now().Add(srsSessionWindow))
+	now := time.Now()
+	n, err := storage.CountDueReminders(db, userID, now, now.Add(srsSessionWindow))
 	if err != nil {
 		log.Printf("srs words left: %v", err)
 		return 0
@@ -1669,9 +1722,9 @@ func HandleCallbackQuery(bot *tgbotapi.BotAPI, clients *Clients, callbackQuery *
 			send(bot, chatID, "Не понял, какое слово запомнить. Напиши его одним словом.")
 			return
 		}
-		translation, verified := translateWord(clients, db, word)
+		translation, alternatives, verified := translateWord(clients, db, word)
 		deleteMsg(bot, chatID, think)
-		askSaveConfirmation(bot, db, chatID, userID, word, translation, verified)
+		askSaveConfirmation(bot, db, chatID, userID, word, translation, alternatives, verified)
 
 	case data == "save_yes":
 		st := storage.GetState(db, userID)
@@ -1684,8 +1737,8 @@ func HandleCallbackQuery(bot *tgbotapi.BotAPI, clients *Clients, callbackQuery *
 			send(bot, chatID, "Не понял, какое слово сохранить. Напиши слово ещё раз.")
 			return
 		}
-		translation := st.TaskText // stashed by askSaveConfirmation
-		storage.SaveVocab(db, userID, word, translation)
+		translation, alternatives := splitSenses(st.TaskText) // stashed by askSaveConfirmation
+		storage.SaveVocab(db, userID, word, translation, alternatives)
 		if !storage.HasPendingReminder(db, userID, word) {
 			storage.ScheduleReminder(db, userID, word, 1, time.Now().Add(intervalFor(1)))
 		}
@@ -1693,6 +1746,11 @@ func HandleCallbackQuery(bot *tgbotapi.BotAPI, clients *Clients, callbackQuery *
 		msg := fmt.Sprintf("Добавил «%s» в словарь. Напомню по расписанию.", word)
 		if translation != "" {
 			msg = fmt.Sprintf("Добавил «%s» — %s в словарь. Напомню по расписанию.", word, translation)
+			for _, alt := range strings.Split(alternatives, "\n") {
+				if alt = strings.TrimSpace(alt); alt != "" {
+					msg += "\nещё: " + alt
+				}
+			}
 		}
 		if e, err := storage.FindVocab(db, userID, word); err == nil && japaneseHeadword(e.Translation) != "" {
 			sendKb(bot, chatID, msg, playKeyboard(e.ID))

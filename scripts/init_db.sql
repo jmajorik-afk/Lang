@@ -10,7 +10,8 @@ CREATE TABLE IF NOT EXISTS vocab (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL,
     word TEXT NOT NULL,
-    translation TEXT NOT NULL DEFAULT '', -- Japanese: "kanji(чтение) (romaji)"
+    translation TEXT NOT NULL DEFAULT '', -- main sense, "kanji(чтение) (romaji)"
+    alternatives TEXT NOT NULL DEFAULT '', -- other senses, one per line, each with a usage note
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(user_id, word)
 );
@@ -63,6 +64,7 @@ CREATE TABLE IF NOT EXISTS api_usage (
 CREATE TABLE IF NOT EXISTS translation_cache (
     word TEXT PRIMARY KEY,
     translation TEXT NOT NULL,
+    alternatives TEXT NOT NULL DEFAULT '',
     verified INTEGER NOT NULL DEFAULT 0,    -- 1 = reading confirmed by Jisho
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );

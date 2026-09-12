@@ -4,6 +4,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"language-learning-bot/pkg/storage"
 )
 
 // TestSanitizeWord covers the junk that actually made it into the vocabulary
@@ -116,8 +118,14 @@ func TestSplitHeadword(t *testing.T) {
 // judge still rejected it. An answer matching the stored entry in any script is
 // accepted without asking the model at all.
 func TestMatchesStoredEntry(t *testing.T) {
-	const cold = "寒(さむ)い (samui)"
-	accept := []string{"寒い", "さむい", "samui", " Samui ", "SAMUI", "さむい。", "寒い!"}
+	cold := storage.VocabEntry{
+		Word:         "холодно",
+		Translation:  "寒(さむ)い (samui)",
+		Alternatives: "冷(つめ)たい (tsumetai) — о предмете на ощупь",
+	}
+	// every sense counts, in every script — including the alternative one
+	accept := []string{"寒い", "さむい", "samui", " Samui ", "SAMUI", "さむい。", "寒い!",
+		"冷たい", "つめたい", "tsumetai"}
 	for _, a := range accept {
 		if !matchesStoredEntry(cold, a) {
 			t.Errorf("matchesStoredEntry(%q) = false, want true", a)
@@ -125,38 +133,68 @@ func TestMatchesStoredEntry(t *testing.T) {
 	}
 	// «самуи» in Cyrillic is not romaji — it falls through to the judge, which
 	// may still accept it; only an exact script match short-circuits.
-	reject := []string{"", "冷たい", "tsumetai", "寒", "холодно", "atsui", "самуи"}
+	reject := []string{"", "寒", "холодно", "atsui", "самуи", "あつい"}
 	for _, a := range reject {
 		if matchesStoredEntry(cold, a) {
 			t.Errorf("matchesStoredEntry(%q) = true, want false (must fall through to the judge)", a)
 		}
 	}
-	// kana-only entry, and no entry at all
-	if !matchesStoredEntry("ありがとう (arigatou)", "ありがとう") {
+	if !matchesStoredEntry(storage.VocabEntry{Translation: "ありがとう (arigatou)"}, "ありがとう") {
 		t.Error("kana-only entry must match its own form")
 	}
-	if matchesStoredEntry("", "さむい") {
+	if matchesStoredEntry(storage.VocabEntry{}, "さむい") {
 		t.Error("with no stored entry there is nothing to match against")
 	}
 
-	if got := romajiOf(cold); got != "samui" {
+	if got := romajiOf("寒(さむ)い (samui)"); got != "samui" {
 		t.Errorf("romajiOf = %q, want samui", got)
 	}
 	if got := romajiOf("屋根(やね)"); got != "やね" {
 		t.Errorf("romajiOf without a romaji group = %q, want the trailing group やね", got)
+	}
+	// a usage note must not leak into the matchable forms
+	forms := entryForms("冷(つめ)たい (tsumetai) — о предмете на ощупь")
+	want := map[string]bool{"冷たい": true, "つめたい": true, "tsumetai": true}
+	for _, f := range forms {
+		if f != "" && !want[f] {
+			t.Errorf("entryForms produced %q — the usage note leaked in", f)
+		}
+	}
+}
+
+// TestSplitSenses pins how the model's reply becomes a main sense plus extras.
+func TestSplitSenses(t *testing.T) {
+	cases := []struct {
+		resp     string
+		tr, alts string
+	}{
+		{"寒(さむ)い (samui)", "寒(さむ)い (samui)", ""},
+		{"寒(さむ)い (samui)\n冷(つめ)たい (tsumetai) — о предмете",
+			"寒(さむ)い (samui)", "冷(つめ)たい (tsumetai) — о предмете"},
+		// a note on line 1 belongs to alternatives only — strip it
+		{"寒(さむ)い (samui) — о погоде", "寒(さむ)い (samui)", ""},
+		// blank lines ignored, at most two alternatives kept
+		{"a\n\nb\nc\nd", "a", "b\nc"},
+		{"", "", ""},
+	}
+	for _, c := range cases {
+		tr, alts := splitSenses(c.resp)
+		if tr != c.tr || alts != c.alts {
+			t.Errorf("splitSenses(%q) = (%q, %q), want (%q, %q)", c.resp, tr, alts, c.tr, c.alts)
+		}
 	}
 }
 
 // TestReminderTaskCarriesStoredEntry — the judge must be told what the user's
 // dictionary says, otherwise it grades against its own idea of the best phrasing.
 func TestReminderTaskCarriesStoredEntry(t *testing.T) {
-	task := reminderTask("холодно", "寒(さむ)い (samui)", "さむい")
+	task := reminderTask("холодно", storage.VocabEntry{Translation: "寒(さむ)い (samui)"}, "さむい")
 	for _, must := range []string{"холодно", "さむい", "寒(さむ)い (samui)", "NEVER reject"} {
 		if !strings.Contains(task, must) {
 			t.Errorf("reminder task lacks %q", must)
 		}
 	}
-	if strings.Contains(reminderTask("холодно", "", "さむい"), "stored entry") {
+	if strings.Contains(reminderTask("холодно", storage.VocabEntry{}, "さむい"), "stored entry") {
 		t.Error("with no stored entry the task must not reference one")
 	}
 }
