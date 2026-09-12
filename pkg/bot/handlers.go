@@ -752,13 +752,16 @@ func translateWord(clients *Clients, db *sql.DB, word string) (translation, alte
 	}
 	sys := "Translate the single Russian word «" + word + "» into Japanese.\n" +
 		"Line 1: the main Japanese word — every kanji immediately followed by its hiragana reading in round " +
-		"brackets, then one space, then the full romaji in round brackets. Nothing else on line 1. " +
+		"brackets, then one space, then the full romaji in round brackets. " +
 		"Example for «растение»: 植物(しょくぶつ) (shokubutsu)\n" +
 		"Then, ONLY IF the Russian word really maps to different Japanese words depending on context, add up to 2 " +
-		"more lines in that same format, each followed by ' — ' and a SHORT Russian note saying when that one is " +
-		"used. Example for «холодно»: 冷(つめ)たい (tsumetai) — о предмете на ощупь\n" +
-		"If one Japanese word covers the ordinary meaning, output line 1 only. Never invent variants, never repeat " +
-		"the same word twice, no other text."
+		"more lines in that same format.\n" +
+		"If you add such lines, append ' — ' and a SHORT Russian note to EVERY line INCLUDING line 1, saying when " +
+		"that variant is used, so the variants can be told apart. Example for «холодно»:\n" +
+		"寒(さむ)い (samui) — о погоде, об ощущении холода\n" +
+		"冷(つめ)たい (tsumetai) — о предмете на ощупь\n" +
+		"If one Japanese word covers the ordinary meaning, output line 1 alone with no note. Never invent variants, " +
+		"never repeat the same word twice, no other text."
 	resp, err := claudeOne(clients, sys, word)
 	if err != nil {
 		log.Printf("translateWord error: %v", err)
@@ -773,9 +776,11 @@ func translateWord(clients *Clients, db *sql.DB, word string) (translation, alte
 	return translation, alternatives, verified
 }
 
-// splitSenses takes the model's reply apart: the first line is the main sense
-// (any usage note stripped — that belongs to alternatives only), the remaining
-// lines are the other senses, at most two.
+// splitSenses takes the model's reply apart: the first line is the main sense,
+// the rest are the other senses, at most two. When there are several senses the
+// main one keeps its usage note — that note is what makes the reminder question
+// unambiguous («Как будет «холодно» (о погоде)?»). A lone sense needs no note,
+// so one is stripped if the model added it anyway.
 func splitSenses(resp string) (translation, alternatives string) {
 	var lines []string
 	for _, l := range strings.Split(resp, "\n") {
@@ -786,15 +791,38 @@ func splitSenses(resp string) (translation, alternatives string) {
 	if len(lines) == 0 {
 		return "", ""
 	}
-	translation = lines[0]
-	if i := strings.Index(translation, " — "); i >= 0 {
-		translation = strings.TrimSpace(translation[:i])
-	}
-	rest := lines[1:]
+	translation, rest := lines[0], lines[1:]
 	if len(rest) > 2 {
 		rest = rest[:2]
 	}
+	if len(rest) == 0 {
+		if i := strings.Index(translation, " — "); i >= 0 {
+			translation = strings.TrimSpace(translation[:i])
+		}
+	}
 	return translation, strings.Join(rest, "\n")
+}
+
+// senseNote is the "when is this used" half of a sense line, or "" if it has none.
+func senseNote(sense string) string {
+	if i := strings.Index(sense, " — "); i >= 0 {
+		return strings.TrimSpace(sense[i+len(" — "):])
+	}
+	return ""
+}
+
+// reminderQuestion asks for ONE specific sense. When a word has several Japanese
+// translations the bare question «как будет холодно?» has more than one right
+// answer, so the saved sense's usage note goes into the question itself — the
+// user learns the distinction instead of guessing which word is wanted.
+func reminderQuestion(db *sql.DB, userID int, word string) string {
+	q := "Как будет «" + word + "»"
+	if e, err := storage.FindVocab(db, userID, word); err == nil {
+		if note := senseNote(e.Translation); note != "" {
+			q += " (" + note + ")"
+		}
+	}
+	return q + " по-японски?"
 }
 
 // kanjiReadingRe matches one kanji run with its bracketed reading: 遊(あそ).
@@ -1465,7 +1493,7 @@ func checkReminder(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, message *
 		// not an answer at all — don't lapse the word, just ask again; «Оспорить»
 		// is offered in case the classification itself was wrong
 		storage.SetLastAnswer(db, userID, message.Text)
-		sendKb(bot, chatID, fmt.Sprintf("Это не похоже на ответ. Как будет «%s» по-японски? Или нажми «Закончить».", word),
+		sendKb(bot, chatID, "Это не похоже на ответ. "+reminderQuestion(db, userID, word)+" Или нажми «Закончить».",
 			reminderContestKeyboard(st.ReminderID, st.TaskText == srsSessionFlag && srsWordsLeft(db, userID) > 0))
 		return
 	}
@@ -1658,7 +1686,7 @@ func sendNextDueReminder(bot *tgbotapi.BotAPI, db *sql.DB, userID int, session b
 	}
 	storage.SetState(db, userID, "reminder", r.Word, flag, r.ID)
 
-	text := fmt.Sprintf("Повторение!\nКак будет «%s» по-японски? Напиши свой вариант.", r.Word)
+	text := "Повторение!\n" + reminderQuestion(db, userID, r.Word) + " Напиши свой вариант."
 	if session {
 		if left, err := storage.CountDueReminders(db, userID, now, horizon); err == nil && left > 0 {
 			text += fmt.Sprintf("\n\nПосле этого останется ещё %d.", left)

@@ -163,18 +163,20 @@ func TestMatchesStoredEntry(t *testing.T) {
 }
 
 // TestSplitSenses pins how the model's reply becomes a main sense plus extras.
+// With several senses the main one KEEPS its note — that note is what makes the
+// reminder question unambiguous; a lone sense needs none.
 func TestSplitSenses(t *testing.T) {
 	cases := []struct {
 		resp     string
 		tr, alts string
 	}{
 		{"寒(さむ)い (samui)", "寒(さむ)い (samui)", ""},
-		{"寒(さむ)い (samui)\n冷(つめ)たい (tsumetai) — о предмете",
-			"寒(さむ)い (samui)", "冷(つめ)たい (tsumetai) — о предмете"},
-		// a note on line 1 belongs to alternatives only — strip it
+		{"寒(さむ)い (samui) — о погоде\n冷(つめ)たい (tsumetai) — о предмете",
+			"寒(さむ)い (samui) — о погоде", "冷(つめ)たい (tsumetai) — о предмете"},
+		// a lone sense has nothing to disambiguate against — drop a stray note
 		{"寒(さむ)い (samui) — о погоде", "寒(さむ)い (samui)", ""},
 		// blank lines ignored, at most two alternatives kept
-		{"a\n\nb\nc\nd", "a", "b\nc"},
+		{"a — x\n\nb\nc\nd", "a — x", "b\nc"},
 		{"", "", ""},
 	}
 	for _, c := range cases {
@@ -182,6 +184,21 @@ func TestSplitSenses(t *testing.T) {
 		if tr != c.tr || alts != c.alts {
 			t.Errorf("splitSenses(%q) = (%q, %q), want (%q, %q)", c.resp, tr, alts, c.tr, c.alts)
 		}
+	}
+
+	if got := senseNote("寒(さむ)い (samui) — о погоде"); got != "о погоде" {
+		t.Errorf("senseNote = %q, want «о погоде»", got)
+	}
+	if got := senseNote("屋根(やね) (yane)"); got != "" {
+		t.Errorf("senseNote without a note = %q, want empty", got)
+	}
+	// a note must never leak into the forms an answer is matched against, nor
+	// into what TTS reads aloud
+	if !matchesStoredEntry(storage.VocabEntry{Translation: "寒(さむ)い (samui) — о погоде"}, "さむい") {
+		t.Error("a noted sense must still match its kana reading")
+	}
+	if got := japaneseHeadword("寒(さむ)い (samui) — о погоде"); got != "寒い" {
+		t.Errorf("japaneseHeadword with a note = %q, want 寒い", got)
 	}
 }
 
