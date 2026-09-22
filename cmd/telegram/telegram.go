@@ -183,6 +183,14 @@ func scheduleReminders(db *sql.DB, tgbot *tgbotapi.BotAPI) {
 	ticker := time.NewTicker(1 * time.Minute)
 	go func() {
 		for range ticker.C {
+			// put back any word whose reminder was sent but never answered —
+			// without this it would never be asked again
+			if n, err := storage.RescheduleAbandoned(db, 6*time.Hour); err != nil {
+				log.Println("rescheduling abandoned words:", err)
+			} else if n > 0 {
+				log.Printf("put %d abandoned word(s) back into the rotation", n)
+			}
+
 			due, err := storage.GetDueReminders(db)
 			if err != nil {
 				log.Println("Error fetching reminders:", err)

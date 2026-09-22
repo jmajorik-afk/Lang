@@ -375,6 +375,34 @@ func GetDueReminders(db *sql.DB) ([]DueReminder, error) {
 	return out, nil
 }
 
+// RescheduleAbandoned re-queues saved words that have no reminder waiting for
+// them. A new reminder is only ever created when the previous one is answered,
+// so a question that was sent and then ignored — or overwritten by another —
+// took its word out of the rotation for good. Words whose last reminder is
+// newer than grace are left alone: that question may still be on screen.
+// Returns how many words were put back.
+func RescheduleAbandoned(db *sql.DB, grace time.Duration) (int64, error) {
+	now := time.Now().UTC()
+	res, err := db.Exec(`
+		INSERT INTO reminders (user_id, word, step, send_at, sent)
+		SELECT v.user_id, v.word,
+		       COALESCE((SELECT r.step FROM reminders r
+		                 WHERE r.user_id = v.user_id AND r.word = v.word
+		                 ORDER BY r.id DESC LIMIT 1), 1),
+		       ?, 0
+		FROM vocab v
+		WHERE NOT EXISTS (
+		        SELECT 1 FROM reminders p
+		        WHERE p.user_id = v.user_id AND p.word = v.word AND p.sent = 0)
+		  AND COALESCE((SELECT MAX(r.send_at) FROM reminders r
+		                WHERE r.user_id = v.user_id AND r.word = v.word), '') <= ?
+	`, now, now.Add(-grace))
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
 func MarkReminderSent(db *sql.DB, id int) error {
 	_, err := db.Exec(`UPDATE reminders SET sent=1 WHERE id=?`, id)
 	return err

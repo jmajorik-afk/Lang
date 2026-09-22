@@ -340,6 +340,55 @@ func TestDueRemindersSkipJustAnswered(t *testing.T) {
 	}
 }
 
+// TestRescheduleAbandoned — a reminder that was sent and never answered used to
+// take its word out of the rotation for good, because only an answer ever
+// creates the next one. Three real words («бутылка», «игра», «ребёнок») had
+// vanished that way.
+func TestRescheduleAbandoned(t *testing.T) {
+	db := testDB(t)
+	const uid = 1
+	now := time.Now()
+	for _, w := range []string{"бутылка", "окно", "игра", "новое"} {
+		SaveVocab(db, uid, w, "", "")
+	}
+	// бутылка: asked at step 3 a day ago, never answered — abandoned
+	ScheduleReminder(db, uid, "бутылка", 3, now.Add(-24*time.Hour))
+	MarkReminderSent(db, 1)
+	// окно: has a pending reminder, nothing to do
+	ScheduleReminder(db, uid, "окно", 2, now.Add(24*time.Hour))
+	// игра: asked minutes ago and still on screen — must be left alone
+	ScheduleReminder(db, uid, "игра", 1, now.Add(-time.Minute))
+	MarkReminderSent(db, 3)
+	// новое: never had a reminder at all
+
+	n, err := RescheduleAbandoned(db, 6*time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Fatalf("put back %d words, want 2 (бутылка and новое)", n)
+	}
+	if !HasPendingReminder(db, uid, "бутылка") {
+		t.Error("«бутылка» must be back in the rotation")
+	}
+	if !HasPendingReminder(db, uid, "новое") {
+		t.Error("a word that never had a reminder must get one")
+	}
+	if HasPendingReminder(db, uid, "игра") {
+		t.Error("a question asked minutes ago must not be duplicated")
+	}
+	// the restored word keeps the step it had reached
+	var step int
+	db.QueryRow(`SELECT step FROM reminders WHERE word='бутылка' AND sent=0`).Scan(&step)
+	if step != 3 {
+		t.Errorf("restored step = %d, want 3 — progress must not be lost", step)
+	}
+	// running again changes nothing
+	if again, _ := RescheduleAbandoned(db, 6*time.Hour); again != 0 {
+		t.Errorf("second run touched %d rows, want 0", again)
+	}
+}
+
 func TestScheduleReminderStoresUTC(t *testing.T) {
 	db := testDB(t)
 	plus5 := time.FixedZone("UTC+5", 5*3600)

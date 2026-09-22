@@ -278,6 +278,27 @@ func TestOfftrackAllowed(t *testing.T) {
 	}
 }
 
+// TestJudgeDemandsRussian — the learner answers in Japanese, and the model used
+// to answer in Japanese too. The prompt must insist on Russian, and a reply
+// without a single Cyrillic letter has to be caught.
+func TestJudgeDemandsRussian(t *testing.T) {
+	for _, must := range []string{"IN RUSSIAN", "NEVER switch to the language of their answer"} {
+		if !strings.Contains(judgeBase, must) {
+			t.Errorf("judge prompt lacks %q", must)
+		}
+	}
+	japanese := "食(た)べ物(もの)に付(つ)く助詞(じょし)は が ではなく を が正(ただ)しいです。"
+	if containsCyrillic(japanese) {
+		t.Error("an all-Japanese review must read as having no Russian")
+	}
+	if !containsCyrillic("Частица を, а не が.") {
+		t.Error("a Russian review must read as Russian")
+	}
+	if containsCyrillic("") || containsCyrillic("just latin") {
+		t.Error("only Cyrillic letters count as Russian")
+	}
+}
+
 // TestParsePracticeTask is the safety net: whatever the model writes, only a
 // real exercise — a Russian sentence to put into Japanese — gets through.
 func TestParsePracticeTask(t *testing.T) {

@@ -30,6 +30,7 @@ const historyTurns = 6
 const (
 	modeConfirmSave = "confirm_save" // bot asked «Запомнить слово «X»?»
 	modeAwaitWord   = "await_word"   // user rejected the guess and types the right word
+	modeAskWait     = "ask_wait"     // bare /ask — the next message is the question
 )
 
 // Clients bundles both API clients: Claude for text, OpenAI for TTS.
@@ -271,9 +272,15 @@ func HandleCommand(bot *tgbotapi.BotAPI, message *tgbotapi.Message, db *sql.DB, 
 			startPracticeWeakest(bot, clients, db, chatID, userID, "")
 		}
 	case "ask":
-		// an empty /ask only prints the usage hint — no API call, no budget spent
-		if strings.TrimSpace(message.CommandArguments()) == "" || capOK(bot, clients, db, chatID, userID) {
-			handleAsk(bot, clients, db, message)
+		q := strings.TrimSpace(message.CommandArguments())
+		if q == "" {
+			// wait for the question instead of dropping back to word lookup —
+			// a bare /ask used to print a hint and leave the mode unchanged, so
+			// the question typed next was answered as if it were a new word
+			storage.SetState(db, userID, modeAskWait, "", "", 0)
+			send(bot, chatID, "Задай вопрос по грамматике сообщением.\nНапример: как работает частица は")
+		} else if capOK(bot, clients, db, chatID, userID) {
+			answerAskQuestion(bot, clients, db, chatID, userID, q)
 		}
 	case "vocab":
 		if q := strings.TrimSpace(message.CommandArguments()); q != "" {
@@ -481,14 +488,9 @@ func sendVocabSearch(bot *tgbotapi.BotAPI, db *sql.DB, chatID int64, userID int,
 	send(bot, chatID, sb.String())
 }
 
-func handleAsk(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, message *tgbotapi.Message) {
-	chatID := message.Chat.ID
-	userID := int(message.From.ID)
-	q := strings.TrimSpace(message.CommandArguments())
-	if q == "" {
-		send(bot, chatID, "Спроси что-нибудь про грамматику, например:\n/ask как работает частица は")
-		return
-	}
+// answerAskQuestion answers a grammar question and puts the user in /ask mode,
+// where every further message is a follow-up until «Закончить».
+func answerAskQuestion(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, chatID int64, userID int, q string) {
 	think := sendThinking(bot, chatID)
 	resp, err := claudeOne(clients, grammarSystem, q)
 	deleteMsg(bot, chatID, think)
@@ -539,6 +541,8 @@ func HandleMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, clients *Cli
 		offerPracticeExit(bot, db, chatID, userID, st.Mode, st)
 	case "clarify_compose", "clarify_translate":
 		handleClarify(bot, clients, db, message, st)
+	case modeAskWait:
+		answerAskQuestion(bot, clients, db, chatID, userID, message.Text)
 	case "ask", "clarify_ask": // clarify_ask: legacy state left by the old «Уточнить» button
 		handleAskFollowup(bot, clients, db, message, st)
 	case "reminder":
@@ -1322,7 +1326,14 @@ func handleContestReminder(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, c
 	}
 }
 
-const judgeBase = styleRules + " You are a friendly Japanese tutor. Reply in Russian. Judge the user's answer to the task. "
+// judgeBase insists on Russian several times over: the learner answers in
+// Japanese or romaji, and the model used to mirror that language and hand back
+// a review written entirely in Japanese — correct, but unreadable at this level.
+const judgeBase = styleRules + " You are a friendly Japanese tutor. " +
+	"WRITE EVERY WORD OF YOUR REPLY IN RUSSIAN. The learner's answer is usually in Japanese or romaji — " +
+	"NEVER switch to the language of their answer. Japanese may appear ONLY inside the words, sentences and " +
+	"readings you quote; every explanation, correction and comment around them must be Russian. " +
+	"Judge the user's answer to the task. "
 
 // judgeGrading is shared by both judge prompts: lean toward accepting valid
 // alternatives, and when rejecting name the exact mistake plus one natural
@@ -1556,12 +1567,24 @@ func judgeAnswer(clients *Clients, task, answer string, expectJapanese bool) (ve
 // judgeWith returns (verdict, error bucket, feedback). The bucket is only set
 // on a retry verdict.
 func judgeWith(clients *Clients, system, task string) (verdict, string, string) {
-	resp, err := claudeOne(clients, system, task)
-	if err != nil {
-		log.Printf("judge error: %v", err)
-		return verdictError, "", "Ошибка проверки, попробуй ещё раз."
+	var v verdict
+	var tag, fb string
+	for attempt := 1; attempt <= 2; attempt++ {
+		resp, err := claudeOne(clients, system, task)
+		if err != nil {
+			log.Printf("judge error: %v", err)
+			return verdictError, "", "Ошибка проверки, попробуй ещё раз."
+		}
+		v, tag, fb = parseVerdict(resp)
+		// feedback with no Russian in it at all means the model mirrored the
+		// learner's Japanese — ask again rather than show what they can't read
+		if fb == "" || containsCyrillic(fb) {
+			return v, tag, fb
+		}
+		log.Printf("judge replied without Russian (attempt %d)", attempt)
+		system += " Your previous reply was not in Russian. Write the feedback in Russian."
 	}
-	return parseVerdict(resp)
+	return v, tag, fb
 }
 
 // parseVerdict splits the model reply into its first-line verdict, an optional
@@ -1831,6 +1854,19 @@ func sendNextDueReminder(bot *tgbotapi.BotAPI, db *sql.DB, userID int, session b
 	return true
 }
 
+// reminderPending guards every button that would hand out a new word: if one is
+// already waiting for an answer, pulling the next would silently abandon it —
+// the abandoned word loses its place in the schedule and the answer typed for it
+// gets judged against the newer word.
+func reminderPending(bot *tgbotapi.BotAPI, db *sql.DB, chatID int64, userID int) bool {
+	st := storage.GetState(db, userID)
+	if st.Mode != "reminder" || st.Word == "" {
+		return false
+	}
+	sendKb(bot, chatID, "Сначала ответь на это слово.\n"+reminderQuestion(db, userID, st.Word), reminderKeyboard())
+	return true
+}
+
 // srsWordsLeft is how many words the current batch still has waiting.
 func srsWordsLeft(db *sql.DB, userID int) int {
 	now := time.Now()
@@ -2006,12 +2042,22 @@ func HandleCallbackQuery(bot *tgbotapi.BotAPI, clients *Clients, callbackQuery *
 		continueSrsSession(bot, db, chatID, userID, st.TaskText == srsSessionFlag)
 
 	case data == "srs_start":
+		if reminderPending(bot, db, chatID, userID) {
+			return
+		}
+		// take the buttons off the announcement so a second tap cannot pull
+		// another word — that is what left «бутылка» unanswered and unscheduled
+		bot.Send(tgbotapi.NewEditMessageReplyMarkup(chatID, callbackQuery.Message.MessageID,
+			tgbotapi.NewInlineKeyboardMarkup()))
 		if !sendNextDueReminder(bot, db, userID, true) {
 			storage.ClearMode(db, userID)
 			send(bot, chatID, "Повторять пока нечего — напомню, когда придёт время.")
 		}
 
 	case data == "srs_next":
+		if reminderPending(bot, db, chatID, userID) {
+			return
+		}
 		continueSrsSession(bot, db, chatID, userID, true)
 
 	case data == "srs_later":
