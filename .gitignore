@@ -3,3 +3,5 @@
 *.log
 tmp/
 .env
+languagebot.db
+backups/
