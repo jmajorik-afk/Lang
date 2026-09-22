@@ -39,6 +39,31 @@ CREATE INDEX IF NOT EXISTS idx_queries_language ON queries (language, help_type,
 CREATE TABLE IF NOT EXISTS cached_responses (
     query_id INTEGER NOT NULL,
     response TEXT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (query_id) REFERENCES queries(id)
+);
+
+-- Reminders Table (spaced repetition)
+CREATE TABLE IF NOT EXISTS reminders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    word TEXT NOT NULL,
+    language TEXT NOT NULL,
+    help_type TEXT NOT NULL,
+    send_at DATETIME NOT NULL,
+    sent INTEGER NOT NULL DEFAULT 0,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_reminders_send_at ON reminders (send_at, sent);
+
+-- Quiz State Table (tracks pending spaced-repetition quizzes per user)
+CREATE TABLE IF NOT EXISTS user_quiz_state (
+    user_id INTEGER PRIMARY KEY,
+    word TEXT NOT NULL,
+    language TEXT NOT NULL,
+    help_type TEXT NOT NULL,
+    FOREIGN KEY (user_id) REFERENCES users(id)
 );
 

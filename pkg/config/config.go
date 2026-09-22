@@ -5,22 +5,24 @@ import (
 	"path/filepath"
 	"strings"
 	template "text/template"
-
-	"github.com/sashabaranov/go-openai"
 )
+
+type ChatMessage struct {
+	Role    string
+	Content string
+}
 
 type GptPromptTuningByLanguageAndHelpType map[string]map[string]GptPromptTuning
 
 type GptPromptTuning struct {
 	Language string
 	HelpType string
-	Messages []openai.ChatCompletionMessage
+	Messages []ChatMessage
 }
 
 type GptRequestType struct {
 	HelpType       string
 	PromptTemplate *template.Template
-	Messages       []openai.ChatCompletionMessage
 }
 
 type TTSConfig struct {
@@ -39,7 +41,6 @@ type Config struct {
 func NewGptPromptTuningFromTextFiles() (GptPromptTuningByLanguageAndHelpType, error) {
 	promptTunings := make(GptPromptTuningByLanguageAndHelpType)
 
-	// Read all files in templates/examples and templates/translation directories
 	helpTypeDirectory, err := os.ReadDir("templates/")
 	if err != nil {
 		return nil, err
@@ -48,76 +49,68 @@ func NewGptPromptTuningFromTextFiles() (GptPromptTuningByLanguageAndHelpType, er
 	for _, file := range helpTypeDirectory {
 		if file.IsDir() {
 			helpType := file.Name()
-			helpTypeDirectory, err := os.ReadDir(filepath.Join("templates", helpType))
+			subDir, err := os.ReadDir(filepath.Join("templates", helpType))
 			if err != nil {
 				return nil, err
 			}
-			for _, file := range helpTypeDirectory {
-				if !file.IsDir() && strings.HasSuffix(file.Name(), ".txt") {
-					language := strings.TrimSuffix(file.Name(), ".txt")
-					filePath := filepath.Join("templates", helpType, file.Name())
-
+			for _, f := range subDir {
+				if !f.IsDir() && strings.HasSuffix(f.Name(), ".txt") {
+					language := strings.TrimSuffix(f.Name(), ".txt")
+					filePath := filepath.Join("templates", helpType, f.Name())
 					content, err := os.ReadFile(filePath)
 					if err != nil {
 						return nil, err
 					}
-					var chatCompletionMessages []openai.ChatCompletionMessage
-					chatCompletionMessages = getChatCompletionMessages(content)
+					messages := parseChatMessages(content)
 					promptTuning := GptPromptTuning{
 						Language: language,
 						HelpType: helpType,
-						Messages: chatCompletionMessages,
+						Messages: messages,
 					}
-
 					if _, ok := promptTunings[language]; !ok {
 						promptTunings[language] = make(map[string]GptPromptTuning)
 					}
 					promptTunings[language][helpType] = promptTuning
-					chatCompletionMessages = nil
 				}
 			}
 		}
 	}
-
 	return promptTunings, nil
 }
 
-func getChatCompletionMessages(content []byte) []openai.ChatCompletionMessage {
-	var chatCompletionMessages []openai.ChatCompletionMessage
+func parseChatMessages(content []byte) []ChatMessage {
+	var messages []ChatMessage
 	for _, line := range strings.Split(string(content), "\n") {
-		role, content, found := strings.Cut(line, ":")
+		role, text, found := strings.Cut(line, ":")
 		if !found {
 			continue
 		}
 		role = strings.TrimSpace(role)
-		content = strings.TrimSpace(content)
-		chatCompletionMessages = append(chatCompletionMessages, openai.ChatCompletionMessage{
+		text = strings.TrimSpace(text)
+		messages = append(messages, ChatMessage{
 			Role:    role,
-			Content: strings.Replace(content, `\n`, "\n", -1),
+			Content: strings.Replace(text, `\n`, "\n", -1),
 		})
 	}
-	return chatCompletionMessages
+	return messages
 }
 
-// NewConfig creates a new config
 func NewConfig() *Config {
 	gptPromptTunings, err := NewGptPromptTuningFromTextFiles()
 	if err != nil {
 		panic(err)
 	}
 
-	config := &Config{
+	return &Config{
 		GptPromptTunings: gptPromptTunings,
 		GptTemplateWordUsageExamples: &GptRequestType{
 			HelpType:       "examples",
 			PromptTemplate: template.Must(template.ParseFiles("templates/examples.txt")),
 		},
-
 		GptTemplateWordTranslation: &GptRequestType{
 			HelpType:       "translation",
 			PromptTemplate: template.Must(template.ParseFiles("templates/translation.txt")),
 		},
-
 		GptTemplateInflection: &GptRequestType{
 			HelpType:       "inflection",
 			PromptTemplate: template.Must(template.ParseFiles("templates/inflection.txt")),
@@ -127,5 +120,4 @@ func NewConfig() *Config {
 			Speed: 1,
 		},
 	}
-	return config
 }
