@@ -278,6 +278,72 @@ func TestOfftrackAllowed(t *testing.T) {
 	}
 }
 
+// TestParsePracticeTask is the safety net: whatever the model writes, only a
+// real exercise — a Russian sentence to put into Japanese — gets through.
+func TestParsePracticeTask(t *testing.T) {
+	good := "ТЕМА: построение предложений\n" +
+		"ЗАДАНИЕ: Я ем вкусную еду дома.\n" +
+		"СЛОВА:\n" +
+		"еда — 食(た)べ物(もの) (tabemono)\n" +
+		"- дома — 家(いえ)で (ie de)"
+	task, ok := parsePracticeTask(good, true)
+	if !ok {
+		t.Fatal("a well-formed task was rejected")
+	}
+	if task.Topic != "построение предложений" || task.Sentence != "Я ем вкусную еду дома." || len(task.Helpers) != 2 {
+		t.Errorf("parsed = %+v", task)
+	}
+	if task.Helpers[1] != "дома — 家(いえ)で (ie de)" {
+		t.Errorf("list markers must be stripped from helper lines, got %q", task.Helpers[1])
+	}
+	if want := "Я ем вкусную еду дома.\n\nеда — 食(た)べ物(もの) (tabemono)\nдома — 家(いえ)で (ie de)"; task.String() != want {
+		t.Errorf("String() = %q, want %q", task.String(), want)
+	}
+
+	bad := map[string]string{
+		// the exact output the user was shown instead of a task
+		"the real failure":                "Давай покажу на примере слова \"есть / кушать\" — 食(た)べる (taberu).",
+		"labelled but carries the answer": "ЗАДАНИЕ: Давай покажу на примере слова «есть» — 食(た)べる (taberu).\nСЛОВА:\nx",
+		"no ЗАДАНИЕ line":                 "ТЕМА: частицы\nСЛОВА:\nеда — 食べ物",
+		"too short":                       "ЗАДАНИЕ: Еда.\nСЛОВА:\nx",
+		"Japanese instead of Russian":     "ЗАДАНИЕ: 私はご飯を食べます。\nСЛОВА:\nx",
+		"empty":                           "",
+	}
+	for name, resp := range bad {
+		if _, ok := parsePracticeTask(resp, false); ok {
+			t.Errorf("%s: accepted, must be rejected", name)
+		}
+	}
+
+	// a topic task without its label is incomplete; a vocabulary task needs none
+	noTopic := "ЗАДАНИЕ: Я ем вкусную еду дома.\nСЛОВА:\nеда — 食べ物"
+	if _, ok := parsePracticeTask(noTopic, true); ok {
+		t.Error("topic practice must require a ТЕМА line")
+	}
+	if _, ok := parsePracticeTask(noTopic, false); !ok {
+		t.Error("vocabulary practice must not require a ТЕМА line")
+	}
+	// labels are recognised in any case, quotes around the sentence are dropped
+	if task, ok := parsePracticeTask("задание: «Я иду в школу утром.»", false); !ok || task.Sentence != "Я иду в школу утром." {
+		t.Errorf("lower-case label / quotes: ok=%v sentence=%q", ok, task.Sentence)
+	}
+}
+
+// TestTopicTaskPromptFencesTheSource — the explanation is reference material
+// inside delimiters, never the message the model responds to.
+func TestTopicTaskPromptFencesTheSource(t *testing.T) {
+	src := "можешь показать мне пример, как строится предложение?"
+	p := topicTaskPrompt(src)
+	for _, must := range []string{"<<<\n" + src + "\n>>>", "REFERENCE MATERIAL ONLY", "ЗАДАНИЕ:", "ТЕМА:"} {
+		if !strings.Contains(p, must) {
+			t.Errorf("topic prompt lacks %q", must)
+		}
+	}
+	if strings.Contains(composeTaskPrompt("яблоко", 1, "", nil), "ТЕМА:") {
+		t.Error("vocabulary tasks must not ask for a topic label")
+	}
+}
+
 // TestLevelFromRate pins the difficulty dial: too little data stays easy,
 // then the recent first-try rate decides.
 func TestLevelFromRate(t *testing.T) {
