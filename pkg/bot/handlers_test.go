@@ -202,6 +202,72 @@ func TestSplitSenses(t *testing.T) {
 	}
 }
 
+// TestAnswerSenses guards the mismatch that «Запомнить» used to produce: the
+// lookup answer and the saved entry came from two independent model calls, so the
+// bot could explain «иметь» as ある and then offer to save 持つ.
+func TestAnswerSenses(t *testing.T) {
+	const answer = "В японском нет глагола «иметь». Говорят ある (aru) — «имеется»:\n" +
+		"車(くるま)がある (kuruma ga aru) — «есть машина».\nА 持(も)つ (motsu) — «держать, владеть»."
+
+	cases := []struct {
+		name     string
+		resp     string
+		answer   string
+		tr, alts string
+	}{
+		{
+			name:   "every variant the answer offered is kept as its own sense",
+			resp:   "ある (aru) — о наличии чего-то\n持(も)つ (motsu) — держать в руках, владеть",
+			answer: answer,
+			tr:     "ある (aru) — о наличии чего-то",
+			alts:   "持(も)つ (motsu) — держать в руках, владеть",
+		},
+		{
+			// the answer writes 持(も)つ, the sense line reduces to 持つ
+			name:   "a reading in brackets does not hide the word",
+			resp:   "持(も)つ (motsu)",
+			answer: answer,
+			tr:     "持(も)つ (motsu)",
+		},
+		{
+			name:   "a word the answer never mentioned means the model ignored it",
+			resp:   "所有(しょゆう)する (shoyuu suru)",
+			answer: answer,
+		},
+		{name: "NONE: the answer held no Japanese", resp: "NONE", answer: answer},
+		{name: "a reply with no Japanese is unusable", resp: "не могу определить", answer: answer},
+		{name: "nothing was shown", resp: "ある (aru)", answer: ""},
+	}
+	for _, c := range cases {
+		tr, alts := answerSenses(c.resp, c.answer)
+		if tr != c.tr || alts != c.alts {
+			t.Errorf("%s: answerSenses = (%q, %q), want (%q, %q)", c.name, tr, alts, c.tr, c.alts)
+		}
+	}
+
+	// lastLookupAnswer finds the turn by the same key flow1Lookup filed it under,
+	// so both must agree on how a message becomes a word
+	for _, c := range []struct{ in, want string }{
+		{"как будет иметь?", "иметь"},
+		{"как будет", "как будет"}, // nothing survives stripping: keep the raw text
+		{"  окно  ", "окно"},
+	} {
+		if got := lookupWord(c.in); got != c.want {
+			t.Errorf("lookupWord(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+// TestTranslationPromptsShareTheFormat — both prompts feed splitSenses, so they
+// must ask for the same shape.
+func TestTranslationPromptsShareTheFormat(t *testing.T) {
+	for _, must := range []string{"植物(しょくぶつ) (shokubutsu)", " — ", "no other text"} {
+		if !strings.Contains(senseFormat, must) {
+			t.Errorf("senseFormat lost %q", must)
+		}
+	}
+}
+
 // TestReminderTaskCarriesStoredEntry — the judge must be told what the user's
 // dictionary says, otherwise it grades against its own idea of the best phrasing.
 func TestReminderTaskCarriesStoredEntry(t *testing.T) {
