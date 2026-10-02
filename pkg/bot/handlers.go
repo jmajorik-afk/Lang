@@ -258,6 +258,7 @@ func HandleCommand(bot *tgbotapi.BotAPI, message *tgbotapi.Message, db *sql.DB, 
 	userID := int(message.From.ID)
 	chatID := message.Chat.ID
 	storage.EnsureUser(db, userID)
+	storage.Touch(db, userID)
 
 	switch message.Command() {
 	case "start":
@@ -511,6 +512,7 @@ func HandleMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, clients *Cli
 	userID := int(message.From.ID)
 	chatID := message.Chat.ID
 	storage.EnsureUser(db, userID)
+	storage.Touch(db, userID)
 
 	st := storage.GetState(db, userID)
 	switch st.Mode {
@@ -546,7 +548,7 @@ func HandleMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, clients *Cli
 	case "ask", "clarify_ask": // clarify_ask: legacy state left by the old «Уточнить» button
 		handleAskFollowup(bot, clients, db, message, st)
 	case "reminder":
-		checkReminder(bot, clients, db, message, st)
+		checkReminder(bot, clients, db, chatID, userID, message.Text, st)
 	case modeAwaitWord:
 		handleAwaitWord(bot, clients, db, message)
 	default:
@@ -1619,10 +1621,26 @@ func parseVerdict(resp string) (verdict, string, string) {
 
 // ---------- Flow 3 — SRS reminder answer ----------
 
-func checkReminder(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, message *tgbotapi.Message, st storage.State) {
-	chatID := message.Chat.ID
-	userID := int(message.From.ID)
+// reminderTypoAsked marks, in user_state.target (unused during reminders), that
+// the user was already asked to re-check a near-miss answer for this word — the
+// next answer goes to the judge as written.
+const reminderTypoAsked = "typo_asked"
 
+// reminderTypoKeyboard — under «похоже на опечатку»: keep the answer as written,
+// or the usual reminder exits.
+func reminderTypoKeyboard() tgbotapi.InlineKeyboardMarkup {
+	return tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("Да, это мой ответ", "typo_keep"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("Закончить", "exit"),
+			tgbotapi.NewInlineKeyboardButtonData("Не помню", "dont_remember"),
+		),
+	)
+}
+
+func checkReminder(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, chatID int64, userID int, answer string, st storage.State) {
 	word := st.Word
 	step := 1
 	if w, s, err := storage.GetReminder(db, st.ReminderID); err == nil && w != "" {
@@ -1633,13 +1651,21 @@ func checkReminder(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, message *
 
 	var v verdict
 	var tag, fb string
-	if matchesStoredEntry(entry, message.Text) {
+	if matchesStoredEntry(entry, answer) {
 		// the user recalled one of their own saved senses verbatim — there is
 		// nothing for the model to second-guess, and nothing to pay for
 		v, fb = verdictOK, strings.Join(entry.SenseLines(), "\n")
+	} else if st.Target != reminderTypoAsked && looksLikeTypo(entry, answer) {
+		// a slip of the finger on a word the user knows shouldn't cost the SRS
+		// step: ask once to re-check, without revealing the right spelling
+		storage.SetTaskTarget(db, userID, reminderTypoAsked)
+		storage.SetLastAnswer(db, userID, answer)
+		sendKb(bot, chatID, "Похоже на опечатку — проверь, как написал, и отправь ещё раз.\n"+
+			"Если так и хотел — нажми «Да, это мой ответ».", reminderTypoKeyboard())
+		return
 	} else {
 		think := sendThinking(bot, chatID)
-		v, tag, fb = judgeAnswer(clients, reminderTask(word, entry, message.Text), message.Text, true)
+		v, tag, fb = judgeAnswer(clients, reminderTask(word, entry, answer), answer, true)
 		deleteMsg(bot, chatID, think)
 	}
 
@@ -1650,7 +1676,7 @@ func checkReminder(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, message *
 	if v == verdictOffTrack {
 		// not an answer at all — don't lapse the word, just ask again; «Оспорить»
 		// is offered in case the classification itself was wrong
-		storage.SetLastAnswer(db, userID, message.Text)
+		storage.SetLastAnswer(db, userID, answer)
 		sendKb(bot, chatID, "Это не похоже на ответ. "+reminderQuestion(db, userID, word)+" Или нажми «Закончить».",
 			reminderContestKeyboard(st.ReminderID, st.TaskText == srsSessionFlag && srsWordsLeft(db, userID) > 0))
 		return
@@ -1667,7 +1693,7 @@ func checkReminder(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, message *
 	} else {
 		back := lapseStep(step)
 		storage.ScheduleReminder(db, userID, word, back, time.Now().Add(intervalFor(back)))
-		storage.SetLastAnswer(db, userID, message.Text)
+		storage.SetLastAnswer(db, userID, answer)
 		// stay on this word rather than auto-advancing: «Оспорить» needs the
 		// answer, and moving on would bury a possibly wrong verdict. «Дальше»
 		// lets the user continue the batch deliberately.
@@ -1693,6 +1719,88 @@ func matchesStoredEntry(entry storage.VocabEntry, answer string) bool {
 		}
 	}
 	return false
+}
+
+// looksLikeTypo reports whether the answer is a near miss of one of the saved
+// kana or romaji forms — a slip of the finger rather than a different word.
+// Forms with kanji are left out: one different kanji is a different word.
+func looksLikeTypo(entry storage.VocabEntry, answer string) bool {
+	a := compactAnswer(answer)
+	if a == "" {
+		return false
+	}
+	for _, sense := range entry.SenseLines() {
+		for _, form := range entryForms(sense) {
+			f := compactAnswer(form)
+			if f == "" || hasKanji(f) {
+				continue
+			}
+			if d := editDistance(a, f); d > 0 && d <= typoBudget(f) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func compactAnswer(s string) string {
+	return strings.NewReplacer(" ", "", "-", "", "　", "").Replace(normalizeAnswer(s))
+}
+
+// typoBudget is how many slips a form of this length tolerates. Short words get
+// none: «ie» and «ii» are different words, not a typo. A kana character is a
+// whole syllable, so kana forms qualify sooner than romaji.
+func typoBudget(form string) int {
+	n := utf8.RuneCountInString(form)
+	if containsJapanese(form) {
+		if n >= 3 {
+			return 1
+		}
+		return 0
+	}
+	switch {
+	case n >= 8:
+		return 2
+	case n >= 4:
+		return 1
+	}
+	return 0
+}
+
+func hasKanji(s string) bool {
+	for _, r := range s {
+		if r >= 0x4E00 && r <= 0x9FFF {
+			return true
+		}
+	}
+	return false
+}
+
+// editDistance is the Damerau (optimal string alignment) distance over runes:
+// insertions, deletions, substitutions and swapped neighbours cost 1 each.
+func editDistance(a, b string) int {
+	ra, rb := []rune(a), []rune(b)
+	prev2 := make([]int, len(rb)+1)
+	prev := make([]int, len(rb)+1)
+	for j := range prev {
+		prev[j] = j
+	}
+	for i := 1; i <= len(ra); i++ {
+		cur := make([]int, len(rb)+1)
+		cur[0] = i
+		for j := 1; j <= len(rb); j++ {
+			cost := 1
+			if ra[i-1] == rb[j-1] {
+				cost = 0
+			}
+			cur[j] = min(prev[j]+1, cur[j-1]+1, prev[j-1]+cost)
+			if i > 1 && j > 1 && ra[i-1] == rb[j-2] && ra[i-2] == rb[j-1] {
+				cur[j] = min(cur[j], prev2[j-2]+1)
+			}
+		}
+		prev2, prev = prev, cur
+	}
+	return prev[len(rb)]
 }
 
 // entryForms lists every way one dictionary line could be written: the written
@@ -1889,6 +1997,85 @@ func continueSrsSession(bot *tgbotapi.BotAPI, db *sql.DB, chatID int64, userID i
 	}
 }
 
+// ---------- idle modes ----------
+
+// While any mode is set the scheduler starts no reminder round, so a question
+// left unanswered or an /ask left open used to freeze SRS until the user did
+// something — and then the whole backlog arrived at once.
+const (
+	idleNudgeAfter    = 1 * time.Hour    // unanswered reminder / batch offer: one nudge
+	idleGiveUpAfter   = 4 * time.Hour    // …then it is set aside and offered again later
+	askIdleAfter      = 30 * time.Minute // /ask dialog closes itself
+	practiceIdleAfter = 1 * time.Hour    // abandoned practice closes itself
+	otherIdleAfter    = 1 * time.Hour    // save confirmations etc. — cleared silently
+)
+
+// ExpireIdleStates nudges or closes modes the user has walked away from. The
+// scheduler runs it every tick.
+func ExpireIdleStates(bot *tgbotapi.BotAPI, db *sql.DB) {
+	states, err := storage.ActiveModes(db)
+	if err != nil {
+		log.Println("listing active modes:", err)
+		return
+	}
+	now := time.Now()
+	for _, s := range states {
+		idle := now.Sub(s.ActiveAt)
+		chatID := int64(s.UserID)
+		switch s.Mode {
+		case "reminder", modeSrsOffer:
+			if idle >= idleGiveUpAfter {
+				if ok, _ := storage.ClearIdleMode(db, s.UserID, s.Mode, now.Add(-idleGiveUpAfter)); ok {
+					setAsideReminder(db, s)
+				}
+			} else if idle >= idleNudgeAfter && !s.Nudged {
+				if ok, _ := storage.MarkNudged(db, s.UserID, s.Mode, now.Add(-idleNudgeAfter)); ok {
+					nudgeReminder(bot, db, chatID, s)
+				}
+			}
+		case "ask", "clarify_ask", modeAskWait:
+			if ok, _ := storage.ClearIdleMode(db, s.UserID, s.Mode, now.Add(-askIdleAfter)); ok {
+				send(bot, chatID, "Закрыл режим вопросов по грамматике. Будет новый вопрос — пиши /ask.")
+			}
+		case "practice_compose", "practice_translate", "paused_compose", "paused_translate",
+			"clarify_compose", "clarify_translate":
+			if ok, _ := storage.ClearIdleMode(db, s.UserID, s.Mode, now.Add(-practiceIdleAfter)); ok {
+				send(bot, chatID, "Тренировку закрыл — долго не было ответа. /practice — начать заново.")
+			}
+		default:
+			storage.ClearIdleMode(db, s.UserID, s.Mode, now.Add(-otherIdleAfter))
+		}
+	}
+}
+
+func nudgeReminder(bot *tgbotapi.BotAPI, db *sql.DB, chatID int64, s storage.IdleState) {
+	if s.Mode == "reminder" {
+		sendKb(bot, chatID, "Напоминаю, ждёт ответа:\n"+reminderQuestion(db, s.UserID, s.Word)+" Напиши свой вариант.",
+			reminderKeyboard())
+		return
+	}
+	if n := srsWordsLeft(db, s.UserID); n > 0 {
+		sendKb(bot, chatID, fmt.Sprintf("Напоминаю: ждут повторения %d %s.", n, pluralRu(n, "слово", "слова", "слов")),
+			srsOfferKeyboard())
+	}
+}
+
+// setAsideReminder puts an ignored question back into the queue without a
+// lapse — silence is not a wrong answer — and holds the next round back like
+// «Позже» does, so an absent user isn't asked again every few minutes.
+func setAsideReminder(db *sql.DB, s storage.IdleState) {
+	if s.Mode == "reminder" {
+		word, step := s.Word, 1
+		if w, st, err := storage.GetReminder(db, s.ReminderID); err == nil && w != "" {
+			word, step = w, st
+		}
+		if word != "" && !storage.HasPendingReminder(db, s.UserID, word) {
+			storage.ScheduleReminder(db, s.UserID, word, step, time.Now())
+		}
+	}
+	storage.SetLastReminderAt(db, s.UserID, time.Now().Add(srsSnooze-ReminderThrottle))
+}
+
 // ---------- callbacks ----------
 
 func HandleCallbackQuery(bot *tgbotapi.BotAPI, clients *Clients, callbackQuery *tgbotapi.CallbackQuery, db *sql.DB) {
@@ -1897,6 +2084,7 @@ func HandleCallbackQuery(bot *tgbotapi.BotAPI, clients *Clients, callbackQuery *
 	chatID := callbackQuery.Message.Chat.ID
 	answerCallback(bot, callbackQuery)
 	storage.EnsureUser(db, userID)
+	storage.Touch(db, userID)
 
 	// Buttons that lead to a model or TTS call count against the daily budget.
 	apiCall := data == "memorize" || data == "ask_practice" || data == "practice_yes" || data == "round_yes" ||
@@ -2040,6 +2228,16 @@ func HandleCallbackQuery(bot *tgbotapi.BotAPI, clients *Clients, callbackQuery *
 		storage.ScheduleReminder(db, userID, word, 1, time.Now().Add(intervalFor(1)))
 		send(bot, chatID, "Ничего страшного, вот как это:\n\n"+ans+"\n\nНапомню это слово снова скоро.")
 		continueSrsSession(bot, db, chatID, userID, st.TaskText == srsSessionFlag)
+
+	case data == "typo_keep":
+		st := storage.GetState(db, userID)
+		if st.Mode != "reminder" || st.Target != reminderTypoAsked || st.LastAnswer == "" {
+			send(bot, chatID, "Это уже неактуально.")
+			return
+		}
+		bot.Send(tgbotapi.NewEditMessageReplyMarkup(chatID, callbackQuery.Message.MessageID,
+			tgbotapi.NewInlineKeyboardMarkup()))
+		checkReminder(bot, clients, db, chatID, userID, st.LastAnswer, st)
 
 	case data == "srs_start":
 		if reminderPending(bot, db, chatID, userID) {

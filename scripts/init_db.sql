@@ -39,8 +39,11 @@ CREATE TABLE IF NOT EXISTS user_state (
     last_reminder_at DATETIME,
     last_answer TEXT NOT NULL DEFAULT '',  -- most recent judged answer, for «Оспорить»
     attempt INTEGER NOT NULL DEFAULT 0,    -- judged attempts at the current task (reset by SetState)
-    target TEXT NOT NULL DEFAULT ''        -- error bucket the current practice task drills, if any
+    target TEXT NOT NULL DEFAULT '',       -- error bucket the current practice task drills, if any
+    active_at DATETIME,                    -- last user activity; idle modes get nudged / closed
+    nudged INTEGER NOT NULL DEFAULT 0      -- 1 once the idle user was nudged in this mode
 );
+-- columns added after the first release are also added by storage.Migrate
 
 -- Short conversation history fed back to Claude for word lookups
 CREATE TABLE IF NOT EXISTS conversations (

@@ -64,12 +64,102 @@ func upsertState(db *sql.DB, userID int, mode, word, task string, reminderID int
 	// attempt resets here on purpose: SetState marks the start of a new task
 	// or stage, so the next judged answer is a first try again.
 	_, err := db.Exec(`
-		INSERT INTO user_state (user_id, mode, word, task_text, reminder_id, attempt, target)
-		VALUES (?,?,?,?,?,0,'')
+		INSERT INTO user_state (user_id, mode, word, task_text, reminder_id, attempt, target, active_at, nudged)
+		VALUES (?,?,?,?,?,0,'',?,0)
 		ON CONFLICT(user_id) DO UPDATE SET
 			mode=excluded.mode, word=excluded.word,
-			task_text=excluded.task_text, reminder_id=excluded.reminder_id, attempt=0, target=''
-	`, userID, mode, word, task, reminderID)
+			task_text=excluded.task_text, reminder_id=excluded.reminder_id, attempt=0, target='',
+			active_at=excluded.active_at, nudged=0
+	`, userID, mode, word, task, reminderID, time.Now().UTC())
+	return err
+}
+
+// Touch restarts the idle clock: the user just did something.
+func Touch(db *sql.DB, userID int) error {
+	_, err := db.Exec(`UPDATE user_state SET active_at=? WHERE user_id=?`, time.Now().UTC(), userID)
+	return err
+}
+
+// IdleState is a user in the middle of something (a mode is set), with the time
+// of their last activity — what the scheduler needs to unstick a forgotten mode.
+type IdleState struct {
+	UserID     int
+	Mode       string
+	Word       string
+	ReminderID int
+	ActiveAt   time.Time
+	Nudged     bool
+}
+
+// ActiveModes lists every user whose mode is set.
+func ActiveModes(db *sql.DB) ([]IdleState, error) {
+	rows, err := db.Query(`SELECT user_id, mode, word, reminder_id, active_at, nudged FROM user_state WHERE mode != ''`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []IdleState
+	for rows.Next() {
+		var s IdleState
+		var at sql.NullTime
+		if err := rows.Scan(&s.UserID, &s.Mode, &s.Word, &s.ReminderID, &at, &s.Nudged); err != nil {
+			return nil, err
+		}
+		s.ActiveAt = time.Now()
+		if at.Valid {
+			s.ActiveAt = at.Time
+		}
+		out = append(out, s)
+	}
+	return out, rows.Err()
+}
+
+// MarkNudged records the one nudge for the user's current mode. It only takes
+// while the user is still in that mode and has been idle since before idleSince,
+// so a reply that lands meanwhile cancels the nudge. Reports whether it took.
+func MarkNudged(db *sql.DB, userID int, mode string, idleSince time.Time) (bool, error) {
+	res, err := db.Exec(`UPDATE user_state SET nudged=1
+		WHERE user_id=? AND mode=? AND nudged=0 AND active_at <= ?`, userID, mode, idleSince.UTC())
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n == 1, nil
+}
+
+// ClearIdleMode ends the mode only if it is still the same one and the user has
+// been idle since before idleSince. Reports whether it ended it.
+func ClearIdleMode(db *sql.DB, userID int, mode string, idleSince time.Time) (bool, error) {
+	res, err := db.Exec(`UPDATE user_state SET mode='', task_text='', reminder_id=0
+		WHERE user_id=? AND mode=? AND active_at <= ?`, userID, mode, idleSince.UTC())
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n == 1, nil
+}
+
+// Migrate brings a database created from an older init_db.sql up to date.
+// CREATE TABLE IF NOT EXISTS never touches an existing table, so columns added
+// later are added here. Idempotent; run at startup after init_db.sql.
+func Migrate(db *sql.DB) error {
+	for _, c := range []struct{ table, column, ddl string }{
+		{"user_state", "active_at", "DATETIME"},
+		{"user_state", "nudged", "INTEGER NOT NULL DEFAULT 0"},
+	} {
+		var n int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info(?) WHERE name=?`, c.table, c.column).Scan(&n); err != nil {
+			return err
+		}
+		if n > 0 {
+			continue
+		}
+		if _, err := db.Exec("ALTER TABLE " + c.table + " ADD COLUMN " + c.column + " " + c.ddl); err != nil {
+			return err
+		}
+	}
+	// rows from before active_at existed start their idle clock now
+	_, err := db.Exec(`UPDATE user_state SET active_at=? WHERE active_at IS NULL`, time.Now().UTC())
 	return err
 }
 

@@ -63,6 +63,9 @@ func StartTelegramBot() {
 	if _, err = db.Exec(string(initDBSQL)); err != nil {
 		log.Fatal("Error executing init_db.sql:", err)
 	}
+	if err := storage.Migrate(db); err != nil {
+		log.Fatal("Error migrating database:", err)
+	}
 	if n, err := storage.NormalizeReminderTimes(db); err != nil {
 		log.Println("normalizing reminder times:", err)
 	} else if n > 0 {
@@ -183,6 +186,10 @@ func scheduleReminders(db *sql.DB, tgbot *tgbotapi.BotAPI) {
 	ticker := time.NewTicker(1 * time.Minute)
 	go func() {
 		for range ticker.C {
+			// nudge or close modes the user walked away from — otherwise a
+			// forgotten reminder or /ask blocks every round below indefinitely
+			bot.ExpireIdleStates(tgbot, db)
+
 			// put back any word whose reminder was sent but never answered —
 			// without this it would never be asked again
 			if n, err := storage.RescheduleAbandoned(db, 6*time.Hour); err != nil {
