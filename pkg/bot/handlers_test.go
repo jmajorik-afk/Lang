@@ -492,3 +492,54 @@ func TestLapseStep(t *testing.T) {
 		}
 	}
 }
+
+func TestEditDistance(t *testing.T) {
+	cases := []struct {
+		a, b string
+		want int
+	}{
+		{"samui", "samui", 0},
+		{"samui", "sanui", 1},  // substitution
+		{"samui", "samu", 1},   // deletion
+		{"samui", "samuii", 1}, // insertion
+		{"samui", "smaui", 1},  // swapped neighbours
+		{"さむい", "さもい", 1},
+		{"samui", "atsui", 3},
+	}
+	for _, c := range cases {
+		if got := editDistance(c.a, c.b); got != c.want {
+			t.Errorf("editDistance(%q, %q) = %d, want %d", c.a, c.b, got, c.want)
+		}
+	}
+}
+
+func TestLooksLikeTypo(t *testing.T) {
+	cold := storage.VocabEntry{Translation: "寒(さむ)い (samui) — о погоде"}
+	typos := []string{"sanui", "smaui", "samuu", "さもい", "Samu"}
+	for _, a := range typos {
+		if !looksLikeTypo(cold, a) {
+			t.Errorf("%q should look like a typo of samui/さむい", a)
+		}
+	}
+	notTypos := []string{
+		"samui",  // exact: not a typo, it is right
+		"さむい",    // exact kana
+		"atsui",  // a different word
+		"あつい",    // a different word in kana
+		"冷い",     // kanji forms are never typo-matched
+		"きのうは寒い", // a whole sentence
+	}
+	for _, a := range notTypos {
+		if looksLikeTypo(cold, a) {
+			t.Errorf("%q should not look like a typo", a)
+		}
+	}
+	// short words tolerate nothing: «ie» vs «ii» are different words
+	if looksLikeTypo(storage.VocabEntry{Translation: "家(いえ) (ie)"}, "ii") {
+		t.Error("two-letter romaji must not be typo-matched")
+	}
+	// long romaji tolerates two slips
+	if !looksLikeTypo(storage.VocabEntry{Translation: "ありがとう (arigatou)"}, "arigato") {
+		t.Error("arigato should be a typo of arigatou")
+	}
+}

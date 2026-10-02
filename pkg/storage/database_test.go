@@ -78,6 +78,10 @@ func testDB(t *testing.T) *sql.DB {
 			t.Fatal(err)
 		}
 	}
+	// the tables above are the pre-migration schema, as on a deployed server
+	if err := Migrate(db); err != nil {
+		t.Fatal(err)
+	}
 	return db
 }
 
@@ -630,5 +634,63 @@ func TestBackupDBWritesReadableSnapshot(t *testing.T) {
 	}
 	if n != 1 {
 		t.Errorf("snapshot has %d vocab rows, want 1", n)
+	}
+}
+
+func TestMigrateIsIdempotent(t *testing.T) {
+	db := testDB(t) // already migrated once
+	if err := Migrate(db); err != nil {
+		t.Fatalf("second Migrate: %v", err)
+	}
+	if err := SetState(db, 1, "reminder", "крыша", "", 7); err != nil {
+		t.Fatalf("SetState after migration: %v", err)
+	}
+}
+
+func TestIdleModes(t *testing.T) {
+	db := testDB(t)
+	SetState(db, 1, "reminder", "крыша", "", 7)
+	SetCurrentWord(db, 2, "окно") // mode '' — not listed
+
+	modes, err := ActiveModes(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(modes) != 1 || modes[0].UserID != 1 || modes[0].Mode != "reminder" || modes[0].ReminderID != 7 || modes[0].Nudged {
+		t.Fatalf("ActiveModes = %+v", modes)
+	}
+	if time.Since(modes[0].ActiveAt) > time.Minute {
+		t.Fatalf("ActiveAt not set by SetState: %v", modes[0].ActiveAt)
+	}
+
+	past := time.Now().Add(-time.Hour)
+	if ok, _ := MarkNudged(db, 1, "reminder", past); ok {
+		t.Fatal("nudged a user who was active just now")
+	}
+	if ok, _ := ClearIdleMode(db, 1, "reminder", past); ok {
+		t.Fatal("cleared a mode the user was active in just now")
+	}
+
+	later := time.Now().Add(time.Minute)
+	if ok, _ := ClearIdleMode(db, 1, "ask", later); ok {
+		t.Fatal("cleared although the mode had changed")
+	}
+	if ok, _ := MarkNudged(db, 1, "reminder", later); !ok {
+		t.Fatal("idle user was not nudged")
+	}
+	if ok, _ := MarkNudged(db, 1, "reminder", later); ok {
+		t.Fatal("nudged twice")
+	}
+	if ok, _ := ClearIdleMode(db, 1, "reminder", later); !ok {
+		t.Fatal("idle mode was not cleared")
+	}
+	if st := GetState(db, 1); st.Mode != "" || st.Word != "крыша" {
+		t.Fatalf("after ClearIdleMode state = %+v", st)
+	}
+
+	// a new mode starts a fresh clock with a fresh nudge
+	SetState(db, 1, "ask", "は", "", 0)
+	if m, _ := ActiveModes(db); len(m) != 1 || m[0].Nudged {
+		t.Fatalf("new mode inherited nudge: %+v", m)
 	}
 }
