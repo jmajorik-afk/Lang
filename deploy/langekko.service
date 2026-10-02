@@ -1,0 +1,24 @@
+[Unit]
+Description=langekko — Japanese learning Telegram bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=langekko
+# relative paths in the bot (scripts/, templates/, ./languagebot.db, backups/) resolve from here
+WorkingDirectory=/opt/langekko
+EnvironmentFile=/opt/langekko/.env
+ExecStart=/opt/langekko/langekko telegram
+Restart=always
+RestartSec=5
+
+# hardening — the bot only needs its own directory and outbound network
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/opt/langekko
+
+[Install]
+WantedBy=multi-user.target
