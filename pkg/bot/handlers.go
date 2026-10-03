@@ -1983,7 +1983,23 @@ const (
 	srsSessionWindow = 12 * time.Hour
 	// srsSnooze is how long «Позже» postpones the announcement.
 	srsSnooze = 2 * time.Hour
+	// dailyReviewCap limits how many words on a long interval (a day or more) are
+	// asked per 24 hours, so a backlog after a break is spread over several days
+	// instead of arriving as one exhausting pile. Words on the 3-hour step — new
+	// and just forgotten ones — are never held back: that step is the point.
+	dailyReviewCap = 15
 )
+
+// longBudget is how many long-interval words may still be asked in the current
+// 24 hours.
+func longBudget(db *sql.DB, userID int) int {
+	n, err := storage.CountLongSent(db, userID, time.Now().Add(-24*time.Hour))
+	if err != nil {
+		log.Printf("daily review cap: %v", err)
+		return dailyReviewCap
+	}
+	return max(dailyReviewCap-n, 0)
+}
 
 // pluralRu picks the Russian plural form: 1 слово, 2 слова, 5 слов.
 func pluralRu(n int, one, few, many string) string {
@@ -2006,14 +2022,18 @@ func pluralRu(n int, one, few, many string) string {
 func StartReminderRound(bot *tgbotapi.BotAPI, db *sql.DB, userID int) {
 	storage.SetLastReminderAt(db, userID, time.Now())
 	now := time.Now()
-	n, err := storage.CountDueReminders(db, userID, now, now.Add(srsSessionWindow))
+	horizon := now.Add(srsSessionWindow)
+	n, err := storage.CountDueReminders(db, userID, now, horizon, longBudget(db, userID))
 	if err != nil || n == 0 {
 		return
 	}
 	if n >= srsSessionMin {
 		storage.SetState(db, userID, modeSrsOffer, "", "", 0)
-		sendKb(bot, int64(userID), fmt.Sprintf("Сегодня повторяем %d %s.\nНачнём, как будешь готов.",
-			n, pluralRu(n, "слово", "слова", "слов")), srsOfferKeyboard())
+		msg := fmt.Sprintf("Сегодня повторяем %d %s.", n, pluralRu(n, "слово", "слова", "слов"))
+		if all, err := storage.CountDueReminders(db, userID, now, horizon, -1); err == nil && all > n {
+			msg += fmt.Sprintf(" Остальные %d — завтра и дальше.", all-n)
+		}
+		sendKb(bot, int64(userID), msg+"\nНачнём, как будешь готов.", srsOfferKeyboard())
 		return
 	}
 	sendNextDueReminder(bot, db, userID, false)
@@ -2027,7 +2047,7 @@ func sendNextDueReminder(bot *tgbotapi.BotAPI, db *sql.DB, userID int, session b
 	if session {
 		horizon = now.Add(srsSessionWindow) // …a batch gathers the day's long-interval words
 	}
-	r, err := storage.NextDueReminder(db, userID, now, horizon)
+	r, err := storage.NextDueReminder(db, userID, now, horizon, longBudget(db, userID))
 	if err != nil {
 		return false
 	}
@@ -2041,7 +2061,7 @@ func sendNextDueReminder(bot *tgbotapi.BotAPI, db *sql.DB, userID int, session b
 
 	text := "Повторение!\n" + reminderQuestion(db, userID, r.Word) + " Напиши свой вариант."
 	if session {
-		if left, err := storage.CountDueReminders(db, userID, now, horizon); err == nil && left > 0 {
+		if left, err := storage.CountDueReminders(db, userID, now, horizon, longBudget(db, userID)); err == nil && left > 0 {
 			text += fmt.Sprintf("\n\nПосле этого останется ещё %d.", left)
 		}
 	}
@@ -2065,7 +2085,7 @@ func reminderPending(bot *tgbotapi.BotAPI, db *sql.DB, chatID int64, userID int)
 // srsWordsLeft is how many words the current batch still has waiting.
 func srsWordsLeft(db *sql.DB, userID int) int {
 	now := time.Now()
-	n, err := storage.CountDueReminders(db, userID, now, now.Add(srsSessionWindow))
+	n, err := storage.CountDueReminders(db, userID, now, now.Add(srsSessionWindow), longBudget(db, userID))
 	if err != nil {
 		log.Printf("srs words left: %v", err)
 		return 0
@@ -2086,12 +2106,14 @@ func continueSrsSession(bot *tgbotapi.BotAPI, db *sql.DB, chatID int64, userID i
 
 // ---------- idle modes ----------
 
-// While any mode is set the scheduler starts no reminder round, so a question
-// left unanswered or an /ask left open used to freeze SRS until the user did
-// something — and then the whole backlog arrived at once.
+// While a reminder or a batch offer waits for an answer, the scheduler starts no
+// other round. That is deliberate — the freeze: an absent user gets one nudge a
+// day later and then silence, not a question every few hours (the bot cannot
+// tell whether a message was read, so an earlier nudge would land on top of an
+// unread one). Whatever comes due meanwhile is spread out by dailyReviewCap once
+// the user is back. Other modes close on their own so they never block reminders.
 const (
-	idleNudgeAfter    = 1 * time.Hour    // unanswered reminder / batch offer: one nudge
-	idleGiveUpAfter   = 4 * time.Hour    // …then it is set aside and offered again later
+	idleNudgeAfter    = 24 * time.Hour   // unanswered reminder / batch offer: one nudge, then quiet
 	askIdleAfter      = 30 * time.Minute // /ask dialog closes itself
 	practiceIdleAfter = 1 * time.Hour    // abandoned practice closes itself
 	otherIdleAfter    = 1 * time.Hour    // save confirmations etc. — cleared silently
@@ -2111,11 +2133,7 @@ func ExpireIdleStates(bot *tgbotapi.BotAPI, db *sql.DB) {
 		chatID := int64(s.UserID)
 		switch s.Mode {
 		case "reminder", modeSrsOffer:
-			if idle >= idleGiveUpAfter {
-				if ok, _ := storage.ClearIdleMode(db, s.UserID, s.Mode, now.Add(-idleGiveUpAfter)); ok {
-					setAsideReminder(db, s)
-				}
-			} else if idle >= idleNudgeAfter && !s.Nudged {
+			if idle >= idleNudgeAfter && !s.Nudged {
 				if ok, _ := storage.MarkNudged(db, s.UserID, s.Mode, now.Add(-idleNudgeAfter)); ok {
 					nudgeReminder(bot, db, chatID, s)
 				}
@@ -2145,22 +2163,6 @@ func nudgeReminder(bot *tgbotapi.BotAPI, db *sql.DB, chatID int64, s storage.Idl
 		sendKb(bot, chatID, fmt.Sprintf("Напоминаю: ждут повторения %d %s.", n, pluralRu(n, "слово", "слова", "слов")),
 			srsOfferKeyboard())
 	}
-}
-
-// setAsideReminder puts an ignored question back into the queue without a
-// lapse — silence is not a wrong answer — and holds the next round back like
-// «Позже» does, so an absent user isn't asked again every few minutes.
-func setAsideReminder(db *sql.DB, s storage.IdleState) {
-	if s.Mode == "reminder" {
-		word, step := s.Word, 1
-		if w, st, err := storage.GetReminder(db, s.ReminderID); err == nil && w != "" {
-			word, step = w, st
-		}
-		if word != "" && !storage.HasPendingReminder(db, s.UserID, word) {
-			storage.ScheduleReminder(db, s.UserID, word, step, time.Now())
-		}
-	}
-	storage.SetLastReminderAt(db, s.UserID, time.Now().Add(srsSnooze-ReminderThrottle))
 }
 
 // ---------- callbacks ----------

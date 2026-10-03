@@ -24,7 +24,8 @@ CREATE TABLE IF NOT EXISTS reminders (
     step INTEGER NOT NULL DEFAULT 1,
     send_at DATETIME NOT NULL,
     sent INTEGER NOT NULL DEFAULT 0,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    sent_at DATETIME                       -- when it was actually asked; feeds the daily cap
 );
 CREATE INDEX IF NOT EXISTS idx_reminders_due ON reminders (send_at, sent);
 

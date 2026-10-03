@@ -71,6 +71,11 @@ func StartTelegramBot() {
 	} else if n > 0 {
 		log.Printf("normalized %d reminder timestamps to UTC", n)
 	}
+	if n, err := storage.DedupePendingReminders(db); err != nil {
+		log.Println("deduplicating reminders:", err)
+	} else if n > 0 {
+		log.Printf("removed %d duplicate pending reminder(s)", n)
+	}
 
 	allowedUsers := parseAllowedUsers(os.Getenv("ALLOWED_TELEGRAM_USER_IDS"))
 
@@ -186,8 +191,9 @@ func scheduleReminders(db *sql.DB, tgbot *tgbotapi.BotAPI) {
 	ticker := time.NewTicker(1 * time.Minute)
 	go func() {
 		for range ticker.C {
-			// nudge or close modes the user walked away from — otherwise a
-			// forgotten reminder or /ask blocks every round below indefinitely
+			// an unanswered reminder gets one nudge a day later and keeps the
+			// rounds below on hold until the user is back; an abandoned /ask or
+			// practice closes itself so it never holds reminders back
 			bot.ExpireIdleStates(tgbot, db)
 
 			// put back any word whose reminder was sent but never answered —

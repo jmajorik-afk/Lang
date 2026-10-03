@@ -146,6 +146,7 @@ func Migrate(db *sql.DB) error {
 	for _, c := range []struct{ table, column, ddl string }{
 		{"user_state", "active_at", "DATETIME"},
 		{"user_state", "nudged", "INTEGER NOT NULL DEFAULT 0"},
+		{"reminders", "sent_at", "DATETIME"},
 	} {
 		var n int
 		if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info(?) WHERE name=?`, c.table, c.column).Scan(&n); err != nil {
@@ -365,12 +366,37 @@ type DueReminder struct {
 // lexicographically — so a row written on a UTC+5 laptop and compared on a
 // UTC+2 server fired three hours late. Every writer here calls .UTC() and every
 // comparison passes a UTC value; NormalizeReminderTimes fixes rows from before.
+//
+// ScheduleReminder sets the word's next reminder, replacing any that is still
+// pending: a word has exactly one waiting reminder. Two of them meant the word
+// was asked twice — five words had doubles until 2026-10-03.
 func ScheduleReminder(db *sql.DB, userID int, word string, step int, sendAt time.Time) error {
-	_, err := db.Exec(
-		`INSERT INTO reminders (user_id, word, step, send_at, sent) VALUES (?,?,?,?,0)`,
-		userID, word, step, sendAt.UTC(),
-	)
-	return err
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`DELETE FROM reminders WHERE user_id=? AND word=? AND sent=0`, userID, word); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`INSERT INTO reminders (user_id, word, step, send_at, sent) VALUES (?,?,?,?,0)`,
+		userID, word, step, sendAt.UTC()); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// DedupePendingReminders keeps only the newest pending reminder of each word —
+// the one the latest answer scheduled. ScheduleReminder now prevents doubles;
+// this clears the ones made before. Idempotent; run at startup. Returns the
+// number of rows removed.
+func DedupePendingReminders(db *sql.DB) (int64, error) {
+	res, err := db.Exec(`DELETE FROM reminders WHERE sent=0 AND id NOT IN (
+		SELECT MAX(id) FROM reminders WHERE sent=0 GROUP BY user_id, word)`)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }
 
 // NormalizeReminderTimes rewrites timestamps stored with a non-UTC offset as
@@ -426,23 +452,43 @@ const dueWindow = ` AND (r.send_at <= ? OR (r.step >= 2 AND r.send_at <= ?))`
 
 // CountDueReminders is how many words are waiting for this user as of now: those
 // already due, plus long-interval words ripening before horizon that a batch may
-// gather early. Pass horizon == now for "strictly due now".
-func CountDueReminders(db *sql.DB, userID int, now, horizon time.Time) (int, error) {
-	var n int
-	err := db.QueryRow(`SELECT COUNT(*) FROM reminders r WHERE r.user_id=? AND r.sent=0`+dueWindow+justAnswered,
-		userID, now.UTC(), horizon.UTC()).Scan(&n)
-	return n, err
+// gather early. Pass horizon == now for "strictly due now". At most long words
+// on a long interval (step 2+) are counted — the daily cap; the 3-hour step is
+// never capped. A negative long means no cap.
+func CountDueReminders(db *sql.DB, userID int, now, horizon time.Time, long int) (int, error) {
+	var short, longN int
+	err := db.QueryRow(`SELECT COUNT(CASE WHEN r.step < 2 THEN 1 END), COUNT(CASE WHEN r.step >= 2 THEN 1 END)
+		FROM reminders r WHERE r.user_id=? AND r.sent=0`+dueWindow+justAnswered,
+		userID, now.UTC(), horizon.UTC()).Scan(&short, &longN)
+	if long >= 0 && longN > long {
+		longN = long
+	}
+	return short + longN, err
 }
 
-// NextDueReminder returns the longest-overdue word in that same scope.
-func NextDueReminder(db *sql.DB, userID int, now, horizon time.Time) (DueReminder, error) {
+// NextDueReminder returns the next word to ask in that same scope: the shortest
+// interval first — those memories are the most fragile, so after a break they
+// go before the long-settled ones — then the longest overdue. With no
+// long-interval budget left (long == 0) only 3-hour-step words qualify.
+func NextDueReminder(db *sql.DB, userID int, now, horizon time.Time, long int) (DueReminder, error) {
+	q := `SELECT r.id, r.user_id, r.word, r.step FROM reminders r WHERE r.user_id=? AND r.sent=0` +
+		dueWindow + justAnswered
+	if long == 0 {
+		q += ` AND r.step < 2`
+	}
 	var r DueReminder
-	err := db.QueryRow(
-		`SELECT r.id, r.user_id, r.word, r.step FROM reminders r WHERE r.user_id=? AND r.sent=0`+
-			dueWindow+justAnswered+` ORDER BY r.send_at ASC, r.id ASC LIMIT 1`,
-		userID, now.UTC(), horizon.UTC()).
+	err := db.QueryRow(q+` ORDER BY r.step ASC, r.send_at ASC, r.id ASC LIMIT 1`, userID, now.UTC(), horizon.UTC()).
 		Scan(&r.ID, &r.UserID, &r.Word, &r.Step)
 	return r, err
+}
+
+// CountLongSent is how many words on a long interval (step 2+) the user has
+// been asked since the given time — what the daily review cap is measured by.
+func CountLongSent(db *sql.DB, userID int, since time.Time) (int, error) {
+	var n int
+	err := db.QueryRow(`SELECT COUNT(*) FROM reminders WHERE user_id=? AND sent=1 AND step>=2 AND sent_at>=?`,
+		userID, since.UTC()).Scan(&n)
+	return n, err
 }
 
 func GetDueReminders(db *sql.DB) ([]DueReminder, error) {
@@ -468,8 +514,14 @@ func GetDueReminders(db *sql.DB) ([]DueReminder, error) {
 // RescheduleAbandoned re-queues saved words that have no reminder waiting for
 // them. A new reminder is only ever created when the previous one is answered,
 // so a question that was sent and then ignored — or overwritten by another —
-// took its word out of the rotation for good. Words whose last reminder is
-// newer than grace are left alone: that question may still be on screen.
+// took its word out of the rotation for good.
+//
+// The question the user has open right now is never touched, however old: an
+// unanswered reminder waits for its answer. And "how long ago" is measured from
+// when the word was actually asked (sent_at). It used to be its scheduled time,
+// so a word that was a day overdue when asked looked abandoned the minute it
+// went out, got a second reminder while the user was still typing — and was
+// asked twice. Rows sent before sent_at existed fall back to send_at.
 // Returns how many words were put back.
 func RescheduleAbandoned(db *sql.DB, grace time.Duration) (int64, error) {
 	now := time.Now().UTC()
@@ -484,7 +536,10 @@ func RescheduleAbandoned(db *sql.DB, grace time.Duration) (int64, error) {
 		WHERE NOT EXISTS (
 		        SELECT 1 FROM reminders p
 		        WHERE p.user_id = v.user_id AND p.word = v.word AND p.sent = 0)
-		  AND COALESCE((SELECT MAX(r.send_at) FROM reminders r
+		  AND NOT EXISTS (
+		        SELECT 1 FROM user_state s
+		        WHERE s.user_id = v.user_id AND s.mode = 'reminder' AND s.word = v.word)
+		  AND COALESCE((SELECT MAX(COALESCE(r.sent_at, r.send_at)) FROM reminders r
 		                WHERE r.user_id = v.user_id AND r.word = v.word), '') <= ?
 	`, now, now.Add(-grace))
 	if err != nil {
@@ -494,7 +549,7 @@ func RescheduleAbandoned(db *sql.DB, grace time.Duration) (int64, error) {
 }
 
 func MarkReminderSent(db *sql.DB, id int) error {
-	_, err := db.Exec(`UPDATE reminders SET sent=1 WHERE id=?`, id)
+	_, err := db.Exec(`UPDATE reminders SET sent=1, sent_at=? WHERE id=?`, time.Now().UTC(), id)
 	return err
 }
 
