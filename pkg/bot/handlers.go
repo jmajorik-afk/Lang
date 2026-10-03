@@ -10,12 +10,14 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
 	claude_api "language-learning-bot/pkg/claude"
 	"language-learning-bot/pkg/config"
 	"language-learning-bot/pkg/jisho"
+	"language-learning-bot/pkg/kanji"
 	openai_api "language-learning-bot/pkg/openai"
 	storage "language-learning-bot/pkg/storage"
 
@@ -345,12 +347,13 @@ func backfillTranslations(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, ch
 		if tr, alts, _ := translateWord(clients, db, entries[i].Word); tr != "" {
 			storage.SetVocabSenses(db, userID, entries[i].Word, tr, alts)
 			entries[i].Translation, entries[i].Alternatives = tr, alts
+			learnKanji(clients, db, sensesOf(tr, alts), saveKanjiWait)
 		}
 	}
 	deleteMsg(bot, chatID, think)
 }
 
-func vocabLine(sb *strings.Builder, n int, e storage.VocabEntry) {
+func vocabLine(sb *strings.Builder, db *sql.DB, n int, e storage.VocabEntry) {
 	if e.Translation != "" {
 		fmt.Fprintf(sb, "%d. %s — %s\n", n, e.Word, e.Translation)
 	} else {
@@ -361,6 +364,10 @@ func vocabLine(sb *strings.Builder, n int, e storage.VocabEntry) {
 		if alt = strings.TrimSpace(alt); alt != "" {
 			fmt.Fprintf(sb, "    ещё: %s\n", alt)
 		}
+	}
+	// what each kanji of the word means, the building blocks of the word
+	for _, note := range kanjiNotes(db, e.SenseLines()) {
+		fmt.Fprintf(sb, "    %s\n", note)
 	}
 }
 
@@ -389,7 +396,7 @@ func sendVocab(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, chatID int64,
 		fmt.Fprintf(&sb, "Твой словарь (%d), слова %d–%d:\n\n", total, offset+1, offset+len(entries))
 	}
 	for i, e := range entries {
-		vocabLine(&sb, offset+i+1, e)
+		vocabLine(&sb, db, offset+i+1, e)
 	}
 
 	sendKb(bot, chatID, sb.String(), vocabPageKeyboard(offset, offset+len(entries) < total))
@@ -484,7 +491,7 @@ func sendVocabSearch(bot *tgbotapi.BotAPI, db *sql.DB, chatID int64, userID int,
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "Нашёл (%d):\n\n", len(entries))
 	for i, e := range entries {
-		vocabLine(&sb, i+1, e)
+		vocabLine(&sb, db, i+1, e)
 	}
 	send(bot, chatID, sb.String())
 }
@@ -577,6 +584,7 @@ func handleAwaitWord(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, message
 		return
 	}
 	translation, alternatives, verified := translateWord(clients, db, word)
+	learnKanji(clients, db, sensesOf(translation, alternatives), saveKanjiWait)
 	deleteMsg(bot, chatID, think)
 	askSaveConfirmation(bot, db, chatID, userID, word, translation, alternatives, verified)
 }
@@ -993,6 +1001,192 @@ func firstLine(s string) string {
 	return ""
 }
 
+// ---------- kanji meanings ----------
+
+// saveKanjiWait bounds the dictionary lookups made while the user waits for the
+// «Запомнить» confirmation; a slow dictionary only delays the meanings to the
+// next background fill, never the confirmation itself.
+const saveKanjiWait = 5 * time.Second
+
+func isKanji(r rune) bool { return r >= 0x4E00 && r <= 0x9FFF }
+
+// kanjiOf lists the distinct kanji in the Japanese forms of the senses, in order
+// of appearance: 植物(しょくぶつ) → 植, 物. Kana and the 々 repeat mark carry no
+// meaning of their own and are skipped.
+func kanjiOf(senses []string) []string {
+	seen := map[rune]bool{}
+	var out []string
+	for _, sense := range senses {
+		for _, r := range japaneseHeadword(sense) {
+			if isKanji(r) && !seen[r] {
+				seen[r] = true
+				out = append(out, string(r))
+			}
+		}
+	}
+	return out
+}
+
+func sensesOf(translation, alternatives string) []string {
+	return storage.VocabEntry{Translation: translation, Alternatives: alternatives}.SenseLines()
+}
+
+// kanjiNotes returns one line per kanji of the senses — «植 — сажать, растение» —
+// read from the cache only, so showing a word never waits on the network. Kanji
+// not learned yet are left out; learnKanji fills them in.
+func kanjiNotes(db *sql.DB, senses []string) []string {
+	chars := kanjiOf(senses)
+	if len(chars) == 0 {
+		return nil
+	}
+	known, err := storage.KanjiMeanings(db, chars)
+	if err != nil {
+		log.Printf("kanji cache: %v", err)
+		return nil
+	}
+	var out []string
+	for _, c := range chars {
+		if m := known[c]; m != "" {
+			out = append(out, c+" — "+m)
+		}
+	}
+	return out
+}
+
+// kanjiBlock renders the notes under an entry, or "" for a word without kanji.
+func kanjiBlock(notes []string) string {
+	if len(notes) == 0 {
+		return ""
+	}
+	return "\n\nКандзи:\n" + strings.Join(notes, "\n")
+}
+
+// kanjiGlossPrompt turns KANJIDIC's English meanings into a short Russian gloss.
+// The meanings are handed over, so the model translates instead of recalling.
+const kanjiGlossPrompt = "You write a Russian dictionary for a beginner learning Japanese. Each input line is " +
+	"a kanji, a colon and its English meanings from the KANJIDIC dictionary. For every line output exactly one " +
+	"line: the kanji, ' — ', then 1-3 short Russian words for its core meaning, comma-separated, lowercase. " +
+	"Translate ONLY the given English meanings; the first given one is the main meaning. Leave out zodiac, " +
+	"calendar and rare senses — a beginner needs the everyday meaning. Never add a meaning that is not given. " +
+	"Output only these lines, in the same order, nothing else."
+
+// learnKanji caches a Russian gloss for every kanji of the senses that has none
+// yet. The meanings come from KANJIDIC (kanjiapi.dev) and one model call glosses
+// the whole batch. A character the dictionary can't supply within wait is
+// skipped and tried again later — nothing is ever made up for it. Returns how
+// many kanji it learned.
+func learnKanji(clients *Clients, db *sql.DB, senses []string, wait time.Duration) int {
+	chars := kanjiOf(senses)
+	if len(chars) == 0 {
+		return 0
+	}
+	known, err := storage.KanjiMeanings(db, chars)
+	if err != nil {
+		log.Printf("kanji cache: %v", err)
+		return 0
+	}
+	var missing []string
+	for _, c := range chars {
+		if known[c] == "" {
+			missing = append(missing, c)
+		}
+	}
+	if len(missing) == 0 {
+		return 0
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), wait)
+	defer cancel()
+	english := make([][]string, len(missing))
+	var wg sync.WaitGroup
+	slots := make(chan struct{}, 4) // a free API: a few requests at a time
+	for i, c := range missing {
+		wg.Add(1)
+		go func(i int, c string) {
+			defer wg.Done()
+			slots <- struct{}{}
+			defer func() { <-slots }()
+			m, err := kanji.Meanings(ctx, c)
+			if err != nil {
+				log.Printf("kanji %s: %v", c, err)
+				return
+			}
+			english[i] = m
+		}(i, c)
+	}
+	wg.Wait()
+
+	var req strings.Builder
+	var asked []string
+	for i, c := range missing {
+		if len(english[i]) > 0 {
+			fmt.Fprintf(&req, "%s: %s\n", c, strings.Join(english[i], "; "))
+			asked = append(asked, c)
+		}
+	}
+	if len(asked) == 0 {
+		return 0
+	}
+	resp, err := claudeOne(clients, kanjiGlossPrompt, req.String())
+	if err != nil {
+		log.Printf("kanji glosses: %v", err)
+		return 0
+	}
+	glosses := parseKanjiGlosses(resp, asked)
+	if len(glosses) < len(asked) {
+		log.Printf("kanji glosses: %d of %d usable in %q", len(glosses), len(asked), resp)
+	}
+	learned := 0
+	for c, m := range glosses {
+		if err := storage.SetKanjiMeaning(db, c, m); err != nil {
+			log.Printf("kanji cache: %v", err)
+			continue
+		}
+		learned++
+	}
+	return learned
+}
+
+// parseKanjiGlosses reads «植 — растение» lines back, keeping only the kanji
+// that were asked about and a gloss that is short Russian text. The kanji is
+// the first character of the line and the separator is whatever the model
+// chose: on a long batch it mirrors the input and writes «植: растение».
+func parseKanjiGlosses(resp string, asked []string) map[string]string {
+	want := map[string]bool{}
+	for _, c := range asked {
+		want[c] = true
+	}
+	out := map[string]string{}
+	for _, line := range strings.Split(resp, "\n") {
+		line = strings.TrimSpace(line)
+		r, size := utf8.DecodeRuneInString(line)
+		k := string(r)
+		if size == 0 || !want[k] {
+			continue
+		}
+		gloss := strings.TrimLeft(line[size:], " \t:：—–-")
+		gloss = strings.ToLower(strings.TrimRight(strings.TrimSpace(gloss), ".;"))
+		if gloss == "" || !containsCyrillic(gloss) || containsJapanese(gloss) || utf8.RuneCountInString(gloss) > 40 {
+			continue
+		}
+		out[k] = gloss
+	}
+	return out
+}
+
+// LearnVocabKanji fills the kanji cache for every saved word — the words saved
+// before kanji meanings existed and any whose lookup failed at the time.
+func LearnVocabKanji(clients *Clients, db *sql.DB) {
+	senses, err := storage.AllVocabSenses(db)
+	if err != nil {
+		log.Printf("kanji backfill: %v", err)
+		return
+	}
+	if n := learnKanji(clients, db, senses, 2*time.Minute); n > 0 {
+		log.Printf("learned the meanings of %d kanji", n)
+	}
+}
+
 // askSaveConfirmation puts the user in the confirm step (with the senses already
 // shown) instead of saving blindly. The senses are stashed in task_text — main
 // sense on the first line — so "Да" can persist them without a second API call.
@@ -1009,6 +1203,7 @@ func askSaveConfirmation(bot *tgbotapi.BotAPI, db *sql.DB, chatID int64, userID 
 		if verified {
 			msg += "\n(чтение сверено с Jisho)"
 		}
+		msg += kanjiBlock(kanjiNotes(db, sensesOf(translation, alternatives)))
 	}
 	sendKb(bot, chatID, msg, confirmSaveKeyboard())
 }
@@ -1772,10 +1967,12 @@ func checkReminder(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, chatID in
 	recordOutcome(db, userID, "reminder", word, "", v, tag, fb)
 
 	session := st.TaskText == srsSessionFlag
+	// the meaning of each kanji, right when the word is fresh in mind
+	kanjiHint := kanjiBlock(kanjiNotes(db, entry.SenseLines()))
 	if v == verdictOK {
 		next := step + 1
 		storage.ScheduleReminder(db, userID, word, next, time.Now().Add(intervalFor(next)))
-		send(bot, chatID, "Правильно!\n"+fb+"\n\nНапомню это слово ещё попозже.")
+		send(bot, chatID, "Правильно!\n"+fb+kanjiHint+"\n\nНапомню это слово ещё попозже.")
 		continueSrsSession(bot, db, chatID, userID, session)
 	} else {
 		back := lapseStep(step)
@@ -1784,7 +1981,7 @@ func checkReminder(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, chatID in
 		// stay on this word rather than auto-advancing: «Оспорить» needs the
 		// answer, and moving on would bury a possibly wrong verdict. «Дальше»
 		// lets the user continue the batch deliberately.
-		sendKb(bot, chatID, fb+"\n\nНичего страшного — напомню это слово снова скоро.",
+		sendKb(bot, chatID, fb+kanjiHint+"\n\nНичего страшного — напомню это слово снова скоро.",
 			reminderContestKeyboard(st.ReminderID, session && srsWordsLeft(db, userID) > 0))
 	}
 }
@@ -1856,7 +2053,7 @@ func typoBudget(form string) int {
 
 func hasKanji(s string) bool {
 	for _, r := range s {
-		if r >= 0x4E00 && r <= 0x9FFF {
+		if isKanji(r) {
 			return true
 		}
 	}
@@ -2200,6 +2397,7 @@ func HandleCallbackQuery(bot *tgbotapi.BotAPI, clients *Clients, callbackQuery *
 			return
 		}
 		translation, alternatives, verified := savePayload(clients, db, word, answer)
+		learnKanji(clients, db, sensesOf(translation, alternatives), saveKanjiWait)
 		deleteMsg(bot, chatID, think)
 		askSaveConfirmation(bot, db, chatID, userID, word, translation, alternatives, verified)
 
@@ -2313,7 +2511,20 @@ func HandleCallbackQuery(bot *tgbotapi.BotAPI, clients *Clients, callbackQuery *
 			return
 		}
 		think := sendThinking(bot, chatID)
-		ans, _ := claudeOne(clients, styleRules+" Reply in Russian. Show how the word «"+word+"» is in Japanese: kanji(чтение) (romaji) — перевод, plus one short example.", word)
+		entry, _ := storage.FindVocab(db, userID, word)
+		var ans string
+		if senses := entry.SenseLines(); len(senses) > 0 {
+			// reveal the user's own entry: a fresh translation could name a
+			// different word than the one the reminder will keep asking for
+			ans = strings.Join(senses, "\n")
+			if ex, err := claudeOne(clients, styleRules+" Reply in Russian. Give one short example sentence in "+
+				"Japanese with «"+japaneseHeadword(entry.Translation)+"», then its Russian translation.", word); err == nil {
+				ans += "\n\n" + ex
+			}
+			ans += kanjiBlock(kanjiNotes(db, senses))
+		} else {
+			ans, _ = claudeOne(clients, styleRules+" Reply in Russian. Show how the word «"+word+"» is in Japanese: kanji(чтение) (romaji) — перевод, plus one short example.", word)
+		}
 		deleteMsg(bot, chatID, think)
 		storage.ScheduleReminder(db, userID, word, 1, time.Now().Add(intervalFor(1)))
 		send(bot, chatID, "Ничего страшного, вот как это:\n\n"+ans+"\n\nНапомню это слово снова скоро.")

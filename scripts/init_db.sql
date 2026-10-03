@@ -73,6 +73,14 @@ CREATE TABLE IF NOT EXISTS translation_cache (
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Global cache of single-kanji meanings: a short Russian gloss made from the
+-- English meanings in KANJIDIC (kanjiapi.dev). Shown under words written in kanji.
+CREATE TABLE IF NOT EXISTS kanji_cache (
+    kanji TEXT PRIMARY KEY,
+    meaning TEXT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
 -- Journal of every judged answer: feeds /stats, weak-point targeting, difficulty
 CREATE TABLE IF NOT EXISTS outcomes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -261,6 +261,58 @@ func SetVocabSenses(db *sql.DB, userID int, word, translation, alternatives stri
 	return err
 }
 
+// AllVocabSenses returns every sense line of every saved word, all users —
+// what the kanji cache is filled from.
+func AllVocabSenses(db *sql.DB) ([]string, error) {
+	rows, err := db.Query(`SELECT translation, alternatives FROM vocab`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var e VocabEntry
+		if err := rows.Scan(&e.Translation, &e.Alternatives); err != nil {
+			return nil, err
+		}
+		out = append(out, e.SenseLines()...)
+	}
+	return out, rows.Err()
+}
+
+// KanjiMeanings returns the cached Russian glosses of the given kanji; those not
+// cached yet are absent from the map.
+func KanjiMeanings(db *sql.DB, chars []string) (map[string]string, error) {
+	out := map[string]string{}
+	if len(chars) == 0 {
+		return out, nil
+	}
+	args := make([]any, len(chars))
+	for i, c := range chars {
+		args[i] = c
+	}
+	rows, err := db.Query(`SELECT kanji, meaning FROM kanji_cache WHERE kanji IN (?`+
+		strings.Repeat(",?", len(chars)-1)+`)`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var k, m string
+		if err := rows.Scan(&k, &m); err != nil {
+			return nil, err
+		}
+		out[k] = m
+	}
+	return out, rows.Err()
+}
+
+func SetKanjiMeaning(db *sql.DB, char, meaning string) error {
+	_, err := db.Exec(`INSERT INTO kanji_cache (kanji, meaning) VALUES (?, ?)
+		ON CONFLICT(kanji) DO UPDATE SET meaning=excluded.meaning`, char, meaning)
+	return err
+}
+
 // GetVocabPage returns the total number of saved words plus one page of them,
 // newest first (id breaks ties for words saved within the same second).
 func GetVocabPage(db *sql.DB, userID, offset, limit int) (int, []VocabEntry, error) {

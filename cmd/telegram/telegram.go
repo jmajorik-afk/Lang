@@ -81,6 +81,14 @@ func StartTelegramBot() {
 
 	scheduleBackups(db)
 	scheduleReminders(db, tgbot)
+	// kanji meanings for words saved before the feature existed, and a daily
+	// retry for any lookup the dictionary failed at the time
+	go func() {
+		for {
+			bot.LearnVocabKanji(clients, db)
+			time.Sleep(24 * time.Hour)
+		}
+	}()
 
 	u := tgbotapi.NewUpdate(0)
 	u.Timeout = 60

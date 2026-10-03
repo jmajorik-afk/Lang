@@ -73,6 +73,12 @@ func testDB(t *testing.T) *sql.DB {
 			verified INTEGER NOT NULL DEFAULT 0,
 			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 		)`,
+		// a new table, not a migration: init_db.sql creates it on any database
+		`CREATE TABLE kanji_cache (
+			kanji TEXT PRIMARY KEY,
+			meaning TEXT NOT NULL,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		)`,
 	} {
 		if _, err := db.Exec(ddl); err != nil {
 			t.Fatal(err)
@@ -841,5 +847,38 @@ func TestIdleModes(t *testing.T) {
 	SetState(db, 1, "ask", "は", "", 0)
 	if m, _ := ActiveModes(db); len(m) != 1 || m[0].Nudged {
 		t.Fatalf("new mode inherited nudge: %+v", m)
+	}
+}
+
+func TestKanjiCache(t *testing.T) {
+	db := testDB(t)
+	if m, err := KanjiMeanings(db, nil); err != nil || len(m) != 0 {
+		t.Fatalf("empty request: %v, %v", m, err)
+	}
+	SetKanjiMeaning(db, "植", "сажать")
+	SetKanjiMeaning(db, "物", "вещь, предмет")
+	SetKanjiMeaning(db, "植", "сажать, растение") // a better gloss replaces the old one
+
+	m, err := KanjiMeanings(db, []string{"植", "物", "寒"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(m) != 2 || m["植"] != "сажать, растение" || m["物"] != "вещь, предмет" {
+		t.Errorf("KanjiMeanings = %v; 寒 is not cached and must be absent", m)
+	}
+}
+
+func TestAllVocabSenses(t *testing.T) {
+	db := testDB(t)
+	SaveVocab(db, 1, "растение", "植物(しょくぶつ) (shokubutsu)", "")
+	SaveVocab(db, 2, "холодно", "寒(さむ)い (samui) — о погоде", "冷(つめ)たい (tsumetai) — о предмете")
+	SaveVocab(db, 1, "старое", "", "") // legacy row without a translation
+
+	senses, err := AllVocabSenses(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(senses) != 3 {
+		t.Errorf("AllVocabSenses = %q, want 3 lines across both users", senses)
 	}
 }

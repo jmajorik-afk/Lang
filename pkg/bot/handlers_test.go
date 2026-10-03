@@ -543,3 +543,52 @@ func TestLooksLikeTypo(t *testing.T) {
 		t.Error("arigato should be a typo of arigatou")
 	}
 }
+
+func TestKanjiOf(t *testing.T) {
+	got := kanjiOf([]string{
+		"植物(しょくぶつ) (shokubutsu)",
+		"寒(さむ)い (samui) — о погоде", // okurigana and the usage note are not kanji
+		"冷(つめ)たい (tsumetai) — о предмете",
+		"人々(ひとびと) (hitobito)", // 々 repeats 人, it has no meaning of its own
+		"ありがとう (arigatou)",    // kana only
+		"植木(うえき) (ueki)",      // 植 again — listed once
+	})
+	if want := "植 物 寒 冷 人 木"; strings.Join(got, " ") != want {
+		t.Errorf("kanjiOf = %v, want %s", got, want)
+	}
+	if kanjiOf([]string{"コーヒー (koohii)"}) != nil {
+		t.Error("a katakana word has no kanji to explain")
+	}
+}
+
+func TestParseKanjiGlosses(t *testing.T) {
+	resp := "植 — сажать, растение\n" +
+		"物 - Вещь, предмет.\n" + // hyphen and capital: still accepted, normalised
+		"子: ребёнок\n" + // on a long batch the model mirrors the input's colon
+		"Note: here are the glosses\n" + // chatter around the lines is ignored
+		"寒 — cold\n" + // not Russian — rejected
+		"冷 — 冷たい\n" + // Japanese in the gloss — rejected
+		"木 — дерево\n" + // never asked about — ignored
+		"人 — это очень длинное описание значения, которое явно не короткое\n" +
+		"мусор без разделителя"
+	got := parseKanjiGlosses(resp, []string{"植", "物", "子", "寒", "冷", "人"})
+	want := map[string]string{"植": "сажать, растение", "物": "вещь, предмет", "子": "ребёнок"}
+	if len(got) != len(want) {
+		t.Fatalf("parseKanjiGlosses = %v, want %v", got, want)
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("%s = %q, want %q", k, got[k], v)
+		}
+	}
+}
+
+func TestKanjiBlock(t *testing.T) {
+	if kanjiBlock(nil) != "" {
+		t.Error("a word without kanji must add nothing")
+	}
+	got := kanjiBlock([]string{"植 — сажать, растение", "物 — вещь, предмет"})
+	if want := "\n\nКандзи:\n植 — сажать, растение\n物 — вещь, предмет"; got != want {
+		t.Errorf("kanjiBlock = %q, want %q", got, want)
+	}
+}
