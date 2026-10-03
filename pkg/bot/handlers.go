@@ -572,6 +572,10 @@ func HandleMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, clients *Cli
 		if !capOK(bot, clients, db, chatID, userID) {
 			return
 		}
+		if words := splitWordList(message.Text); words != nil {
+			lookupWordList(bot, clients, db, chatID, userID, words)
+			return
+		}
 		flow1Lookup(bot, clients, db, message)
 	}
 }
@@ -2601,6 +2605,9 @@ func HandleCallbackQuery(bot *tgbotapi.BotAPI, clients *Clients, callbackQuery *
 
 	case strings.HasPrefix(data, "kana_pick#"), strings.HasPrefix(data, "kana_skip#"):
 		handleKanaButton(bot, db, callbackQuery, data)
+
+	case data == "list_all", strings.HasPrefix(data, "list_one#"):
+		saveFromWordList(bot, db, callbackQuery, data)
 
 	case data == "clarify":
 		st := storage.GetState(db, userID)

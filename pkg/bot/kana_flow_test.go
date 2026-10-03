@@ -49,7 +49,7 @@ func (f *fakeTelegram) last() string {
 	return f.texts[len(f.texts)-1]
 }
 
-func kanaTestEnv(t *testing.T) (*tgbotapi.BotAPI, *sql.DB, *fakeTelegram) {
+func botTestEnv(t *testing.T) (*tgbotapi.BotAPI, *sql.DB, *fakeTelegram) {
 	t.Helper()
 	fake := &fakeTelegram{}
 	srv := httptest.NewServer(fake)
@@ -119,7 +119,7 @@ func answerKana(bot *tgbotapi.BotAPI, db *sql.DB, ks kanaState, right bool) {
 func TestKanaRoundsEndToEnd(t *testing.T) {
 	for _, mode := range []string{"hiragana", "katakana", "mixed", "pairs"} {
 		t.Run(mode, func(t *testing.T) {
-			bot, db, fake := kanaTestEnv(t)
+			bot, db, fake := botTestEnv(t)
 			startKanaRound(bot, db, kanaTestUser, kanaTestUser, mode)
 			if !strings.Contains(fake.last(), "Уровень 1") {
 				t.Fatalf("round opened with %q", fake.last())
@@ -161,7 +161,7 @@ func TestKanaRoundsEndToEnd(t *testing.T) {
 // TestKanaStageAdvancesInPlay — answering everything right moves the user from
 // reading to writing within a few rounds, and says so.
 func TestKanaStageAdvancesInPlay(t *testing.T) {
-	bot, db, fake := kanaTestEnv(t)
+	bot, db, fake := botTestEnv(t)
 	passed := false
 	for round := 0; round < 12 && !passed; round++ {
 		startKanaRound(bot, db, kanaTestUser, kanaTestUser, "hiragana")
@@ -186,7 +186,7 @@ func TestKanaStageAdvancesInPlay(t *testing.T) {
 
 // TestKanaStaleAndStrayInput — an old button, Cyrillic text and «Не знаю».
 func TestKanaStaleAndStrayInput(t *testing.T) {
-	bot, db, fake := kanaTestEnv(t)
+	bot, db, fake := botTestEnv(t)
 	startKanaRound(bot, db, kanaTestUser, kanaTestUser, "hiragana")
 	ks, _ := kanaOpen(t, db)
 
