@@ -35,33 +35,50 @@ type listWord struct {
 	Saved        bool   `json:"s,omitempty"` // in the dictionary, from before or just now
 }
 
+// sentenceStarts open a clause, not a dictionary entry: «я дома, но устал» is
+// a sentence with a comma, «в порядке» is an expression to learn.
+var sentenceStarts = map[string]bool{
+	"но": true, "что": true, "если": true, "когда": true, "потому": true, "чтобы": true, "хотя": true,
+	"который": true, "которая": true, "которое": true, "которые": true,
+	"я": true, "ты": true, "он": true, "она": true, "оно": true, "мы": true, "вы": true, "они": true,
+}
+
 // splitWordList recognises a message that is a list of words and returns them,
-// or nil for anything else, which stays a normal lookup: every item must reduce
-// to one Russian word, so «красная машина» (a phrase) and «я дома, но устал» (a
-// sentence) are not lists.
+// or nil for anything else, which stays a normal lookup. An item may be a short
+// expression of up to three words («в порядке», «доброе утро»), but one that
+// opens like a clause («я дома, но устал») makes the message a sentence. A lone
+// pronoun is still a word: «я, ты, он» is a list.
 func splitWordList(text string) []string {
 	if !strings.ContainsAny(text, ",;\n") {
 		return nil
 	}
-	var words []string
+	var items []string
 	seen := map[string]bool{}
 	for _, part := range strings.FieldsFunc(text, func(r rune) bool { return r == ',' || r == ';' || r == '\n' }) {
 		if strings.TrimSpace(part) == "" {
 			continue
 		}
-		w := sanitizeWord(part)
-		if w == "" || !containsCyrillic(w) {
+		// count before fillers are peeled: «это очень большая собака» is a
+		// sentence, even though «очень большая собака» would fit
+		if len(strings.Fields(normalizeWord(part))) > 3 {
 			return nil
 		}
-		if !seen[w] {
-			seen[w] = true
-			words = append(words, w)
+		item := sanitizePhrase(part, 3)
+		if item == "" || !containsCyrillic(item) {
+			return nil
+		}
+		if words := strings.Fields(item); len(words) > 1 && sentenceStarts[words[0]] {
+			return nil
+		}
+		if !seen[item] {
+			seen[item] = true
+			items = append(items, item)
 		}
 	}
-	if len(words) < 2 {
+	if len(items) < 2 {
 		return nil
 	}
-	return words
+	return items
 }
 
 // lookupWordList translates the words — a few at a time, cached ones for free —

@@ -724,6 +724,12 @@ var fillerPrefixes = []string{"а ", "и ", "ну ", "вот ", "это ", "сл
 // be reduced to a single word. "" is the signal that the caller must resolve it
 // (via Claude or by asking the user) rather than saving junk.
 func sanitizeWord(raw string) string {
+	return sanitizePhrase(raw, 1)
+}
+
+// sanitizePhrase is sanitizeWord for a short expression of up to maxWords
+// words, such as «в порядке» in a list of words to save. "" when it is longer.
+func sanitizePhrase(raw string, maxWords int) string {
 	w := strings.ToLower(normalizeWord(raw))
 	// peel repeated fillers: "а вот крыша" → "крыша"
 	for {
@@ -738,10 +744,12 @@ func sanitizeWord(raw string) string {
 		w = stripped
 	}
 	w = strings.Trim(w, " \t?!.,;:«»\"'()")
-	if w == "" || strings.ContainsAny(w, " \t") {
-		return "" // still a phrase, not a single word
+	words := strings.Fields(w)
+	if len(words) == 0 || len(words) > maxWords {
+		return "" // still a longer phrase
 	}
-	if utf8.RuneCountInString(w) > 32 {
+	w = strings.Join(words, " ")
+	if utf8.RuneCountInString(w) > 32*maxWords {
 		return ""
 	}
 	return w

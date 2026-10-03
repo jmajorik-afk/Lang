@@ -18,11 +18,17 @@ func TestSplitWordList(t *testing.T) {
 		"Собака; КОШКА.":           "собака кошка",
 		"собака, собака, кошка":    "собака кошка", // repeats dropped
 		"как будет собака, кошка?": "собака кошка", // lookup phrasing peeled off
-		"собака":              "", // one word: the usual lookup
-		"красная машина, дом": "", // a phrase is not a list item
-		"я дома, но устал":    "", // a sentence with a comma
-		"dog, cat":            "", // not Russian
-		"собака, собака":      "", // one word after all
+		"собака":           "", // one word: the usual lookup
+		"я дома, но устал": "", // a sentence with a comma
+		"dog, cat":         "", // not Russian
+		"собака, собака":   "", // one word after all
+		// the real message that came through as a single lookup
+		"человек, студент, друг, в порядке": "человек студент друг в порядке",
+		"красная машина, доброе утро":       "красная машина доброе утро",
+		"я, ты, он":        "я ты он", // lone pronouns are words to learn
+		"привет, как дела": "привет как дела",
+		"если пойдёт дождь, я останусь дома": "", // a clause
+		"собака, это очень большая собака":   "", // four words: a sentence
 	} {
 		if got := strings.Join(splitWordList(text), " "); got != want {
 			t.Errorf("splitWordList(%q) = %q, want %q", text, got, want)
