@@ -307,6 +307,66 @@ func KanjiMeanings(db *sql.DB, chars []string) (map[string]string, error) {
 	return out, rows.Err()
 }
 
+// --- Kana trainer ---
+
+// KanaStat is one item's record in one direction.
+type KanaStat struct {
+	Seen, Correct, Streak int
+	Confused              string // what it was last mistaken for
+}
+
+// KanaProgress returns all the user's kana records keyed by dir + "|" + item.
+func KanaProgress(db *sql.DB, userID int) (map[string]KanaStat, error) {
+	rows, err := db.Query(`SELECT item, dir, seen, correct, streak, confused FROM kana_progress WHERE user_id=?`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]KanaStat{}
+	for rows.Next() {
+		var item, dir string
+		var s KanaStat
+		if err := rows.Scan(&item, &dir, &s.Seen, &s.Correct, &s.Streak, &s.Confused); err != nil {
+			return nil, err
+		}
+		out[dir+"|"+item] = s
+	}
+	return out, rows.Err()
+}
+
+// RecordKana logs one answer: a right one extends the run, a wrong one ends it
+// and remembers what the item was mistaken for.
+func RecordKana(db *sql.DB, userID int, item, dir string, ok bool, confused string) error {
+	right := 0
+	if ok {
+		right = 1
+	}
+	_, err := db.Exec(`
+		INSERT INTO kana_progress (user_id, item, dir, seen, correct, streak, confused, updated_at)
+		VALUES (?, ?, ?, 1, ?, ?, ?, ?)
+		ON CONFLICT(user_id, item, dir) DO UPDATE SET
+			seen = seen + 1,
+			correct = correct + excluded.correct,
+			streak = CASE WHEN excluded.correct = 1 THEN streak + 1 ELSE 0 END,
+			confused = CASE WHEN excluded.correct = 1 THEN confused ELSE excluded.confused END,
+			updated_at = excluded.updated_at`,
+		userID, item, dir, right, right, confused, time.Now().UTC())
+	return err
+}
+
+// GetKanaStage is the stage the user has reached in a trainer mode (0 if new).
+func GetKanaStage(db *sql.DB, userID int, mode string) int {
+	var n int
+	db.QueryRow(`SELECT stage FROM kana_stage WHERE user_id=? AND mode=?`, userID, mode).Scan(&n)
+	return n
+}
+
+func SetKanaStage(db *sql.DB, userID int, mode string, stage int) error {
+	_, err := db.Exec(`INSERT INTO kana_stage (user_id, mode, stage) VALUES (?, ?, ?)
+		ON CONFLICT(user_id, mode) DO UPDATE SET stage=excluded.stage`, userID, mode, stage)
+	return err
+}
+
 func SetKanjiMeaning(db *sql.DB, char, meaning string) error {
 	_, err := db.Exec(`INSERT INTO kanji_cache (kanji, meaning) VALUES (?, ?)
 		ON CONFLICT(kanji) DO UPDATE SET meaning=excluded.meaning`, char, meaning)

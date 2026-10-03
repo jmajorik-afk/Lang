@@ -73,11 +73,28 @@ func testDB(t *testing.T) *sql.DB {
 			verified INTEGER NOT NULL DEFAULT 0,
 			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 		)`,
-		// a new table, not a migration: init_db.sql creates it on any database
+		// new tables, not migrations: init_db.sql creates them on any database
 		`CREATE TABLE kanji_cache (
 			kanji TEXT PRIMARY KEY,
 			meaning TEXT NOT NULL,
 			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`CREATE TABLE kana_progress (
+			user_id INTEGER NOT NULL,
+			item TEXT NOT NULL,
+			dir TEXT NOT NULL,
+			seen INTEGER NOT NULL DEFAULT 0,
+			correct INTEGER NOT NULL DEFAULT 0,
+			streak INTEGER NOT NULL DEFAULT 0,
+			confused TEXT NOT NULL DEFAULT '',
+			updated_at DATETIME,
+			PRIMARY KEY (user_id, item, dir)
+		)`,
+		`CREATE TABLE kana_stage (
+			user_id INTEGER NOT NULL,
+			mode TEXT NOT NULL,
+			stage INTEGER NOT NULL DEFAULT 0,
+			PRIMARY KEY (user_id, mode)
 		)`,
 	} {
 		if _, err := db.Exec(ddl); err != nil {
@@ -880,5 +897,37 @@ func TestAllVocabSenses(t *testing.T) {
 	}
 	if len(senses) != 3 {
 		t.Errorf("AllVocabSenses = %q, want 3 lines across both users", senses)
+	}
+}
+
+func TestKanaProgressAndStage(t *testing.T) {
+	db := testDB(t)
+	RecordKana(db, 1, "ぬ", "read", true, "")
+	RecordKana(db, 1, "ぬ", "read", false, "め") // a miss ends the run and remembers the mix-up
+	RecordKana(db, 1, "ぬ", "read", true, "")
+	RecordKana(db, 1, "ぬ", "write", true, "")
+	RecordKana(db, 2, "ぬ", "read", false, "む") // another user
+
+	prog, err := KanaProgress(db, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s := prog["read|ぬ"]; s.Seen != 3 || s.Correct != 2 || s.Streak != 1 || s.Confused != "め" {
+		t.Errorf("read|ぬ = %+v, want seen 3, correct 2, streak 1, confused め", s)
+	}
+	if s := prog["write|ぬ"]; s.Seen != 1 || s.Streak != 1 {
+		t.Errorf("write|ぬ = %+v — directions are counted apart", s)
+	}
+	if len(prog) != 2 {
+		t.Errorf("user 1 has %d records, want 2 — other users' answers must not leak in", len(prog))
+	}
+
+	if GetKanaStage(db, 1, "hiragana") != 0 {
+		t.Error("a new mode starts at stage 0")
+	}
+	SetKanaStage(db, 1, "hiragana", 3)
+	SetKanaStage(db, 1, "katakana", 1)
+	if GetKanaStage(db, 1, "hiragana") != 3 || GetKanaStage(db, 1, "katakana") != 1 {
+		t.Error("each mode keeps its own stage")
 	}
 }

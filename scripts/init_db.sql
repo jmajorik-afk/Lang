@@ -81,6 +81,29 @@ CREATE TABLE IF NOT EXISTS kanji_cache (
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Kana trainer (/kana): per user, per item (ぬ, ヌ, きゃ, コーヒー; a pair is ぬヌ)
+-- and direction — how often asked and answered right, the current run of right
+-- answers, and what it was last mistaken for
+CREATE TABLE IF NOT EXISTS kana_progress (
+    user_id INTEGER NOT NULL,
+    item TEXT NOT NULL,
+    dir TEXT NOT NULL,                      -- read | write | pair
+    seen INTEGER NOT NULL DEFAULT 0,
+    correct INTEGER NOT NULL DEFAULT 0,
+    streak INTEGER NOT NULL DEFAULT 0,
+    confused TEXT NOT NULL DEFAULT '',
+    updated_at DATETIME,
+    PRIMARY KEY (user_id, item, dir)
+);
+
+-- Kana trainer: the stage each user has reached in each mode; never goes back
+CREATE TABLE IF NOT EXISTS kana_stage (
+    user_id INTEGER NOT NULL,
+    mode TEXT NOT NULL,                     -- hiragana | katakana | mixed | pairs
+    stage INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (user_id, mode)
+);
+
 -- Journal of every judged answer: feeds /stats, weak-point targeting, difficulty
 CREATE TABLE IF NOT EXISTS outcomes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -268,6 +268,7 @@ func HandleCommand(bot *tgbotapi.BotAPI, message *tgbotapi.Message, db *sql.DB, 
 			"/practice — тренировка по выученным словам\n"+
 			"/ask — вопрос по грамматике (дальше уточняй просто сообщениями)\n"+
 			"/vocab — твой словарь; /vocab <часть слова> — поиск\n"+
+			"/kana — тренировка хираганы и катаканы\n"+
 			"/stats — статистика и слабые места\n"+
 			"/speech_speed — скорость озвучки")
 	case "practice":
@@ -293,6 +294,8 @@ func HandleCommand(bot *tgbotapi.BotAPI, message *tgbotapi.Message, db *sql.DB, 
 		}
 	case "stats":
 		sendStats(bot, db, chatID, userID)
+	case "kana":
+		startKana(bot, db, chatID, userID)
 	case "speech_speed":
 		sendKb(bot, chatID, "Выбери скорость озвучки:", speechSpeedInlineKeyboard())
 	case "healthz":
@@ -523,8 +526,9 @@ func HandleMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, clients *Cli
 
 	st := storage.GetState(db, userID)
 	switch st.Mode {
-	case "paused_compose", "paused_translate", "reminder", modeSrsOffer:
-		// paused/offer: just a re-prompt, no API; reminder: SRS answers are never capped
+	case "paused_compose", "paused_translate", "reminder", modeSrsOffer, modeKana:
+		// paused/offer: just a re-prompt, no API; reminder: SRS answers are never
+		// capped; kana answers are checked locally, without the model
 	default:
 		if !capOK(bot, clients, db, chatID, userID) {
 			return
@@ -556,6 +560,8 @@ func HandleMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, clients *Cli
 		handleAskFollowup(bot, clients, db, message, st)
 	case "reminder":
 		checkReminder(bot, clients, db, chatID, userID, message.Text, st)
+	case modeKana:
+		handleKanaText(bot, db, message, st)
 	case modeAwaitWord:
 		handleAwaitWord(bot, clients, db, message)
 	default:
@@ -2588,6 +2594,13 @@ func HandleCallbackQuery(bot *tgbotapi.BotAPI, clients *Clients, callbackQuery *
 	case data == "exit":
 		storage.ClearMode(db, userID)
 		send(bot, chatID, "Окей, закончили. Пиши слово, когда захочешь.")
+
+	case strings.HasPrefix(data, "kana_mode#"), strings.HasPrefix(data, "kana_more#"):
+		_, mode, _ := strings.Cut(data, "#")
+		startKanaRound(bot, db, chatID, userID, mode)
+
+	case strings.HasPrefix(data, "kana_pick#"), strings.HasPrefix(data, "kana_skip#"):
+		handleKanaButton(bot, db, callbackQuery, data)
 
 	case data == "clarify":
 		st := storage.GetState(db, userID)
