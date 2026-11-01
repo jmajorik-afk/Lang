@@ -37,8 +37,8 @@ func TestSanitizeWord(t *testing.T) {
 	}
 
 	for _, c := range cases {
-		if got := sanitizeWord(c.in); got != c.want {
-			t.Errorf("sanitizeWord(%q) = %q, want %q", c.in, got, c.want)
+		if got := sanitizePhrase(c.in, 1); got != c.want {
+			t.Errorf("sanitizePhrase(%q, 1) = %q, want %q", c.in, got, c.want)
 		}
 	}
 }

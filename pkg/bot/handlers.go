@@ -48,6 +48,7 @@ const styleRules = "Plain text only — no Markdown, no #, no *, no bold, no hea
 	"Japanese style: every kanji is immediately followed by its reading in round brackets, like 育(そだ). " +
 	"Give romaji for a whole word or sentence once, in pure Latin letters only — never use square brackets, " +
 	"never mix Cyrillic into romaji, never leave part of a word without romaji. Example: 育(そだ)っています (sodatte imasu). " +
+	"Romaji must follow the kana letter by letter, long vowels included — こう is kou, せい is sei, おお is oo, and ー repeats the vowel before it (コーヒー is koohii); never macrons. " +
 	"No emojis."
 
 // uncertaintyRule (research 1a): a wrong explanation reads exactly as fluently
@@ -66,13 +67,13 @@ const grammarSystem = styleRules + " You are a friendly Japanese tutor. " +
 // ---------- small send helpers ----------
 
 func send(bot *tgbotapi.BotAPI, chatID int64, text string) {
-	if _, err := bot.Send(tgbotapi.NewMessage(chatID, text)); err != nil {
+	if _, err := bot.Send(tgbotapi.NewMessage(chatID, tidy(text))); err != nil {
 		log.Printf("send error: %v", err)
 	}
 }
 
 func sendKb(bot *tgbotapi.BotAPI, chatID int64, text string, kb tgbotapi.InlineKeyboardMarkup) {
-	m := tgbotapi.NewMessage(chatID, text)
+	m := tgbotapi.NewMessage(chatID, tidy(text))
 	m.ReplyMarkup = kb
 	if _, err := bot.Send(m); err != nil {
 		log.Printf("send error: %v", err)
@@ -590,7 +591,7 @@ func handleAwaitWord(bot *tgbotapi.BotAPI, clients *Clients, db *sql.DB, message
 	word := resolveHeadword(clients, message.Text)
 	if word == "" {
 		deleteMsg(bot, chatID, think)
-		send(bot, chatID, "Нужно одно слово, без лишнего. Попробуй ещё раз.")
+		send(bot, chatID, "Нужно слово или выражение до трёх слов, по-русски. Попробуй ещё раз.")
 		return
 	}
 	translation, alternatives, verified := translateWord(clients, db, word)
@@ -720,15 +721,10 @@ func lookupWord(text string) string {
 // e.g. "А крыша ?" — without stripping these they end up saved verbatim.
 var fillerPrefixes = []string{"а ", "и ", "ну ", "вот ", "это ", "слово ", "ещё ", "еще "}
 
-// sanitizeWord reduces raw text to one clean lowercase word, or "" if it cannot
-// be reduced to a single word. "" is the signal that the caller must resolve it
-// (via Claude or by asking the user) rather than saving junk.
-func sanitizeWord(raw string) string {
-	return sanitizePhrase(raw, 1)
-}
-
-// sanitizePhrase is sanitizeWord for a short expression of up to maxWords
-// words, such as «в порядке» in a list of words to save. "" when it is longer.
+// sanitizePhrase reduces raw text to a clean lowercase entry of at most maxWords
+// words — lookup phrasing, fillers and punctuation peeled off — or "" if it is
+// longer. "" is the signal that the caller must resolve it (via Claude or by
+// asking the user) rather than saving junk.
 func sanitizePhrase(raw string, maxWords int) string {
 	w := strings.ToLower(normalizeWord(raw))
 	// peel repeated fillers: "а вот крыша" → "крыша"
@@ -755,23 +751,60 @@ func sanitizePhrase(raw string, maxWords int) string {
 	return w
 }
 
-// resolveHeadword picks the single dictionary word to store in the vocabulary.
-// Clean single-word input is handled locally; only genuinely messy input costs
-// a Claude call.
+// vocabKey reduces raw text to a dictionary entry: one word, or a fixed
+// expression of up to three words («туалетная бумага», «в порядке»). "" when it
+// is longer or opens like a clause («я дома, но…») — then it is not an entry.
+// Words are counted before fillers are peeled, so «это очень большая собака»
+// stays a sentence.
+func vocabKey(raw string) string {
+	if len(strings.Fields(normalizeWord(raw))) > 3 {
+		return ""
+	}
+	w := sanitizePhrase(raw, 3)
+	if words := strings.Fields(w); len(words) > 1 && sentenceStarts[words[0]] {
+		return ""
+	}
+	return w
+}
+
+// russianKey: a dictionary entry the reminder can ask about — «Как будет «X» по-
+// японски?» only makes sense when X is Russian.
+func russianKey(w string) bool {
+	return w != "" && containsCyrillic(w) && !containsJapanese(w) && !hasLatinLetter(w)
+}
+
+func hasLatinLetter(s string) bool {
+	for _, r := range s {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' {
+			return true
+		}
+	}
+	return false
+}
+
+// resolveHeadword picks the dictionary entry to store: a Russian word or a fixed
+// expression of up to three words. Clean Russian input is used as it is; anything
+// else costs one model call — a sentence is reduced to its main word, and a
+// Japanese or English word is replaced by its Russian meaning. A Japanese key made
+// the reminder ask «Как будет «トイレットペーパー» по-японски?».
 func resolveHeadword(clients *Clients, raw string) string {
-	if w := sanitizeWord(raw); w != "" {
+	if w := vocabKey(raw); russianKey(w) {
 		return w
 	}
-	sys := "Extract the single Russian word the user asked about. " +
-		"Reply with exactly ONE word in dictionary form (nominative singular; infinitive for verbs), " +
-		"lowercase, no punctuation, no quotes, no explanation. " +
-		"If several words are present, pick the main noun or verb."
+	sys := "The learner is saving an entry to their Russian–Japanese vocabulary. From the text, give the Russian " +
+		"entry: one word, or a fixed expression of up to three words when it names one thing (туалетная бумага, " +
+		"в порядке). Dictionary form — nominative singular, infinitive for verbs — lowercase. If the text is " +
+		"Japanese or English, give the Russian word it means. If it is a whole sentence, give its main noun or verb. " +
+		"Reply with the entry only: no punctuation, no quotes, no explanation."
 	resp, err := claudeOne(clients, sys, raw)
 	if err != nil {
 		log.Printf("headword extraction error: %v", err)
 		return ""
 	}
-	return sanitizeWord(resp)
+	if w := vocabKey(resp); russianKey(w) {
+		return w
+	}
+	return ""
 }
 
 // senseFormat is the shape every translation prompt must produce, shared so the
@@ -779,7 +812,7 @@ func resolveHeadword(clients *Clients, raw string) string {
 // than one line, every line carries a usage note — that note is what makes the
 // senses tellable apart in the dictionary and in the reminder question.
 const senseFormat = "Format each line as the Japanese word with every kanji immediately followed by its hiragana " +
-	"reading in round brackets, then one space, then the full romaji in round brackets. " +
+	"reading in round brackets, then one space, then the full romaji in round brackets. The romaji must follow the kana letter by letter, long vowels included — こう is kou, せい is sei, おお is oo, and ー repeats the vowel before it (コーヒー is koohii); never macrons. " +
 	"Example for «растение»: 植物(しょくぶつ) (shokubutsu)\n" +
 	"If you output more than one line, append ' — ' and a SHORT Russian note to EVERY line INCLUDING the first, " +
 	"saying when that variant is used. Example for «холодно»:\n" +
@@ -838,7 +871,7 @@ func answerSenses(resp, answer string) (translation, alternatives string) {
 	if strings.HasPrefix(strings.ToUpper(firstLine(resp)), "NONE") {
 		return "", ""
 	}
-	translation, alternatives = splitSenses(resp)
+	translation, alternatives = splitSenses(tidy(resp))
 	written := japaneseHeadword(translation)
 	if written == "" {
 		return "", ""
@@ -870,6 +903,8 @@ func lastLookupAnswer(db *sql.DB, userID int, stateWord string) string {
 // on the user); an unverified cached line is re-checked against Jisho on the
 // next hit, so a temporary Jisho outage never sticks.
 func translateWord(clients *Clients, db *sql.DB, word string) (translation, alternatives string, verified bool) {
+	// every line leaves tidied, cached ones from before tidy existed included
+	defer func() { translation, alternatives = tidy(translation), tidy(alternatives) }()
 	if tr, alts, v, ok := storage.GetCachedTranslation(db, word); ok {
 		if !v {
 			if fixed, okJisho := verifyWithJisho(clients, tr); okJisho {
@@ -887,11 +922,12 @@ func translateWord(clients *Clients, db *sql.DB, word string) (translation, alte
 		log.Printf("translateWord error: %v", err)
 		return "", "", false
 	}
-	translation, alternatives = splitSenses(resp)
+	translation, alternatives = splitSenses(tidy(resp))
 	if translation == "" {
 		return "", "", false
 	}
 	translation, verified = verifyWithJisho(clients, translation)
+	translation = tidy(translation)
 	storage.SetCachedTranslation(db, word, translation, alternatives, verified)
 	return translation, alternatives, verified
 }
@@ -2032,7 +2068,14 @@ func matchesStoredEntry(entry storage.VocabEntry, answer string) bool {
 	}
 	for _, sense := range entry.SenseLines() {
 		for _, form := range entryForms(sense) {
-			if form != "" && normalizeAnswer(form) == a {
+			if form == "" {
+				continue
+			}
+			if normalizeAnswer(form) == a {
+				return true
+			}
+			// romaji in any spelling: koohii, kōhī and kouhii are one answer
+			if isRomaji(a) && isRomaji(form) && normalizeRomaji(form) == normalizeRomaji(a) {
 				return true
 			}
 		}
@@ -2428,7 +2471,7 @@ func HandleCallbackQuery(bot *tgbotapi.BotAPI, clients *Clients, callbackQuery *
 		if word == "" {
 			deleteMsg(bot, chatID, think)
 			storage.SetState(db, userID, modeAwaitWord, "", "", 0)
-			send(bot, chatID, "Не понял, какое слово запомнить. Напиши его одним словом.")
+			send(bot, chatID, "Не понял, что запомнить. Напиши по-русски слово или короткое выражение.")
 			return
 		}
 		translation, alternatives, verified := savePayload(clients, db, word, answer)
@@ -2442,7 +2485,7 @@ func HandleCallbackQuery(bot *tgbotapi.BotAPI, clients *Clients, callbackQuery *
 			send(bot, chatID, "Это подтверждение устарело. Нажми «Запомнить» ещё раз.")
 			return
 		}
-		word := sanitizeWord(st.Word)
+		word := vocabKey(st.Word)
 		if word == "" {
 			send(bot, chatID, "Не понял, какое слово сохранить. Напиши слово ещё раз.")
 			return
@@ -2476,7 +2519,7 @@ func HandleCallbackQuery(bot *tgbotapi.BotAPI, clients *Clients, callbackQuery *
 			return
 		}
 		storage.SetState(db, userID, modeAwaitWord, "", "", 0)
-		send(bot, chatID, "Ок, не добавляю. Напиши одним словом, что запомнить.")
+		send(bot, chatID, "Ок, не добавляю. Напиши по-русски, что запомнить.")
 
 	case data == "know":
 		sendKb(bot, chatID, "Хочешь попрактиковаться?", practiceOfferKeyboard())

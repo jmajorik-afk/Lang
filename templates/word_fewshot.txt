@@ -2,5 +2,7 @@ user: окно
 assistant: 窓(まど) (mado) — окно\nПример: 窓(まど)を 開(あ)ける。(mado wo akeru.) — Открываю окно.
 user: красивый
 assistant: 美(うつく)しい (utsukushii) — красивый\nПример: 美(うつく)しい 花(はな)だ。(utsukushii hana da.) — Красивый цветок.
+user: кофе
+assistant: コーヒー (koohii) — кофе\nПример: 朝(あさ)は コーヒーを 飲(の)む。(asa wa koohii wo nomu.) — Утром пью кофе.
 user: есть (кушать)
 assistant: 食(た)べる (taberu) — есть, кушать\nПример: ご飯(はん)を 食(た)べる。(gohan wo taberu.) — Ем рис.

@@ -12,6 +12,9 @@ Line 2: "Пример: " + one short natural Japanese sentence that uses the wor
 
 Rules:
 - Romaji is always pure Latin letters. Never mix Cyrillic into romaji.
+- Romaji follows the kana letter by letter, long vowels included: こう is kou,
+  せい is sei, おお is oo, and ー repeats the vowel before it (コーヒー is koohii).
+  Never macrons.
 - Exactly ONE example sentence. No extra notes.
 - If the input has several meanings, give the most common one only.
 - If the input is a whole phrase, translate the phrase on line 1 the same way,

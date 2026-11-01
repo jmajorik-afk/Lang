@@ -893,7 +893,7 @@ func finishKanaAnswer(bot *tgbotapi.BotAPI, db *sql.DB, chatID int64, userID int
 }
 
 func sendKbID(bot *tgbotapi.BotAPI, chatID int64, text string, kb tgbotapi.InlineKeyboardMarkup) int {
-	m := tgbotapi.NewMessage(chatID, text)
+	m := tgbotapi.NewMessage(chatID, tidy(text))
 	m.ReplyMarkup = kb
 	sent, err := bot.Send(m)
 	if err != nil {

@@ -41,6 +41,7 @@ var sentenceStarts = map[string]bool{
 	"но": true, "что": true, "если": true, "когда": true, "потому": true, "чтобы": true, "хотя": true,
 	"который": true, "которая": true, "которое": true, "которые": true,
 	"я": true, "ты": true, "он": true, "она": true, "оно": true, "мы": true, "вы": true, "они": true,
+	"почему": true, "зачем": true,
 }
 
 // splitWordList recognises a message that is a list of words and returns them,
@@ -49,25 +50,21 @@ var sentenceStarts = map[string]bool{
 // opens like a clause («я дома, но устал») makes the message a sentence. A lone
 // pronoun is still a word: «я, ты, он» is a list.
 func splitWordList(text string) []string {
-	if !strings.ContainsAny(text, ",;\n") {
+	// Japanese in the message means a question about Japanese — «почему
+	// 食べています, а не 食べる?» came out as a two-word «list» — not Russian
+	// words to look up
+	if !strings.ContainsAny(text, ",;\n") || containsJapanese(text) {
 		return nil
 	}
+	question := strings.HasSuffix(strings.TrimSpace(text), "?")
 	var items []string
 	seen := map[string]bool{}
 	for _, part := range strings.FieldsFunc(text, func(r rune) bool { return r == ',' || r == ';' || r == '\n' }) {
 		if strings.TrimSpace(part) == "" {
 			continue
 		}
-		// count before fillers are peeled: «это очень большая собака» is a
-		// sentence, even though «очень большая собака» would fit
-		if len(strings.Fields(normalizeWord(part))) > 3 {
-			return nil
-		}
-		item := sanitizePhrase(part, 3)
-		if item == "" || !containsCyrillic(item) {
-			return nil
-		}
-		if words := strings.Fields(item); len(words) > 1 && sentenceStarts[words[0]] {
+		item := vocabKey(part)
+		if !russianKey(item) || (question && strings.Contains(item, " ")) {
 			return nil
 		}
 		if !seen[item] {

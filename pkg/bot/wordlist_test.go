@@ -27,6 +27,9 @@ func TestSplitWordList(t *testing.T) {
 		"красная машина, доброе утро":       "красная машина доброе утро",
 		"я, ты, он":        "я ты он", // lone pronouns are words to learn
 		"привет, как дела": "привет как дела",
+		"почему говорят 食べています, а не 食べる?":   "", // QA G04: a question about Japanese
+		"привет, как дела?":                  "", // a question with an expression in it
+		"собака, кошка?":                     "собака кошка",
 		"если пойдёт дождь, я останусь дома": "", // a clause
 		"собака, это очень большая собака":   "", // four words: a sentence
 	} {
