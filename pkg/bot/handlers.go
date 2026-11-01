@@ -1205,6 +1205,23 @@ func LearnVocabKanji(clients *Clients, db *sql.DB) {
 	}
 }
 
+// confirmWordRe reads the word back out of «Запомнить слово «X» — …?», the
+// message the «Да»/«Нет» buttons sit under.
+var confirmWordRe = regexp.MustCompile(`^Запомнить слово «([^»]+)»`)
+
+// confirmationFor reports whether a pressed «Да»/«Нет» belongs to the
+// confirmation open right now. The buttons used to act on whatever was being
+// confirmed at the moment of the tap, so «Да» under an older «собака?» saved
+// «кошка», the word asked about after it. A button now answers only for the
+// word written in its own message.
+func confirmationFor(cq *tgbotapi.CallbackQuery, st storage.State) bool {
+	if st.Mode != modeConfirmSave || cq.Message == nil {
+		return false
+	}
+	m := confirmWordRe.FindStringSubmatch(cq.Message.Text)
+	return m != nil && m[1] == st.Word
+}
+
 // askSaveConfirmation puts the user in the confirm step (with the senses already
 // shown) instead of saving blindly. The senses are stashed in task_text — main
 // sense on the first line — so "Да" can persist them without a second API call.
@@ -2421,7 +2438,7 @@ func HandleCallbackQuery(bot *tgbotapi.BotAPI, clients *Clients, callbackQuery *
 
 	case data == "save_yes":
 		st := storage.GetState(db, userID)
-		if st.Mode != modeConfirmSave {
+		if !confirmationFor(callbackQuery, st) {
 			send(bot, chatID, "Это подтверждение устарело. Нажми «Запомнить» ещё раз.")
 			return
 		}
@@ -2452,6 +2469,12 @@ func HandleCallbackQuery(bot *tgbotapi.BotAPI, clients *Clients, callbackQuery *
 		}
 
 	case data == "save_no":
+		if !confirmationFor(callbackQuery, storage.GetState(db, userID)) {
+			// an old «Нет» must not replace whatever is open now — a reminder,
+			// a practice task — with «напиши, что запомнить»
+			send(bot, chatID, "Это подтверждение уже неактуально.")
+			return
+		}
 		storage.SetState(db, userID, modeAwaitWord, "", "", 0)
 		send(bot, chatID, "Ок, не добавляю. Напиши одним словом, что запомнить.")
 

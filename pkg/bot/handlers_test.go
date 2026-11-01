@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"language-learning-bot/pkg/storage"
+
+	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
 // TestSanitizeWord covers the junk that actually made it into the vocabulary
@@ -590,5 +592,29 @@ func TestKanjiBlock(t *testing.T) {
 	got := kanjiBlock([]string{"植 — сажать, растение", "物 — вещь, предмет"})
 	if want := "\n\nКандзи:\n植 — сажать, растение\n物 — вещь, предмет"; got != want {
 		t.Errorf("kanjiBlock = %q, want %q", got, want)
+	}
+}
+
+// TestConfirmationFor — «Да» under an older «собака?» saved «кошка», the word
+// confirmed after it (QA scenario B04). A button answers only for its own word.
+func TestConfirmationFor(t *testing.T) {
+	press := func(text string) *tgbotapi.CallbackQuery {
+		return &tgbotapi.CallbackQuery{Message: &tgbotapi.Message{Text: text}}
+	}
+	open := storage.State{Mode: modeConfirmSave, Word: "кошка"}
+	if !confirmationFor(press("Запомнить слово «кошка» — 猫(ねこ) (neko)?\n(чтение сверено с Jisho)"), open) {
+		t.Error("the open confirmation's own «Да» must work")
+	}
+	if !confirmationFor(press("Запомнить слово «кошка»?"), open) {
+		t.Error("a confirmation without a translation line must work too")
+	}
+	if confirmationFor(press("Запомнить слово «собака» — 犬(いぬ) (inu)?"), open) {
+		t.Error("«Да» under the older «собака» must not save «кошка»")
+	}
+	if confirmationFor(press("Запомнить слово «кошка» — 猫(ねこ) (neko)?"), storage.State{Mode: "reminder", Word: "кошка"}) {
+		t.Error("with no confirmation open, an old «Да» must do nothing")
+	}
+	if confirmationFor(&tgbotapi.CallbackQuery{}, open) {
+		t.Error("a press that doesn't carry its message cannot be trusted")
 	}
 }
