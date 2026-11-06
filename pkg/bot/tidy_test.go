@@ -56,6 +56,31 @@ func TestStoredEntryAcceptsAnyRomaji(t *testing.T) {
 	}
 }
 
+func TestNormalizeWord(t *testing.T) {
+	for in, want := range map[string]string{
+		"как будешь карандаш":            "карандаш", // a slip in «как будет» made it an entry
+		"Как будет карандаш?":            "карандаш",
+		"как будут собаки":               "собаки",
+		"как по-японски будет карандаш":  "карандаш",
+		"как по японски карандаш":        "карандаш",
+		"как сказать спасибо по-японски": "спасибо",
+		"карандаш на японском":           "карандаш",
+		"что такое кайдан":               "кайдан",
+		"что значит 猫?":                  "猫",
+		"переведи карандаш":              "карандаш",
+		"перевод окна":                   "окна",
+		"а как будет крыша":              "а крыша", // the filler goes later, in sanitizePhrase
+		"как дела":                       "как дела",
+		"как будто":                      "как будто",
+		"переводчик":                     "переводчик",
+		"как будет":                      "",
+	} {
+		if got := normalizeWord(in); got != want {
+			t.Errorf("normalizeWord(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
 func TestVocabKey(t *testing.T) {
 	for raw, want := range map[string]string{
 		"Как будет туалетная бумага": "туалетная бумага",

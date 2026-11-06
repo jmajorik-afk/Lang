@@ -705,15 +705,30 @@ func buildHistory(db *sql.DB, userID int) []claude_api.ChatMessage {
 	return msgs
 }
 
-// normalizeWord strips lookup phrases so that "что значит окно" → "окно".
-var lookupPhrases = []string{"что значит", "как переводится", "как будет", "как сказать", "перевод "}
+// lookupPhraseRe is how a lookup is asked, wherever it stands in the message —
+// «как будет», with the variants and slips people actually type: «как будешь»,
+// «как по-японски будет», «что такое», «переведи», «X по-японски». Only exact
+// phrases used to be stripped, and once an entry could hold three words «как
+// будешь карандаш» became an entry of its own. «как дела» and «как будто» are
+// expressions, not lookup phrasing, and stay.
+var lookupPhraseRe = regexp.MustCompile(`(?i)(^|[\s«"'(,])(?:` +
+	`как(?:\s+по[\s-]?японски)?\s+(?:буд(?:ет|ешь|ут|е|ит)|сказать|скажешь|перевести|переводится|называется|пишется)` +
+	`(?:\s+(?:по[\s-]?японски|на\s+японском))?` +
+	`|как\s+по[\s-]?японски|что\s+(?:значит|означает|такое)|переведи(?:те)?(?:\s+на\s+японский)?|перевод` +
+	`|по[\s-]?японски|на\s+японском|на\s+японский` +
+	`)([\s?!.,:;»"')]|$)`)
 
+// normalizeWord strips lookup phrases so that "что значит окно" → "окно".
 func normalizeWord(message string) string {
 	m := strings.TrimSpace(message)
-	for _, p := range lookupPhrases {
-		if idx := strings.Index(strings.ToLower(m), p); idx >= 0 {
-			m = strings.TrimSpace(m[:idx] + m[idx+len(p):])
+	// a match takes the space after it, so two phrases in a row («переведи что
+	// такое…») need a second pass
+	for i := 0; i < 4; i++ {
+		next := lookupPhraseRe.ReplaceAllString(m, "$1 $2")
+		if next == m {
+			break
 		}
+		m = next
 	}
 	// drop trailing/leading punctuation and collapse inner whitespace
 	m = strings.Trim(m, " \t?!.,;:")
