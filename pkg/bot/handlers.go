@@ -268,7 +268,7 @@ func HandleCommand(bot *tgbotapi.BotAPI, message *tgbotapi.Message, db *sql.DB, 
 		send(bot, chatID, "Привет! Напиши любое слово — переведу, дам пример и предложу запомнить.\n\n"+
 			"/practice — тренировка по выученным словам\n"+
 			"/ask — вопрос по грамматике (дальше уточняй просто сообщениями)\n"+
-			"/vocab — твой словарь; /vocab <часть слова> — поиск\n"+
+			"/vocab — твой словарь, там же ✏️ — исправить или удалить слово; /vocab <часть слова> — поиск\n"+
 			"/kana — тренировка хираганы и катаканы\n"+
 			"/stats — статистика и слабые места\n"+
 			"/speech_speed — скорость озвучки")
@@ -307,11 +307,13 @@ func HandleCommand(bot *tgbotapi.BotAPI, message *tgbotapi.Message, db *sql.DB, 
 // vocabPageSize keeps /vocab pages far under Telegram's 4096-char message cap.
 const vocabPageSize = 10
 
-// vocabPageKeyboard — 🔊 to pick a word to hear, plus paging while more remain.
+// vocabPageKeyboard — 🔊 to pick a word to hear, ✏️ to pick one to fix or
+// delete, plus paging while more remain.
 func vocabPageKeyboard(offset int, more bool) tgbotapi.InlineKeyboardMarkup {
 	kb := tgbotapi.NewInlineKeyboardMarkup(
 		tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData("🔊 Озвучить слово", fmt.Sprintf("vocab_audio#%d", offset)),
+			tgbotapi.NewInlineKeyboardButtonData("✏️ Изменить", fmt.Sprintf("vocab_edit#%d", offset)),
 		),
 	)
 	if more {
@@ -484,10 +486,13 @@ func sendStats(bot *tgbotapi.BotAPI, db *sql.DB, chatID int64, userID int) {
 	send(bot, chatID, sb.String())
 }
 
+const vocabSearchLimit = 20
+
 // sendVocabSearch handles «/vocab <часть слова>» — a plain local substring
 // search over saved words, no API calls involved.
 func sendVocabSearch(bot *tgbotapi.BotAPI, db *sql.DB, chatID int64, userID int, q string) {
-	entries, err := storage.SearchVocab(db, userID, strings.ToLower(q), 20)
+	q = strings.ToLower(q)
+	entries, err := storage.SearchVocab(db, userID, q, vocabSearchLimit)
 	if err != nil || len(entries) == 0 {
 		send(bot, chatID, fmt.Sprintf("По «%s» ничего не нашёл. /vocab — весь список.", q))
 		return
@@ -496,6 +501,10 @@ func sendVocabSearch(bot *tgbotapi.BotAPI, db *sql.DB, chatID int64, userID int,
 	fmt.Fprintf(&sb, "Нашёл (%d):\n\n", len(entries))
 	for i, e := range entries {
 		vocabLine(&sb, db, i+1, e)
+	}
+	if kb, ok := searchEditKeyboard(q); ok {
+		sendKb(bot, chatID, sb.String(), kb)
+		return
 	}
 	send(bot, chatID, sb.String())
 }
@@ -527,9 +536,10 @@ func HandleMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, clients *Cli
 
 	st := storage.GetState(db, userID)
 	switch st.Mode {
-	case "paused_compose", "paused_translate", "reminder", modeSrsOffer, modeKana:
+	case "paused_compose", "paused_translate", "reminder", modeSrsOffer, modeKana, modeEditWord:
 		// paused/offer: just a re-prompt, no API; reminder: SRS answers are never
-		// capped; kana answers are checked locally, without the model
+		// capped; kana answers and a word's new name are checked locally, without
+		// the model
 	default:
 		if !capOK(bot, clients, db, chatID, userID) {
 			return
@@ -565,8 +575,12 @@ func HandleMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, clients *Cli
 		handleKanaText(bot, db, message, st)
 	case modeAwaitWord:
 		handleAwaitWord(bot, clients, db, message)
+	case modeEditWord:
+		handleEditWordText(bot, db, message, st)
+	case modeEditTr:
+		handleEditTrText(bot, clients, db, message, st)
 	default:
-		// modeConfirmSave and modeSrsOffer land here on purpose: if the user
+		// modeConfirmSave, modeEditConfirm and modeSrsOffer land here on purpose: if the user
 		// ignores the buttons and types something, treat it as a fresh lookup
 		// rather than trapping them. flow1Lookup resets the mode itself, so an
 		// ignored announcement is simply re-offered after the usual throttle.
@@ -2574,6 +2588,10 @@ func HandleCallbackQuery(bot *tgbotapi.BotAPI, clients *Clients, callbackQuery *
 		if id, err := strconv.Atoi(strings.TrimPrefix(data, "vocab_play#")); err == nil {
 			playVocabWord(bot, clients, db, chatID, userID, id)
 		}
+
+	case strings.HasPrefix(data, "vocab_edit#"), strings.HasPrefix(data, "vedit"),
+		strings.HasPrefix(data, "vfind#"), strings.HasPrefix(data, "vfback#"):
+		handleVocabEdit(bot, db, callbackQuery, data)
 
 	case data == "contest#practice":
 		handleContestPractice(bot, clients, db, chatID, userID)

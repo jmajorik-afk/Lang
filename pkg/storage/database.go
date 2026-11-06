@@ -2,6 +2,7 @@ package storage
 
 import (
 	"database/sql"
+	"errors"
 	"os"
 	"path/filepath"
 	"sort"
@@ -434,6 +435,68 @@ func GetVocabEntry(db *sql.DB, userID, id int) (VocabEntry, error) {
 	err := db.QueryRow(`SELECT id, word, translation, alternatives FROM vocab WHERE user_id=? AND id=?`, userID, id).
 		Scan(&e.ID, &e.Word, &e.Translation, &e.Alternatives)
 	return e, err
+}
+
+// ErrVocabExists: the new name for a word is already another saved word.
+var ErrVocabExists = errors.New("storage: word already saved")
+
+// RenameVocab gives a saved word a new Russian key everywhere the key is used —
+// its reminders, its answer history and the user's state — so the word keeps
+// its progress. ErrVocabExists when the new key is taken, sql.ErrNoRows when
+// the old word is gone.
+func RenameVocab(db *sql.DB, userID int, oldWord, newWord string) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var n int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM vocab WHERE user_id=? AND word=?`, userID, newWord).Scan(&n); err != nil {
+		return err
+	}
+	if n > 0 {
+		return ErrVocabExists
+	}
+	res, err := tx.Exec(`UPDATE vocab SET word=? WHERE user_id=? AND word=?`, newWord, userID, oldWord)
+	if err != nil {
+		return err
+	}
+	if k, _ := res.RowsAffected(); k == 0 {
+		return sql.ErrNoRows
+	}
+	for _, q := range []string{
+		`UPDATE reminders SET word=? WHERE user_id=? AND word=?`,
+		`UPDATE outcomes SET word=? WHERE user_id=? AND word=?`,
+		`UPDATE user_state SET word=? WHERE user_id=? AND word=?`,
+	} {
+		if _, err := tx.Exec(q, newWord, userID, oldWord); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// DeleteVocab removes a saved word with all its reminders, the sent ones too,
+// so the word is never asked again and an old question about it can't bring it
+// back. The answer journal stays: it is history, and /stats and the streak are
+// counted from it. sql.ErrNoRows when the word is already gone.
+func DeleteVocab(db *sql.DB, userID int, word string) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	res, err := tx.Exec(`DELETE FROM vocab WHERE user_id=? AND word=?`, userID, word)
+	if err != nil {
+		return err
+	}
+	if k, _ := res.RowsAffected(); k == 0 {
+		return sql.ErrNoRows
+	}
+	if _, err := tx.Exec(`DELETE FROM reminders WHERE user_id=? AND word=?`, userID, word); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // GetWeakVocabWord picks the word the user knows least well: the one whose

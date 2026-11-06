@@ -281,6 +281,58 @@ func TestDeletePendingRemindersKeepsSentHistory(t *testing.T) {
 	}
 }
 
+// TestRenameAndDeleteVocab — a new name follows the word into its reminders,
+// answers and state; deleting takes every reminder along but keeps the answers.
+func TestRenameAndDeleteVocab(t *testing.T) {
+	db := testDB(t)
+	const old, renamed = "карандаш и библиотека", "карандаш"
+	SaveVocab(db, 1, old, "鉛筆(えんぴつ) (enpitsu)", "")
+	SaveVocab(db, 1, "собака", "犬(いぬ) (inu)", "")
+	SaveVocab(db, 2, renamed, "鉛筆(えんぴつ) (enpitsu)", "") // another user's word is no obstacle
+	ScheduleReminder(db, 1, old, 2, time.Now())
+	LogOutcome(db, 1, "reminder", old, true, true, "", "", "")
+	SetState(db, 1, "reminder", old, "", 1)
+
+	if err := RenameVocab(db, 1, old, "собака"); err != ErrVocabExists {
+		t.Errorf("renaming onto a saved word: %v, want ErrVocabExists", err)
+	}
+	if err := RenameVocab(db, 1, "нет такого", "кот"); err != sql.ErrNoRows {
+		t.Errorf("renaming a missing word: %v, want sql.ErrNoRows", err)
+	}
+	if err := RenameVocab(db, 1, old, renamed); err != nil {
+		t.Fatal(err)
+	}
+	for _, table := range []string{"vocab", "reminders", "outcomes", "user_state"} {
+		var before, after int
+		db.QueryRow(`SELECT COUNT(*) FROM `+table+` WHERE user_id=1 AND word=?`, old).Scan(&before)
+		db.QueryRow(`SELECT COUNT(*) FROM `+table+` WHERE user_id=1 AND word=?`, renamed).Scan(&after)
+		if before != 0 || after != 1 {
+			t.Errorf("%s: %d rows under the old name, %d under the new one", table, before, after)
+		}
+	}
+
+	MarkReminderSent(db, 1)
+	ScheduleReminder(db, 1, renamed, 3, time.Now())
+	if err := DeleteVocab(db, 1, renamed); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := FindVocab(db, 1, renamed); err == nil {
+		t.Error("the word is still in the vocabulary")
+	}
+	var reminders, answers int
+	db.QueryRow(`SELECT COUNT(*) FROM reminders WHERE user_id=1 AND word=?`, renamed).Scan(&reminders)
+	db.QueryRow(`SELECT COUNT(*) FROM outcomes WHERE user_id=1 AND word=?`, renamed).Scan(&answers)
+	if reminders != 0 || answers != 1 {
+		t.Errorf("after delete: %d reminders (want 0), %d answers (want 1, history stays)", reminders, answers)
+	}
+	if _, err := FindVocab(db, 2, renamed); err != nil {
+		t.Error("another user's word went too")
+	}
+	if err := DeleteVocab(db, 1, renamed); err != sql.ErrNoRows {
+		t.Errorf("deleting twice: %v, want sql.ErrNoRows", err)
+	}
+}
+
 func TestDueReminderQueue(t *testing.T) {
 	db := testDB(t)
 	const uid = 1
