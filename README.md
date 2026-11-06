@@ -1,31 +1,42 @@
-# Language Learning Telegram Bot
+# langekko — Telegram-бот для изучения японского
 
-This Telegram bot is designed to assist users in learning new languages, with initial support for Dutch and Russian. It leverages the OpenAI API to provide examples, translations, and pronunciation for given words. The bot also helps with understanding various grammar aspects of words.
+Личный бот: пишешь слово — получаешь перевод с кандзи, чтением и ромадзи, сохраняешь в словарь, а дальше бот сам тренирует и напоминает по интервалам.
 
-## Features
+## Что умеет
 
-- **Language Selection:** Users can choose a language to start learning.
-- **Word Usage Exploration:** Offers examples, translations, and pronunciation of a given word.
-- **Grammar Assistance:** Provides insights into grammar aspects of words, such as verb conjugations.
-- **User Interaction Recording:** Records words and selections in a SQLite database to minimize repeated API requests.
+- **Поиск слова** — перевод, чтение, пример употребления. Японская сторона сверяется со словарём Jisho.org: слово должно существовать, чтение кандзи — совпасть.
+- **Словарь** (`/vocab`) — постранично, `/vocab <часть слова>` ищет по сохранённым, 🔊 озвучивает.
+- **Практика** (`/practice`) — составить предложение по-японски, затем перевести японское обратно. Сложность (3 уровня) подстраивается под долю заданий, решённых с первой попытки. Если в одной категории ошибок накопилось 3+, задания нацеливаются на неё и бот говорит, зачем.
+- **Интервальные повторения** — 3 ч → 24 ч → 7 д → 30 д → … до 180 д; ошибка откатывает на два шага, а не в начало. Если за день созревает 3+ слова, приходит один анонс и слова идут сессией.
+- **`/ask`** — вопросы по грамматике в режиме диалога, уточнения обычными сообщениями.
+- **`/stats`** — словарь, серия дней, точность за 30 дней, уровень заданий, слабые места.
+- **«Оспорить»** под любым вердиктом — независимая повторная проверка.
+- Озвучка через OpenAI TTS, скорость — `/speech_speed`.
 
-## Configuration
+Бот закрытый: отвечает только пользователям из `ALLOWED_TELEGRAM_USER_IDS`.
 
-The bot's settings are managed through the `.env` file, which includes configurations like the OpenAI API prompt template.
+## Стек
 
-## Database
+Go 1.23 · SQLite (`mattn/go-sqlite3`, cgo) · Claude (Anthropic) для текста и проверки ответов · OpenAI для озвучки · Jisho.org API для проверки чтений.
 
-User interactions are stored in a SQLite database, allowing for efficient retrieval and minimizing redundant API calls.
+## Конфигурация
 
-## Getting Started
+Скопируй `.env.example` в `.env` и заполни: токен бота, ключи Anthropic и OpenAI, разрешённые Telegram ID. `DAILY_API_CAP` ограничивает число обращений к API на пользователя в день.
 
-To run the bot:
+## Запуск локально
 
-1. Ensure Go is installed on your system.
-2. Set up a SQLite database with the necessary schema.
-3. Copy `.env.example` to `.env` and modify the required variables.
-4. Run the bot using `go run main.go`.
+```bash
+go run ./cmd
+```
 
-## License
+Запускать из корня репозитория: `scripts/init_db.sql`, `templates/` и база читаются по относительным путям. Схема создаётся при старте, ежедневные снимки базы складываются в `backups/`. Не запускай локальный экземпляр одновременно с серверным на одном токене — они будут перехватывать сообщения друг у друга.
 
-This project is licensed under the MIT License - see the [LICENSE.md](LICENSE.md) file for details.
+## Деплой
+
+Одна команда с рабочей машины: `deploy/deploy.sh user@host` — ставит Go, собирает на сервере, поднимает systemd-сервис. Подробности и вариант с Docker — в `deploy/README.md`.
+
+## Тесты
+
+```bash
+go test ./...
+```
